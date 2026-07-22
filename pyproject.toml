@@ -1,6 +1,6 @@
 [project]
 name = "guided-story-video-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "A research agent that guides a creator from an opening sentence to a timed storyboard and video plan."
 requires-python = ">=3.10"
 dependencies = [
@@ -11,11 +11,16 @@ dependencies = [
 [project.optional-dependencies]
 web = ["gradio>=4.44,<6"]
 narration = ["edge-tts>=7,<8"]
-dev = ["pytest>=8,<9"]
+dev = ["pytest>=8,<9", "ruff>=0.12,<1"]
 
 [project.scripts]
 guided-story-web = "guided_story_agent.web_app:main"
 guided-story-selfplay = "guided_story_agent.selfplay:main"
+guided-story-cli = "guided_story_agent.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

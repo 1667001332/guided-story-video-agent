@@ -1,129 +1,110 @@
-# 引导式剧本到视频 Agent
+# 引导式剧本到视频 Agent v0.2
 
-这是一个面向 GitHub、简历和科研实践的轻量 Agent 项目。它不要求用户一开始就会写完整提示词，而是从一句故事开头开始，逐轮追问缺少的人物目标、冲突、发展、转折和结局；大纲确认后，再继续补齐人物外形、场景、道具、旁白和镜头承接，最终输出定时剧本、结构化分镜和可选的真实视频。
+这是一个“人主导、AI 辅助诊断”的短片共创 Agent。它从用户的一句话开始，每轮只处理当前最重要的故事缺口，并给出三条可以采用、忽略或改写的方向。故事圣经、大纲、剧本和分镜都可以编辑、局部重写、撤销、重做和确认。
 
 ```text
-用户给出开头
-  -> AI 动态提问并提取剧情事实
-  -> 至少 5 轮 + 明确结局 + 用户主动完成
-  -> 大纲预览 / 确认
-  -> 制作细节追问
-  -> 30–60 秒定时剧本 / 确认
-  -> 结构化分镜 / 确认
-  -> Edge TTS 旁白 + SRT
-  -> 逐镜头 Agnes 视频生成
-  -> FFmpeg 拼接、音频与字幕封装
+自由开头 → 动态故事教练 → 至少 5 轮且因果链完整
+→ 可编辑五节点大纲 → 制作细节 → 可编辑定时剧本
+→ 5–10 个动态分镜 → 质量检查 → 用户确认费用 → 视频生成
 ```
 
-## 与上一版的关系
+## v0.2 改变了什么
 
-本项目是独立仓库，不包含旧版的 `WorldState`、导演命令解析、剧情分支和互动节点记忆。视频 Provider、结构化镜头数据、断点续跑与 FFmpeg 拼接思路迁移自同作者的 `interactive-movie-agent v0.1.0`，并在这里针对“引导创作”重新实现。详见 [docs/provenance.md](docs/provenance.md)。
+- 一次文本调用同时完成事实提取、冲突检测、完整度诊断、一个问题和三条建议，不再用固定字段轮询。
+- 每项事实保留用户原句证据和置信度；建议只有被采用后才进入故事。
+- 故事圣经是事实唯一来源，所有产物保存版本、父版本、反馈、来源轮次和确认状态。
+- 五节点大纲、可拍摄剧本和逐镜头分镜都可编辑；确认后修改会产生新版本并重新进入审阅。
+- 分镜数量按节奏动态规划：30 秒 5 镜头、45 秒 8 镜头、60 秒 10 镜头；每镜头 3–15 秒。
+- 网页改为左侧共创对话、右侧工作区；新增真正的人工交互 CLI。
+- 自演 Bench 新增问题重复率、事实保留率、冲突处理率、因果完整度、视觉锚点覆盖率和镜头多样性。
+
+架构参考与取舍见 [研究与设计依据](docs/research-basis.md)；迁移来源见 [代码来源说明](docs/provenance.md)。
 
 ## 安装
 
 ```powershell
+Set-Location "V:\term_3\科研实践附件\科研实践3\guided-story-video-agent"
 python -m pip install -e ".[web,narration]"
 Copy-Item .env.example .env
+notepad .env
 ```
 
-如需使用 Agnes 文本或视频模型，只在本地 `.env` 中填写
-`AGNES_API_KEY` 的值，不要提交该文件。
+不配置密钥时，核心状态机、网页测试和自演使用确定性的本地 Agent，不发送网络请求。
 
-没有密钥时，核心状态机、测试和自演流程使用确定性的本地 Agent，不会发送网络请求。
+## 人工 CLI
 
-## 网页演示
+真实文本 API 严格模式：
+
+```powershell
+guided-story-cli --target-seconds 30 --require-live-text
+```
+
+常用命令：
+
+```text
+/suggest  获取三个方向       /use 2   采用第二条
+/show     查看故事圣经       /outline 生成大纲候选
+/edit     修改当前产物       /revise  按反馈局部重写
+/review   质量检查           /undo    撤销
+/redo     重做               /confirm 确认并推进
+/render   付费生成入口       /quit    保存退出
+```
+
+`/render` 默认关闭。只有启动时增加 `--render`，且之后再次输入精确的 `RENDER`，才会调用视频 Provider。
+
+## 网页工作台
 
 ```powershell
 python -m guided_story_agent.web_app
 ```
 
-网页只是核心状态机的薄界面。所有阶段门禁都在 `GuidedStorySession` 中执行，无法通过前端按钮绕过。
+浏览器打开 `http://127.0.0.1:7860/`。左侧完成对话、采用或忽略方向；右侧编辑故事地图、大纲、剧本和分镜。真实视频还需要勾选费用确认。
 
-## LLM 自演测试
+## 自演与真实文本验收
 
-```powershell
-python scripts/run_guided_story_selfplay.py --target-seconds 45 --max-turns 12
-```
-
-配置 Agnes 文本 API 后：
-
-- 创作者角色由 LLM 生成开头并逐轮回答；
-- 引导角色使用隔离提示词提取事实并生成下一条问题；
-- 输出完整 transcript、outline、script、storyboard、session 和 bench JSON；
-- 默认不会调用视频 API。
-
-只有显式增加 `--render` 才允许逐镜头生成真实视频：
+离线、自演、不生成视频：
 
 ```powershell
-python scripts/run_guided_story_selfplay.py --target-seconds 30 --max-turns 12 --render
+python scripts/run_guided_story_selfplay.py --target-seconds 45 --max-turns 12 --output outputs/selfplay_45
 ```
 
-## 确认和付费边界
+要求每次文本调用都成功走真实 Agnes 接口，任何本地降级都判失败：
 
-- 少于 5 条有效创作输入不能生成大纲。
-- 没有明确结局不能生成大纲。
-- 大纲未确认不能进入剧本阶段。
-- 制作细节未补齐不能生成剧本。
-- 剧本未确认不能生成分镜。
-- 分镜未确认时 `render_confirmed_plan()` 会在 Provider 调用前直接拒绝。
-- 自动测试和默认自演永远不会调用付费视频 API。
-
-## 核心接口
-
-```python
-session.submit_user_turn(text)
-session.build_outline()
-session.confirm_outline()
-session.answer_detail_question(text)
-session.build_script()
-session.confirm_script()
-session.build_storyboard()
-session.confirm_storyboard()
-session.render_confirmed_plan(renderer, output_dir)
+```powershell
+python scripts/run_guided_story_selfplay.py --target-seconds 30 --max-turns 12 --output outputs/live_text --require-live-text
 ```
 
-状态机为：
+只有以下命令会进入真实视频链路：
 
-```text
-collecting
-  -> outline_review
-  -> detailing
-  -> script_review
-  -> storyboard_review
-  -> render_ready
-  -> completed
+```powershell
+python scripts/run_guided_story_selfplay.py --target-seconds 30 --max-turns 12 --output outputs/live_video --require-live-text --render
 ```
 
-## 时长、旁白和视频
+输出包括 `transcript.json`、`story_bible.json`、`revisions.json`、`outline.json`、`script.json`、`storyboard.json`、`prompt_log.json`、`session.json` 和 `bench.json`。
 
-- 目标成片时长限制为 30–60 秒，默认 45 秒。
-- 当前 MVP 使用五个叙事镜头，每镜头必须为 3–15 秒，总时长误差不超过 1 秒。
-- Edge TTS 和 SRT 在任何视频请求前生成；TTS 失败时仍保留字幕和结构化分镜。
-- 每个视频镜头独立生成和保存，成功镜头可以断点复用。
-- FFmpeg 先拼接无声镜头，再封装旁白和字幕轨道。
+## 安全门禁
+
+- 少于 5 轮、缺少开头/目标/冲突/发展或转折/结局、存在未解决冲突时不能生成大纲。
+- 用户必须主动生成大纲；模型不能自行越级。
+- 大纲、剧本和分镜必须依次确认。
+- 预览、拒绝建议、候选重写均不覆盖已确认版本。
+- 自动测试和 CI 全部离线，绝不调用付费视频 API。
+- `--require-live-text` 禁止悄悄使用本地 fallback。
 
 ## 测试
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall -q guided_story_agent scripts
+python -m compileall -q guided_story_agent scripts tests
+python -m ruff check .
+git diff --check
 ```
 
-测试不会读取真实 API Key，也不会创建视频任务。当前覆盖：
+覆盖动态多事实提取、缺口选择、建议采用、冲突保护、三级编辑与版本回退、30/45/60 秒动态分镜、v0.1 只读迁移、人工 CLI、Gradio 事件和费用门禁。
 
-- 五轮和结局门禁；
-- 空输入、重复输入；
-- 大纲、剧本、分镜三级确认；
-- 30、45、60 秒精确分配；
-- 旁白先于视频；
-- Provider 缺少密钥时零请求失败；
-- 逐镜头失败 manifest；
-- 自演默认不生成视频；
-- Gradio 事件绑定和无浏览器 handler。
+## 项目边界
 
-## 当前边界
-
-- 项目是研究原型，不提供账号、数据库或多人协作。
-- LLM 输出经过本地字段和阶段校验；远程失败时回退本地规则 Agent。
-- 当前字幕以 MP4 字幕轨封装，不做角色口型同步。
-- 当前镜头数量固定为五个叙事节拍；后续可在不改变状态机的情况下扩展为更细镜头。
+- 这是可复现的研究 MVP，不包含账号、数据库、多人协作和商业任务队列。
+- 使用 Agnes 兼容文本接口和既有视频 Provider；真实接口可用性仍需用户显式运行在线测试确认。
+- Edge TTS 旁白和字幕在视频请求前准备；当前不做角色口型同步。
+- 本项目独立于已冻结的 `interactive-movie-agent v0.1.0`，不会修改旧仓库。
