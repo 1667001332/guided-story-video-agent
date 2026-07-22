@@ -5,6 +5,7 @@ import unittest
 import warnings
 
 from guided_story_agent import RuleBasedStoryAgent, Stage
+from guided_story_agent.agent import OpenAIStoryAgent
 from guided_story_agent.web_app import (
     build_app,
     card_grid_payload,
@@ -22,7 +23,7 @@ class CreativeGardenWebTests(unittest.TestCase):
         self.assertEqual([], session.selected_idea_ids)
         self.assertIn("暂无", selection)
         self.assertEqual(2, len(chat))
-        self.assertIn("不需要补字段", status)
+        self.assertIn("离线演示模式", status)
         self.assertIsNotNone(update)
 
     def test_render_progress_rejects_unconfirmed_session(self) -> None:
@@ -30,6 +31,14 @@ class CreativeGardenWebTests(unittest.TestCase):
         updates = list(render_video_with_progress(session, False))
         self.assertEqual(1, len(updates))
         self.assertIn("必须先确认", updates[0][2])
+
+    def test_web_explicitly_labels_offline_fallback(self) -> None:
+        session, _, _, _, status = start_garden_view(
+            "情人节杀人案", 30, OpenAIStoryAgent(None, "offline-test")
+        )
+        self.assertEqual(8, len(session.current_batch.cards))
+        self.assertIn("离线兜底", status)
+        self.assertIn("不是 LLM 结果", status)
 
     def test_app_has_native_multiselect_grid_and_no_dataframe(self) -> None:
         with warnings.catch_warnings():

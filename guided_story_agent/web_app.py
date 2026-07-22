@@ -577,8 +577,16 @@ def _selection_text(session: GuidedStorySession) -> str:
 
 
 def _status_text(session: GuidedStorySession) -> str:
+    if bool(getattr(session.agent, "last_used_fallback", False)):
+        reason = str(getattr(session.agent, "last_fallback_reason", "文本 API 不可用"))
+        return (
+            "⚠️ 当前展示的是离线兜底创意，不是 LLM 结果。"
+            f"原因：{reason}。请检查当前项目的 .env 后重试。"
+        )
     if session.stage == Stage.IDEATING:
-        return "不需要补字段：选卡、聊天或直接生成草稿都可以。"
+        if isinstance(session.agent, OpenAIStoryAgent):
+            return "✓ 已使用真实文本模型生成。选卡、聊天或直接生成草稿都可以。"
+        return "离线演示模式：选卡、聊天或直接生成草稿都可以。"
     if session.stage == Stage.DRAFT_REVIEW:
         return f"当前是第{session.draft.version}版草稿，可以改写或回到灵感区。"
     return f"当前阶段：{session.stage.value}"

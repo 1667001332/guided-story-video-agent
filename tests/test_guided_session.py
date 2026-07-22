@@ -34,6 +34,16 @@ class GuidedStorySessionV3Tests(unittest.TestCase):
         self.assertEqual(8, len({card.fingerprint for card in session.current_batch.cards}))
         self.assertEqual(1, session.free_text_count)
 
+    def test_murder_mystery_fallback_is_specific_not_template_substitution(self) -> None:
+        session = GuidedStorySession(agent=RuleBasedStoryAgent())
+        session.start_ideation("情人节杀人案")
+        cards = session.current_batch.cards
+        self.assertEqual(8, len(cards))
+        self.assertTrue(all("把“情人节杀人案”变成" not in card.logline for card in cards))
+        self.assertEqual(8, len({card.protagonist for card in cards}))
+        self.assertIn("死后送达的玫瑰", {card.title for card in cards})
+        self.assertTrue(all(len(card.central_conflict) >= 25 for card in cards))
+
     def test_one_sentence_can_generate_complete_draft_without_selection(self) -> None:
         session = started(30)
         draft = session.generate_draft()

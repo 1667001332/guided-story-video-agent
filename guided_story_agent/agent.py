@@ -94,6 +94,72 @@ class RuleBasedStoryAgent:
         "双时间线交错",
         "关键物件视角",
     )
+    _mystery_concepts = (
+        (
+            "死后送达的玫瑰",
+            "替同事值夜班的花店店员",
+            "死者在死亡十分钟后亲自下单了一束玫瑰",
+            "订单将在午夜自动删除，她必须赶在警察带走手机前找到真正收花人",
+            "都市悬疑",
+            "收花人正是店员自己，而订单是死者留给她的求救证据",
+        ),
+        (
+            "第九份不在场证明",
+            "专拍情侣合照的街头摄影师",
+            "八名嫌疑人的照片里都出现了同一只不属于现场的红气球",
+            "照片时间只相差一分钟，摄影师必须证明其中一张照片来自预先录制的街景",
+            "本格推理",
+            "所谓不在场证明其实是凶手为真正目击者准备的保护伞",
+        ),
+        (
+            "零点告白",
+            "准备在毕业前关闭节目的校园电台主持人",
+            "死者预先录好的告白在案发后准时播出，并直接叫出主持人的名字",
+            "下一段录音将在六分钟后公开凶手，但有人正在切断整栋楼的电源",
+            "校园惊悚",
+            "录音没有说出名字，而是用一句只有主持人听得懂的话指出共犯",
+        ),
+        (
+            "被剪掉的那句话",
+            "替警方修复语音的声音剪辑师",
+            "求救录音中每次出现“我爱你”都会少掉同一个人的呼吸声",
+            "她必须在嫌疑人销毁母带前，用环境回声还原案发房间和说话顺序",
+            "技术悬疑",
+            "被剪掉的并非凶手声音，而是死者主动隐瞒的保护对象",
+        ),
+        (
+            "最后一颗巧克力",
+            "第一次独立出现场的法医实习生",
+            "死者手中的巧克力写着凶手名字，但糖纸上的字迹会被体温融化",
+            "所有人都以为这是死亡留言，她却发现巧克力是在死者遇害后才被握进手里",
+            "冷峻反转",
+            "名字指向的不是凶手，而是唯一能证明死者真正死亡时间的人",
+        ),
+        (
+            "两人份的晚餐",
+            "记得每一位顾客门牌号的外卖骑手",
+            "独居死者家门口却摆着两双湿鞋和一份从未下单的双人套餐",
+            "骑手必须在凶手取回保温袋前，沿配送轨迹找出被调换的案发地点",
+            "现实犯罪",
+            "真正的谋杀现场不是公寓，而是骑手刚刚经过的停运餐厅",
+        ),
+        (
+            "心形盲区",
+            "商场监控室里即将退休的保安",
+            "所有摄像头同时转向情侣时，画面中央形成了六秒钟的心形盲区",
+            "保安必须只靠玻璃倒影和人群移动，还原凶手如何穿过封锁线",
+            "密室推理",
+            "制造盲区的人想掩盖的不是杀人过程，而是受害者仍活着离开的瞬间",
+        ),
+        (
+            "丘比特的最后一箭",
+            "在商场扮演丘比特的兼职演员",
+            "他的道具箭上出现血迹，而监控显示案发时只有“丘比特”接近过死者",
+            "同一套服装共有三件，他必须在巡游结束前找出谁交换了翅膀和箭袋",
+            "黑色幽默悬疑",
+            "真正的凶手没有穿丘比特服，交换服装的人是在替目击者争取逃跑时间",
+        ),
+    )
 
     def generate_ideas(
         self,
@@ -110,6 +176,8 @@ class RuleBasedStoryAgent:
             raise ValueError("请先给出一句方向。")
         anchors = anchors or []
         previous_cards = previous_cards or []
+        if mode == "diverge" and self._is_mystery(cleaned):
+            return self._mystery_batch(cleaned, round_number, feedback)
         offset = ((round_number - 1) * IDEA_COUNT) % len(self._concepts)
         concepts = [self._concepts[(offset + i) % len(self._concepts)] for i in range(IDEA_COUNT)]
         lens = self._lenses[(round_number - 3) % len(self._lenses)] if round_number > 2 else ""
@@ -126,15 +194,17 @@ class RuleBasedStoryAgent:
                 hook = f"融合{anchor_text}，重点采用{axis}结构"
             else:
                 protagonist = self._protagonist(cleaned, index)
-                hook = f"把“{cleaned}”变成{axis}故事"
+                hook = f"“{cleaned}”最平静的一刻，{conflict}"
             if lens:
                 axis = f"{axis}·{lens}"
                 hook = f"{hook}，并用{lens}重新组织因果"
             suffix = f"，并满足你的补充：{feedback}" if feedback else ""
             card = IdeaCard(
                 idea_id=f"idea-r{round_number}-{index}",
-                title=f"{axis}：{self._short_seed(cleaned)}",
-                logline=f"{protagonist}因为{hook}，{conflict}{suffix}。",
+                title=f"{axis}·{self._short_seed(cleaned)}",
+                logline=(
+                    f"{protagonist}卷入“{cleaned}”：{conflict}{suffix}；故事最终通向{ending}。"
+                ),
                 hook=hook,
                 protagonist=protagonist,
                 central_conflict=conflict,
@@ -150,6 +220,39 @@ class RuleBasedStoryAgent:
             recommended_id=cards[0].idea_id,
             feedback=feedback,
             generation_kind=mode,
+        )
+
+    def _mystery_batch(self, direction: str, round_number: int, feedback: str) -> IdeaBatch:
+        lens = "" if round_number == 1 else self._lenses[(round_number - 2) % len(self._lenses)]
+        preference = f"；同时遵守你的偏好：{feedback}" if feedback else ""
+        cards = []
+        for index, (title, protagonist, hook, conflict, tone, ending) in enumerate(
+            self._mystery_concepts, start=1
+        ):
+            if lens:
+                title = f"{title}·{lens}"
+                hook = f"{hook}，线索将用{lens}呈现"
+            cards.append(
+                IdeaCard(
+                    idea_id=f"idea-r{round_number}-{index}",
+                    title=title,
+                    logline=(
+                        f"{protagonist}卷入“{direction}”，发现{hook}；{conflict}{preference}。"
+                    ),
+                    hook=hook,
+                    protagonist=protagonist,
+                    central_conflict=conflict,
+                    tone=tone,
+                    ending_direction=ending,
+                    generation_kind="diverge",
+                )
+            )
+        return IdeaBatch(
+            round=round_number,
+            cards=cards,
+            recommended_id=cards[0].idea_id,
+            feedback=feedback,
+            generation_kind="diverge",
         )
 
     def expand_elements(self, direction: str, selected_cards: list[IdeaCard]) -> ElementPalette:
@@ -347,6 +450,13 @@ class RuleBasedStoryAgent:
     def _protagonist(direction: str, index: int) -> str:
         roles = ("谨慎的年轻人", "隐瞒秘密的快递员", "即将离开的学生", "失去记忆的老人")
         return roles[(index - 1) % len(roles)]
+
+    @staticmethod
+    def _is_mystery(direction: str) -> bool:
+        return any(
+            keyword in direction
+            for keyword in ("杀人", "谋杀", "命案", "凶案", "案件", "侦探", "推理")
+        )
 
 
 class OpenAIStoryAgent(RuleBasedStoryAgent):
@@ -572,7 +682,20 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 )
             except (KeyError, TypeError):
                 continue
-            if not all((card.title, card.logline, card.hook)) or card.fingerprint in seen:
+            if (
+                not all(
+                    (
+                        card.title,
+                        card.logline,
+                        card.hook,
+                        card.protagonist,
+                        card.central_conflict,
+                        card.ending_direction,
+                    )
+                )
+                or self._is_weak_card(card)
+                or card.fingerprint in seen
+            ):
                 continue
             seen.add(card.fingerprint)
             result.append(card)
@@ -584,6 +707,23 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 result.append(card)
                 seen.add(card.fingerprint)
         return result
+
+    @staticmethod
+    def _is_weak_card(card: IdeaCard) -> bool:
+        meta_patterns = (
+            r"把[“\"].+?[”\"]变成",
+            r"围绕.+?展开",
+            r"某个故事",
+            r"主角遇到困难",
+        )
+        combined = f"{card.title} {card.logline} {card.hook}"
+        return (
+            any(re.search(pattern, combined) for pattern in meta_patterns)
+            or len(card.protagonist) < 4
+            or len(card.hook) < 10
+            or len(card.central_conflict) < 12
+            or len(card.ending_direction) < 8
+        )
 
     @staticmethod
     def _draft_from(
@@ -655,20 +795,32 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         )
 
     def _json_completion(self, prompt_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": self._load_prompt(prompt_name)},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            temperature=0.65 if "idea_" in prompt_name else 0.25,
-            max_tokens=4000,
-        )
-        content = response.choices[0].message.content or ""
-        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-        if not match:
-            raise ValueError("model did not return JSON")
-        data = json.loads(match.group(0))
+            "temperature": 0.65 if "idea_" in prompt_name else 0.25,
+            "max_tokens": 4000,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            response = self.client.chat.completions.create(**request)
+        except Exception as exc:
+            message = str(exc).lower()
+            if "response_format" not in message and "json_object" not in message:
+                raise
+            request.pop("response_format")
+            response = self.client.chat.completions.create(**request)
+        content = (response.choices[0].message.content or "").strip()
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            if not match:
+                raise ValueError("model did not return a JSON object") from exc
+            data = json.loads(match.group(0))
         if not isinstance(data, dict):
             raise ValueError("model JSON must be an object")
         return data
