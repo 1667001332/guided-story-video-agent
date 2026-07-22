@@ -1,95 +1,130 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from guided_story_agent import CreativeBrief, GuidedStorySession, Stage
+from guided_story_agent import CreativeBrief, GuidedStorySession, RuleBasedStoryAgent, Stage
 from guided_story_agent.models import RenderManifest
 
 
-def complete_story(session: GuidedStorySession) -> None:
-    answers = [
-        "暴雨夜，邮差在废弃车站收到一封写给明天的信。",
-        "邮差必须在午夜前找到收信人，阻止一场事故。",
-        "冲突来自封锁车站的管理员，他阻止邮差进入站台。",
-        "邮差沿旧时刻表寻找线索，危险不断升级。",
-        "转折是收信人其实是过去的自己，最后他拉下制动杆救下乘客。",
-    ]
-    for answer in answers:
-        session.submit_user_turn(answer)
+def started(seconds: int = 45) -> GuidedStorySession:
+    session = GuidedStorySession(CreativeBrief(target_seconds=seconds), RuleBasedStoryAgent())
+    session.start_ideation("校园里发生一件带点悬疑的事")
+    return session
 
 
-def complete_details(session: GuidedStorySession) -> None:
-    answers = [
-        "主角穿深蓝旧制服和邮差帽，管理员穿灰色风衣。",
-        "故事发生在雨夜老车站、地下站台和停驶列车内。",
-        "关键道具是湿信封、铜怀表和红色制动杆。",
-        "第一人称低沉旁白，每句话简短克制。",
-        "用怀表特写做匹配剪辑，结尾回到空站台。",
-    ]
-    for answer in answers:
-        session.answer_detail_question(answer)
+class RepairableDraftAgent(RuleBasedStoryAgent):
+    def generate_draft(self, direction, selected_cards, selected_elements, target_seconds):
+        draft = super().generate_draft(direction, selected_cards, selected_elements, target_seconds)
+        for scene, beat in zip(draft.script.scenes, draft.outline.beats):
+            scene.duration = 3
+            beat.duration = 3
+        draft.script.scenes[0].action = ""
+        draft.script.scenes[0].visible_action = ""
+        return draft
 
 
-class GuidedStorySessionTests(unittest.TestCase):
-    def test_target_duration_must_be_between_30_and_60(self) -> None:
-        with self.assertRaises(ValueError):
-            GuidedStorySession(CreativeBrief(target_seconds=29))
-        with self.assertRaises(ValueError):
-            GuidedStorySession(CreativeBrief(target_seconds=61))
+class GuidedStorySessionV3Tests(unittest.TestCase):
+    def test_direction_immediately_creates_eight_distinct_cards(self) -> None:
+        session = started()
+        self.assertEqual(Stage.IDEATING, session.stage)
+        self.assertEqual(8, len(session.current_batch.cards))
+        self.assertEqual(8, len({card.fingerprint for card in session.current_batch.cards}))
+        self.assertEqual(1, session.free_text_count)
 
-    def test_empty_and_duplicate_turns_do_not_count(self) -> None:
-        session = GuidedStorySession()
-        self.assertFalse(session.submit_user_turn(" ").accepted)
-        first = session.submit_user_turn("暴雨夜，车站收到一封信。")
-        self.assertTrue(first.accepted)
-        self.assertFalse(session.submit_user_turn("暴雨夜，车站收到一封信。").accepted)
-        self.assertEqual(1, session.valid_turns)
+    def test_one_sentence_can_generate_complete_draft_without_selection(self) -> None:
+        session = started(30)
+        draft = session.generate_draft()
+        self.assertEqual(Stage.DRAFT_REVIEW, session.stage)
+        self.assertEqual(30, draft.script.total_duration)
+        self.assertEqual(5, len(draft.script.scenes))
+        self.assertGreater(len(draft.ai_filled_fields), 0)
+        self.assertTrue(all(field in draft.field_sources for field in draft.ai_filled_fields))
 
-    def test_fewer_than_five_turns_cannot_build_outline(self) -> None:
-        session = GuidedStorySession()
-        for text in ("开头", "目标", "冲突", "发展"):
-            session.submit_user_turn(text)
-        with self.assertRaises(RuntimeError):
-            session.build_outline()
+    def test_duration_and_empty_action_are_repaired_without_questioning_user(self) -> None:
+        session = GuidedStorySession(CreativeBrief(target_seconds=45), RepairableDraftAgent())
+        session.start_ideation("一个发生在天台的温暖故事")
+        draft = session.generate_draft()
+        self.assertEqual(45, draft.script.total_duration)
+        self.assertTrue(draft.script.scenes[0].visible_action)
 
-    def test_five_turns_without_ending_cannot_build_outline(self) -> None:
-        session = GuidedStorySession()
-        for text in ("开头", "目标", "冲突", "发展", "只有转折没有收尾"):
-            session.submit_user_turn(text)
-        self.assertFalse(session.can_build_outline)
-        self.assertIn("ending", session.facts.missing_outline_fields())
+    def test_selects_one_to_three_and_preserves_all_sources(self) -> None:
+        session = started()
+        ids = [card.idea_id for card in session.current_batch.cards[:3]]
+        session.select_ideas(ids)
+        draft = session.generate_draft()
+        self.assertEqual(set(ids), set(draft.field_sources["selected_ideas"].source_ids))
+        with self.assertRaisesRegex(ValueError, "最多"):
+            session.select_ideas([card.idea_id for card in session.current_batch.cards[:4]])
 
-    def test_five_meaningful_turns_with_ending_can_build_outline(self) -> None:
-        session = GuidedStorySession()
-        complete_story(session)
-        self.assertEqual(5, session.valid_turns)
-        self.assertTrue(session.can_build_outline)
-        outline = session.build_outline()
-        self.assertEqual(Stage.OUTLINE_REVIEW, session.stage)
-        self.assertIn("制动杆", outline.ending)
-        self.assertEqual([1, 2, 3, 4, 5], outline.source_turn_ids)
+    def test_more_like_and_mix_keep_sources(self) -> None:
+        session = started()
+        anchor = session.current_batch.cards[1]
+        similar = session.more_like(anchor.idea_id)
+        self.assertEqual(8, len(similar.cards))
+        self.assertTrue(all(anchor.idea_id in card.source_idea_ids for card in similar.cards))
+        selected = [card.idea_id for card in similar.cards[:2]]
+        session.select_ideas(selected)
+        mixed = session.mix_selected()
+        self.assertTrue(all(set(card.source_idea_ids) == set(selected) for card in mixed.cards))
 
-    def test_full_confirmation_flow_builds_timed_storyboard(self) -> None:
-        session = GuidedStorySession(CreativeBrief(target_seconds=45))
-        complete_story(session)
-        session.build_outline()
-        session.confirm_outline()
-        self.assertEqual(Stage.DETAILING, session.stage)
-        complete_details(session)
-        self.assertTrue(session.can_build_script)
-        script = session.build_script()
-        self.assertEqual(45, script.total_duration)
-        session.confirm_script()
-        plan = session.build_storyboard()
-        self.assertEqual(45, plan.total_duration)
-        self.assertTrue(all(3 <= shot.duration <= 15 for shot in plan.shots))
-        session.confirm_storyboard()
-        self.assertEqual(Stage.RENDER_READY, session.stage)
+    def test_refresh_does_not_repeat_previous_batch(self) -> None:
+        session = started()
+        seen: set[str] = set()
+        for _ in range(5):
+            current = {card.fingerprint for card in session.current_batch.cards}
+            self.assertTrue(seen.isdisjoint(current))
+            seen.update(current)
+            session.refresh_ideas()
 
-    def test_rendering_is_blocked_before_storyboard_confirmation(self) -> None:
-        session = GuidedStorySession()
+    def test_elements_are_optional_four_by_four_and_explicit_choice_wins(self) -> None:
+        session = started()
+        palette = session.expand_selected()
+        self.assertEqual(
+            {"character", "conflict", "turning_point", "ending"},
+            set(palette.options),
+        )
+        self.assertTrue(all(len(options) == 4 for options in palette.options.values()))
+        ending = palette.options["ending"][2]
+        session.choose_element("ending", ending.option_id)
+        draft = session.generate_draft()
+        self.assertEqual(ending.content, draft.outline.ending)
+        self.assertEqual("selected_element", draft.field_sources["ending"].source_type)
+
+    def test_draft_versions_survive_return_to_ideas(self) -> None:
+        session = started()
+        first = session.generate_draft()
+        session.back_to_ideation()
+        self.assertIs(first, session.draft)
+        session.refresh_ideas()
+        session.auto_choose()
+        second = session.generate_draft()
+        self.assertEqual(2, second.version)
+        self.assertEqual(2, len(session.draft_history))
+
+    def test_revision_cannot_silently_change_selected_card(self) -> None:
+        session = started()
+        selected = session.current_batch.cards[0]
+        session.select_ideas([selected.idea_id])
+        session.generate_draft()
+        revised = session.revise_draft("让结局更安静")
+        self.assertEqual(selected.ending_direction, revised.outline.ending)
+        self.assertEqual([selected.idea_id], revised.field_sources["selected_ideas"].source_ids)
+
+    def test_duration_and_dynamic_storyboards(self) -> None:
+        for seconds, expected_shots in {30: 5, 45: 8, 60: 10}.items():
+            session = started(seconds)
+            session.generate_draft()
+            session.confirm_draft()
+            storyboard = session.build_storyboard()
+            self.assertEqual(expected_shots, len(storyboard.shots))
+            self.assertEqual(seconds, storyboard.total_duration)
+            self.assertTrue(all(3 <= shot.duration <= 15 for shot in storyboard.shots))
+
+    def test_render_is_blocked_until_confirmation(self) -> None:
+        session = started()
 
         class SpyRenderer:
             def render(self, plan, output_dir):
@@ -98,14 +133,10 @@ class GuidedStorySessionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             session.render_confirmed_plan(SpyRenderer(), "outputs")
 
-    def test_successful_render_moves_session_to_completed(self) -> None:
-        session = GuidedStorySession()
-        complete_story(session)
-        session.build_outline()
-        session.confirm_outline()
-        complete_details(session)
-        session.build_script()
-        session.confirm_script()
+    def test_successful_render_moves_to_completed(self) -> None:
+        session = started(30)
+        session.generate_draft()
+        session.confirm_draft()
         session.build_storyboard()
         session.confirm_storyboard()
 
@@ -113,18 +144,31 @@ class GuidedStorySessionTests(unittest.TestCase):
             def render(self, plan, output_dir):
                 return RenderManifest(status="succeeded", output_dir=str(output_dir))
 
-        result = session.render_confirmed_plan(Renderer(), "outputs")
-        self.assertEqual("succeeded", result.status)
+        session.render_confirmed_plan(Renderer(), "outputs")
         self.assertEqual(Stage.COMPLETED, session.stage)
 
-    def test_session_exports_traceable_json(self) -> None:
-        session = GuidedStorySession()
-        complete_story(session)
+    def test_schema_v3_roundtrip_and_v2_read_only_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = session.save(Path(temp_dir) / "session.json")
-            content = path.read_text(encoding="utf-8")
-        self.assertIn('"source": "human"', content)
-        self.assertIn('"opening"', content)
+            session = started()
+            session.auto_choose()
+            session.generate_draft()
+            path = session.save(Path(temp_dir) / "v3.json")
+            loaded = GuidedStorySession.load(path, agent=RuleBasedStoryAgent())
+            self.assertEqual(3, json.loads(path.read_text(encoding="utf-8"))["schema_version"])
+            self.assertEqual(session.direction, loaded.direction)
+            self.assertEqual(session.selected_idea_ids, loaded.selected_idea_ids)
+
+            old_path = Path(temp_dir) / "v2.json"
+            old_data = {
+                "schema_version": 2,
+                "stage": "collecting",
+                "brief": {"target_seconds": 30},
+                "facts": {"opening": "旧版开头", "ending": "旧版结局"},
+            }
+            old_path.write_text(json.dumps(old_data, ensure_ascii=False), encoding="utf-8")
+            migrated = GuidedStorySession.load(old_path, agent=RuleBasedStoryAgent())
+            self.assertEqual("旧版开头", migrated.facts.opening)
+            self.assertEqual(old_data, json.loads(old_path.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

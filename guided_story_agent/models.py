@@ -7,6 +7,8 @@ from typing import Any
 
 
 class Stage(str, Enum):
+    IDEATING = "ideating"
+    DRAFT_REVIEW = "draft_review"
     COLLECTING = "collecting"
     OUTLINE_REVIEW = "outline_review"
     DETAILING = "detailing"
@@ -109,6 +111,80 @@ class CreativeSuggestion:
     label: str
     content: str
     target_field: str
+
+
+@dataclass(slots=True)
+class IdeaCard:
+    idea_id: str
+    title: str
+    logline: str
+    hook: str
+    protagonist: str
+    central_conflict: str
+    tone: str
+    ending_direction: str
+    source_idea_ids: list[str] = field(default_factory=list)
+    generation_kind: str = "diverge"
+
+    @property
+    def fingerprint(self) -> str:
+        return " ".join(f"{self.title} {self.logline} {self.hook}".lower().split())
+
+
+@dataclass(slots=True)
+class IdeaBatch:
+    round: int
+    cards: list[IdeaCard]
+    recommended_id: str = ""
+    feedback: str = ""
+    generation_kind: str = "diverge"
+
+
+@dataclass(slots=True)
+class ElementOption:
+    option_id: str
+    kind: str
+    title: str
+    content: str
+    source_idea_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ElementPalette:
+    options: dict[str, list[ElementOption]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SelectionState:
+    selected_idea_ids: list[str] = field(default_factory=list)
+    selected_elements: dict[str, str] = field(default_factory=dict)
+    can_generate_draft: bool = False
+
+
+@dataclass(slots=True)
+class SourceAttribution:
+    field: str
+    source_type: str
+    value: str
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DraftBundle:
+    outline: StoryOutline
+    script: StoryScript
+    field_sources: dict[str, SourceAttribution] = field(default_factory=dict)
+    ai_filled_fields: list[str] = field(default_factory=list)
+    version: int = 1
+
+
+@dataclass(slots=True)
+class IdeationTurnResult:
+    message: str
+    batch: IdeaBatch | None
+    selection: SelectionState
+    available_actions: list[str] = field(default_factory=list)
+    used_fallback: bool = False
 
 
 @dataclass(slots=True)
@@ -272,9 +348,7 @@ class ArtifactRevision:
     parent_version: int | None = None
     user_feedback: str = ""
     source_turn_ids: list[int] = field(default_factory=list)
-    created_at: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     confirmed: bool = False
 
 

@@ -1,7 +1,7 @@
 [project]
 name = "guided-story-video-agent"
-version = "0.2.0"
-description = "A research agent that guides a creator from an opening sentence to a timed storyboard and video plan."
+version = "0.3.0"
+description = "A low-pressure idea garden that turns one direction into selectable story cards, a timed script, and video."
 requires-python = ">=3.10"
 dependencies = [
   "openai>=1.0,<3",

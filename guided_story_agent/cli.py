@@ -1,26 +1,26 @@
 from __future__ import annotations
 
 import argparse
-import json
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
-from .models import CreativeBrief, Stage, to_plain_data
+from .models import CreativeBrief, Stage
 from .rendering import StoryRenderer
 from .session import GuidedStorySession
 from .video_provider import AgnesVideoProvider
 
 
 HELP = """可用命令：
-/suggest  获取三个非强制方向      /use 2  采用第二条建议
-/show     查看故事圣经            /outline 生成大纲候选
-/edit     编辑事实或当前产物      /revise  按反馈局部重写
-/review   运行质量检查            /undo    撤销当前产物
-/redo     重做当前产物            /confirm 确认并推进阶段
-/render   明确进入付费视频生成    /quit    保存并退出
+/pick 1 3       保留第1和第3张卡     /more 2      生成8个相似方向
+/refresh        换一批8张卡          /mix        混合已选卡
+/expand         展开四类故事零件      /choose ending 3  选择结局3
+/auto           让AI替你选择          /draft      随时生成剧本草稿
+/revise         用一句反馈改写         /back       回到灵感区
+/storyboard     接受草稿并生成分镜     /render     付费视频入口
+/quit           保存并退出
 """
 
 
@@ -38,15 +38,17 @@ def run_interactive(
     active_agent = agent or RuleBasedStoryAgent()
     fallback_before = int(getattr(active_agent, "fallback_count", 0))
     if require_live_text and getattr(active_agent, "client", None) is None:
-        raise RuntimeError("--require-live-text 已启用，但没有可用的真实文本 API 配置。")
+        raise RuntimeError("--require-live-text 已启用，但没有可用的真实文本API配置。")
     session = GuidedStorySession(CreativeBrief(target_seconds=target_seconds), active_agent)
     target = Path(output_dir).expanduser().resolve()
-    output_fn("引导式剧本共创已开始。AI 每次只追问一个关键缺口。")
+    output_fn("一句话剧本创意花园：你只需要先说一个方向。")
+    direction = input_fn("方向：").strip()
+    session.start_ideation(direction)
+    _print_cards(session, output_fn)
     output_fn(HELP)
-    output_fn(f"AI：{session.current_question}")
 
     while True:
-        raw = input_fn("你：").strip()
+        raw = input_fn("操作：").strip()
         if not raw:
             continue
         try:
@@ -54,46 +56,69 @@ def run_interactive(
                 break
             if raw == "/help":
                 output_fn(HELP)
-            elif raw == "/suggest":
-                suggestions = session.request_suggestions()
-                for index, item in enumerate(suggestions, 1):
-                    output_fn(f"{index}. {item.content}")
-            elif raw.startswith("/use"):
-                index = int(raw.removeprefix("/use").strip()) - 1
-                suggestions = session.request_suggestions()
-                if index not in range(len(suggestions)):
-                    raise ValueError("建议编号必须是 1、2 或 3。")
-                _print_turn(session.apply_suggestion(suggestions[index].suggestion_id), output_fn)
-            elif raw == "/show":
-                output_fn(json.dumps(to_plain_data(session.story_bible), ensure_ascii=False, indent=2))
-            elif raw == "/outline":
-                session.build_outline()
-                output_fn(_artifact_text(session))
-            elif raw == "/edit":
-                _edit_current(session, input_fn, output_fn)
+            elif raw.startswith("/pick") or raw.startswith("/use"):
+                command = "/pick" if raw.startswith("/pick") else "/use"
+                indexes = [int(item) for item in raw.removeprefix(command).split()]
+                cards = session.current_batch.cards
+                session.select_ideas([cards[index - 1].idea_id for index in indexes])
+                output_fn(_selection_text(session))
+            elif raw.startswith("/more"):
+                index = int(raw.removeprefix("/more").strip())
+                session.more_like(session.current_batch.cards[index - 1].idea_id)
+                _print_cards(session, output_fn)
+            elif raw in ("/refresh", "/suggest"):
+                session.refresh_ideas()
+                _print_cards(session, output_fn)
+            elif raw == "/mix":
+                session.mix_selected()
+                _print_cards(session, output_fn)
+            elif raw == "/expand":
+                palette = session.expand_selected()
+                for kind, options in palette.options.items():
+                    output_fn(f"[{kind}]")
+                    for index, option in enumerate(options, 1):
+                        output_fn(f"  {index}. {option.title}｜{option.content}")
+            elif raw.startswith("/choose"):
+                _, kind, index_text = raw.split(maxsplit=2)
+                option = session.element_palette.options[kind][int(index_text) - 1]
+                session.choose_element(kind, option.option_id)
+                output_fn(f"已保留 {kind}：{option.title}")
+            elif raw == "/auto":
+                session.auto_choose()
+                output_fn(_selection_text(session))
+            elif raw in ("/draft", "/outline"):
+                draft = session.generate_draft()
+                _print_draft(draft, output_fn)
             elif raw == "/revise":
-                feedback = input_fn("修改意见：").strip()
-                _revise_current(session, feedback)
-                output_fn(_artifact_text(session))
-            elif raw == "/review":
-                review = session.review_current_artifact()
-                output_fn(json.dumps(to_plain_data(review), ensure_ascii=False, indent=2))
-            elif raw == "/undo":
-                session.undo_artifact()
-                output_fn("已撤销到上一版本。")
-            elif raw == "/redo":
-                session.redo_artifact()
-                output_fn("已恢复下一版本。")
+                feedback = input_fn("一句话修改：").strip()
+                draft = session.revise_draft(feedback)
+                _print_draft(draft, output_fn)
+            elif raw == "/back":
+                session.back_to_ideation()
+                _print_cards(session, output_fn)
+            elif raw == "/storyboard":
+                session.confirm_draft()
+                plan = session.build_storyboard()
+                output_fn(f"已生成 {len(plan.shots)} 个镜头，总时长 {plan.total_duration} 秒。")
             elif raw == "/confirm":
-                _confirm_and_advance(session, output_fn)
+                if session.stage == Stage.DRAFT_REVIEW:
+                    session.confirm_draft()
+                    output_fn("草稿已确认；输入 /storyboard 生成分镜。")
+                elif session.stage == Stage.STORYBOARD_REVIEW:
+                    session.confirm_storyboard()
+                    output_fn("分镜已确认。")
+                else:
+                    raise RuntimeError("当前没有需要确认的内容。")
             elif raw == "/render":
                 if not allow_render:
-                    raise RuntimeError("本次 CLI 未使用 --render 启动，付费调用保持关闭。")
+                    raise RuntimeError("本次CLI未使用 --render 启动，付费调用保持关闭。")
+                if session.stage == Stage.STORYBOARD_REVIEW:
+                    session.confirm_storyboard()
                 if session.stage != Stage.RENDER_READY:
-                    raise RuntimeError("必须先确认分镜。")
-                confirmation = input_fn("会调用付费视频 API。输入 RENDER 二次确认：").strip()
+                    raise RuntimeError("必须先生成并确认分镜。")
+                confirmation = input_fn("会调用付费视频API。输入 RENDER 二次确认：").strip()
                 if confirmation != "RENDER":
-                    output_fn("已取消，没有调用视频 API。")
+                    output_fn("已取消，没有调用视频API。")
                     continue
                 renderer = (
                     renderer_factory()
@@ -104,17 +129,18 @@ def run_interactive(
                 output_fn(f"视频状态：{manifest.status}｜{manifest.final_video_path}")
             elif raw.startswith("/"):
                 output_fn("未知命令，输入 /help 查看帮助。")
-            elif session.stage == Stage.COLLECTING:
-                _print_turn(session.submit_user_turn(raw), output_fn)
-            elif session.stage == Stage.DETAILING:
-                _print_turn(session.answer_detail_question(raw), output_fn)
             else:
-                output_fn("当前在产物审阅阶段，请使用 /edit、/revise、/review 或 /confirm。")
+                result = session.chat_ideation(raw)
+                output_fn(result.message)
+                _print_cards(session, output_fn)
 
-            if require_live_text and int(getattr(active_agent, "fallback_count", 0)) > fallback_before:
+            if (
+                require_live_text
+                and int(getattr(active_agent, "fallback_count", 0)) > fallback_before
+            ):
                 reason = str(getattr(active_agent, "last_fallback_reason", "未知原因"))
                 raise RuntimeError(f"真实文本链路发生本地降级：{reason}")
-        except (RuntimeError, ValueError, IndexError, json.JSONDecodeError) as exc:
+        except (RuntimeError, ValueError, IndexError) as exc:
             output_fn(f"未执行：{exc}")
 
     target.mkdir(parents=True, exist_ok=True)
@@ -123,85 +149,32 @@ def run_interactive(
     return session
 
 
-def _print_turn(result: Any, output_fn: Callable[[str], None]) -> None:
-    output_fn(f"AI：{result.assistant_message}")
-    if result.extracted_facts:
-        summary = "；".join(f"{item.field}={item.value}" for item in result.extracted_facts)
-        output_fn(f"已理解：{summary}")
-    output_fn(f"完成度：{round(result.readiness_score * 100)}%")
-    if result.next_question:
-        output_fn(f"AI：{result.next_question}")
+def _print_cards(session: GuidedStorySession, output_fn: Callable[[str], None]) -> None:
+    output_fn("\n8张创意卡：")
+    for index, card in enumerate(session.current_batch.cards, 1):
+        output_fn(f"{index}. 《{card.title}》｜{card.logline}｜{card.tone}")
 
 
-def _edit_current(
-    session: GuidedStorySession,
-    input_fn: Callable[[str], str],
-    output_fn: Callable[[str], None],
-) -> None:
-    if session.stage in (Stage.COLLECTING, Stage.DETAILING):
-        raw = input_fn("输入 字段=新内容：")
-        field, value = raw.split("=", 1)
-        session.update_story_bible({field.strip(): value.strip()})
-    elif session.stage == Stage.OUTLINE_REVIEW:
-        patch = json.loads(input_fn('输入大纲 JSON patch，如 {"title":"新标题"}：'))
-        session.update_outline(patch)
-    elif session.stage == Stage.SCRIPT_REVIEW:
-        scene_id = int(input_fn("场景编号："))
-        field, value = input_fn("输入 字段=新内容：").split("=", 1)
-        session.update_script_scene(scene_id, {field.strip(): value.strip()})
-    elif session.stage in (Stage.STORYBOARD_REVIEW, Stage.RENDER_READY):
-        shot_id = int(input_fn("镜头编号："))
-        field, value = input_fn("输入 字段=新内容：").split("=", 1)
-        session.update_storyboard_shot(shot_id, {field.strip(): value.strip()})
-    else:
-        raise RuntimeError("当前没有可编辑内容。")
-    output_fn("修改已保存为新版本。")
+def _selection_text(session: GuidedStorySession) -> str:
+    return "已保留：" + ("、".join(card.title for card in session.selected_cards) or "暂无")
 
 
-def _revise_current(session: GuidedStorySession, feedback: str) -> None:
-    if session.stage == Stage.OUTLINE_REVIEW:
-        session.revise_outline(feedback)
-    elif session.stage == Stage.SCRIPT_REVIEW:
-        session.revise_script(feedback)
-    elif session.stage in (Stage.STORYBOARD_REVIEW, Stage.RENDER_READY):
-        session.revise_storyboard(feedback)
-    else:
-        raise RuntimeError("当前阶段没有可局部重写的产物。")
-
-
-def _confirm_and_advance(
-    session: GuidedStorySession, output_fn: Callable[[str], None]
-) -> None:
-    if session.stage == Stage.OUTLINE_REVIEW:
-        session.confirm_outline()
-        output_fn(f"大纲已确认。AI：{session.current_question}")
-    elif session.stage == Stage.DETAILING:
-        session.build_script()
-        output_fn("定时剧本候选已生成，请先审阅再确认。")
-    elif session.stage == Stage.SCRIPT_REVIEW and session.script and not session.script.confirmed:
-        session.confirm_script()
-        output_fn("剧本已确认；再次输入 /confirm 生成分镜候选。")
-    elif session.stage == Stage.SCRIPT_REVIEW:
-        session.build_storyboard()
-        output_fn("分镜候选已生成，请逐镜头审阅。")
-    elif session.stage == Stage.STORYBOARD_REVIEW:
-        session.confirm_storyboard()
-        output_fn("分镜已确认。付费视频仍需 /render 和 RENDER 二次确认。")
-    else:
-        raise RuntimeError("当前阶段没有待确认产物。")
-
-
-def _artifact_text(session: GuidedStorySession) -> str:
-    artifact = session.storyboard or session.script or session.outline
-    return json.dumps(to_plain_data(artifact), ensure_ascii=False, indent=2)
+def _print_draft(draft, output_fn: Callable[[str], None]) -> None:
+    output_fn(f"\n《{draft.script.title}》第{draft.version}版")
+    output_fn("AI补全：" + ("、".join(draft.ai_filled_fields) or "无"))
+    for scene in draft.script.scenes:
+        output_fn(
+            f"场景{scene.scene_id} {scene.duration}秒｜{scene.title}｜"
+            f"{scene.visible_action or scene.action}"
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="人工参与的引导式剧本共创 CLI")
+    parser = argparse.ArgumentParser(description="一句话剧本创意花园CLI")
     parser.add_argument("--target-seconds", type=int, default=45, choices=range(30, 61))
     parser.add_argument("--output", default="")
     parser.add_argument("--require-live-text", action="store_true")
-    parser.add_argument("--render", action="store_true", help="允许进入二次确认后的付费视频生成")
+    parser.add_argument("--render", action="store_true", help="允许二次确认后的付费视频生成")
     args = parser.parse_args()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or f"outputs/manual_cli/{stamp}"

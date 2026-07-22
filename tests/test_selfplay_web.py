@@ -1,147 +1,120 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
 import unittest
 import warnings
-from pathlib import Path
 
 from guided_story_agent import RuleBasedStoryAgent, Stage
-from guided_story_agent.selfplay import run_selfplay
 from guided_story_agent.web_app import (
     build_app,
-    build_outline_view,
-    initialize_view,
+    card_grid_payload,
     render_video_with_progress,
-    submit_message,
+    start_garden_view,
 )
 
 
-class SelfPlayWebTests(unittest.TestCase):
-    def test_selfplay_completes_without_video_request(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            result = run_selfplay(
-                agent=RuleBasedStoryAgent(),
-                target_seconds=45,
-                max_turns=12,
-                output_dir=temp_dir,
-                render=False,
-            )
-            bench = result["bench"]
-            self.assertFalse(bench["video_requested"])
-            self.assertTrue(bench["duration_within_tolerance"])
-            self.assertTrue((Path(temp_dir) / "transcript.json").is_file())
-            self.assertTrue((Path(temp_dir) / "storyboard.json").is_file())
-            self.assertEqual(Stage.RENDER_READY, result["session"].stage)
+class CreativeGardenWebTests(unittest.TestCase):
+    def test_start_handler_returns_eight_cards(self) -> None:
+        session, update, selection, chat, status = start_garden_view(
+            "校园悬疑", 30, RuleBasedStoryAgent()
+        )
+        self.assertEqual(8, len(card_grid_payload(session)["cards"]))
+        self.assertEqual([], session.selected_idea_ids)
+        self.assertIn("暂无", selection)
+        self.assertEqual(2, len(chat))
+        self.assertIn("不需要补字段", status)
+        self.assertIsNotNone(update)
 
-    def test_web_handlers_are_thin_and_testable(self) -> None:
-        session, chat, outline, script, storyboard, status = initialize_view(30)
-        self.assertEqual(30, session.brief.target_seconds)
-        self.assertIsNone(outline)
-        self.assertIn("开头", chat[0]["content"])
-        returned, chat, cleared, status = submit_message(session, "雨夜，车站出现一封信。", chat)
-        self.assertIs(returned, session)
-        self.assertEqual("", cleared)
-        self.assertEqual(1, session.valid_turns)
-        _, payload, status = build_outline_view(session)
-        self.assertIsNone(payload)
-        self.assertIn("尚未达到", status)
-
-    def test_render_progress_rejects_unconfirmed_session_without_provider(self) -> None:
-        session, *_ = initialize_view(45)
-        updates = list(render_video_with_progress(session))
+    def test_render_progress_rejects_unconfirmed_session(self) -> None:
+        session, *_ = start_garden_view("校园悬疑", 30, RuleBasedStoryAgent())
+        updates = list(render_video_with_progress(session, False))
         self.assertEqual(1, len(updates))
         self.assertIn("必须先确认", updates[0][2])
 
-    def test_gradio_app_exposes_core_handlers(self) -> None:
+    def test_app_has_native_multiselect_grid_and_no_dataframe(self) -> None:
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ResourceWarning)
+            warnings.simplefilter("ignore")
             app = build_app()
         self.addCleanup(app.close)
-        dependency_names = {
-            getattr(dependency.fn, "__name__", "")
-            for dependency in app.fns.values()
-            if getattr(dependency, "fn", None)
-        }
-        self.assertIn("submit_message", dependency_names)
-        self.assertIn("render_video_with_progress", dependency_names)
+        card_grids = [
+            component
+            for component in app.blocks.values()
+            if "idea-card-grid" in (getattr(component, "elem_classes", []) or [])
+        ]
+        self.assertEqual(1, len(card_grids))
+        names = {component.__class__.__name__ for component in app.blocks.values()}
+        self.assertNotIn("Dataframe", names)
+        api_names = {dependency.api_name for dependency in app.fns.values() if dependency.api_name}
+        for name in (
+            "start_ideation",
+            "select_ideas",
+            "mix_selected",
+            "auto_choose",
+            "generate_draft",
+            "back_to_ideas",
+            "render_video",
+        ):
+            self.assertIn(name, api_names)
 
-    def test_gradio_process_api_initializes_real_component_outputs(self) -> None:
+    def test_process_api_one_sentence_select_and_draft(self) -> None:
         from gradio.state_holder import SessionState
 
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ResourceWarning)
-            app = build_app()
-        self.addCleanup(app.close)
-        state = SessionState(app)
-
-        async def process() -> dict:
-            return await app.process_api(0, [30], state=state)
-
-        initialized = asyncio.run(process())
-        self.assertEqual(11, len(initialized["data"]))
-        self.assertIn("开头", initialized["data"][1][0]["content"])
-        self.assertIsNone(initialized["data"][2])
-        self.assertIn("新创作已开始", initialized["data"][5])
-        self.assertTrue(initialized["data"][6])
-
-    def test_gradio_process_api_covers_suggestion_edit_undo_confirm_and_cost_gate(self) -> None:
-        from gradio.state_holder import SessionState
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ResourceWarning)
+            warnings.simplefilter("ignore")
             app = build_app()
         self.addCleanup(app.close)
         state = SessionState(app)
         indexes = {
-            getattr(dependency.fn, "__name__", ""): index
+            dependency.api_name: index
             for index, dependency in app.fns.items()
-            if getattr(dependency, "fn", None)
+            if dependency.api_name
         }
 
         async def process() -> None:
-            initialized = await app.process_api(indexes["initialize_view"], [30], state=state)
-            submitted = await app.process_api(
-                indexes["submit_message"],
-                [None, "雨夜，一封信落在车站。", initialized["data"][1]],
-                state=state,
+            started = await app.process_api(
+                indexes["start_ideation"], ["校园悬疑", 30], state=state
             )
-            self.assertEqual(3, len(submitted["data"][8]["choices"]))
-            suggestion_id = submitted["data"][8]["choices"][0][1]
-            used = await app.process_api(
-                indexes["apply_suggestion_view"],
-                [None, suggestion_id, submitted["data"][1]],
-                state=state,
+            grid = started["data"][1]
+            self.assertEqual(8, len(grid["choices"]))
+            first_id = grid["choices"][0][1]
+            selected = await app.process_api(
+                indexes["select_ideas"], [None, [first_id]], state=state
             )
-            bible = used["data"][3]
-            theme_row = next(row for row in bible["data"] if row[0] == "主题")
-            theme_row[1] = "记忆与承担"
-            await app.process_api(
-                indexes["save_story_bible_view"], [None, bible], state=state
-            )
-            state_id = app.fns[indexes["save_story_bible_view"]].inputs[0]._id
-            active_session = state[state_id]
-            self.assertEqual("记忆与承担", active_session.facts.theme)
-            await app.process_api(indexes["undo_current"], [None], state=state)
-            self.assertEqual("", active_session.facts.theme)
+            self.assertIn(first_id, selected["data"][1]["value"])
+            mixed = await app.process_api(indexes["mix_selected"], [None], state=state)
+            self.assertEqual(8, len(mixed["data"][1]["choices"]))
+            auto = await app.process_api(indexes["auto_choose"], [None], state=state)
+            self.assertEqual(1, len(auto["data"][1]["value"]))
+            drafted = await app.process_api(indexes["generate_draft"], [None], state=state)
+            self.assertIn("场景 1", drafted["data"][1])
+            state_id = app.fns[indexes["generate_draft"]].inputs[0]._id
+            active = state[state_id]
+            self.assertEqual(Stage.DRAFT_REVIEW, active.stage)
+            await app.process_api(indexes["back_to_ideas"], [None], state=state)
+            self.assertIsNotNone(active.draft)
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                ready = run_selfplay(
-                    agent=RuleBasedStoryAgent(), target_seconds=30, max_turns=12,
-                    output_dir=temp_dir,
-                )["session"]
-                ready.update_storyboard_shot(1, {"action": "主角停步回头。"})
-                confirm_id = app.fns[indexes["confirm_storyboard_view"]].inputs[0]._id
-                state[confirm_id] = ready
-                confirmed = await app.process_api(
-                    indexes["confirm_storyboard_view"], [None], state=state
-                )
-                self.assertIn("分镜已确认", confirmed["data"][1])
-                blocked = await app.process_api(
-                    indexes["render_video_with_progress"], [None, False], state=state
-                )
-                self.assertIn("费用确认", blocked["data"][2])
-                self.assertIsNone(ready.render_manifest)
+        asyncio.run(process())
+
+    def test_process_api_paid_gate_does_not_call_provider(self) -> None:
+        from gradio.state_holder import SessionState
+
+        app = build_app()
+        self.addCleanup(app.close)
+        state = SessionState(app)
+        indexes = {
+            dependency.api_name: index
+            for index, dependency in app.fns.items()
+            if dependency.api_name
+        }
+
+        async def process() -> None:
+            await app.process_api(indexes["start_ideation"], ["雨夜车站", 30], state=state)
+            await app.process_api(indexes["auto_choose"], [None], state=state)
+            await app.process_api(indexes["generate_draft"], [None], state=state)
+            await app.process_api(indexes["build_storyboard"], [None], state=state)
+            await app.process_api(indexes["confirm_storyboard"], [None], state=state)
+            blocked = await app.process_api(indexes["render_video"], [None, False], state=state)
+            self.assertIn("费用确认", blocked["data"][2])
 
         asyncio.run(process())
 
