@@ -616,45 +616,17 @@ footer{display:none!important}
 }
 .assistant-note strong{color:var(--studio-ink)}
 .compact-accordion{border-color:var(--studio-line)!important;border-radius:14px!important}
-.cinema-surface{
-  padding:28px 30px 36px!important;background:
-    radial-gradient(circle at 88% 0,rgba(105,216,208,.08),transparent 30rem),
-    var(--studio-night)!important;color:#f2f3f3!important;
-}
-.cinema-surface .stage-kicker{color:var(--studio-cyan)}
-.cinema-surface .stage-heading{color:#fff}
-.cinema-surface .stage-copy{color:#9fa6aa}
-.cinema-panel{
-  padding:22px!important;border:1px solid var(--studio-night-line)!important;
-  border-radius:18px!important;background:var(--studio-night-panel)!important;
-  box-shadow:0 18px 45px rgba(0,0,0,.22)!important;
-}
-.cinema-panel label,.cinema-panel .label-wrap span{color:#c6cbce!important}
-.cinema-copy{color:#e8ebec!important}
-.cinema-copy h3{color:#fff!important;font-size:24px!important}
-.cinema-copy strong{color:var(--studio-cyan)!important}
-.cinema-copy p{line-height:1.75}
-.cinema-copy hr{border-color:var(--studio-night-line)}
-.cinema-surface input,.cinema-surface textarea,.cinema-surface .secondary-wrap{
-  background:#101214!important;color:#f3f4f4!important;border-color:#343a3e!important;
-}
-.cinema-panel .block{
-  background:transparent!important;border-color:var(--studio-night-line)!important;
-}
-.cinema-panel .block.padded{padding:12px!important}
-.cinema-panel .block .container{background:transparent!important}
-.cinema-surface button.secondary{
-  background:#24282c!important;color:#e7e9ea!important;border-color:#393f44!important;
-}
-.cinema-primary{
-  background:var(--studio-cyan)!important;border-color:var(--studio-cyan)!important;
-  color:#10201f!important;font-weight:780!important;
-  box-shadow:0 9px 22px rgba(105,216,208,.16)!important;
-}
 .shot-strip{
-  padding:13px 15px;border:1px solid var(--studio-night-line);border-radius:14px;
-  color:#9fa6aa;background:#15181a;font-size:12px;letter-spacing:.04em;
+  padding:13px 15px;border:1px solid var(--studio-line);border-radius:14px;
+  color:#756c65;background:#f6f2ec;font-size:12px;letter-spacing:.04em;
 }
+.storyboard-paper{min-height:620px}
+.storyboard-copy{color:var(--studio-ink)}
+.storyboard-copy h3{font-size:24px!important;letter-spacing:-.02em!important}
+.storyboard-copy strong{color:var(--studio-accent-dark)!important}
+.storyboard-copy p{line-height:1.78}
+.storyboard-copy hr{border-color:var(--studio-line)}
+.storyboard-controls .wrap{gap:12px!important}
 .video-paper{min-height:520px}
 .video-paper .panel-label{margin-bottom:14px}
 #final-video{
@@ -681,7 +653,7 @@ footer{display:none!important}
     display:flex!important;justify-content:flex-start!important;width:max-content!important;
   }
   #workflow-tabs>.tab-wrapper [role="tab"]{min-width:105px!important}
-  .stage-surface,.cinema-surface{padding:22px 16px 28px!important}
+  .stage-surface{padding:22px 16px 28px!important}
   .idea-card-grid .wrap{grid-template-columns:1fr}
   .paper-panel{padding:18px;min-height:420px}
 }
@@ -878,9 +850,7 @@ footer{display:none!important}
                                 elem_classes=["primary-action"],
                             )
 
-                with gr.Tab(
-                    "04  分镜", id="storyboard", elem_classes=["cinema-surface"]
-                ):
+                with gr.Tab("04  分镜", id="storyboard", elem_classes=["stage-surface"]):
                     gr.HTML(
                         """
                         <div class="stage-kicker">Design the shots</div>
@@ -891,24 +861,37 @@ footer{display:none!important}
                         """
                     )
                     with gr.Row(equal_height=False):
-                        with gr.Column(scale=7, elem_classes=["cinema-panel"]):
+                        with gr.Column(
+                            scale=7, elem_classes=["paper-panel", "storyboard-paper"]
+                        ):
                             storyboard = gr.Markdown(
                                 "*确认剧本后，镜头时间线会出现在这里。*",
-                                elem_classes=["cinema-copy", "empty-state"],
+                                elem_classes=["storyboard-copy", "empty-state"],
                             )
-                        with gr.Column(scale=3, elem_classes=["cinema-panel"]):
-                            gr.HTML('<div class="panel-label">镜头修改</div>')
+                        with gr.Column(
+                            scale=3, elem_classes=["side-panel", "storyboard-controls"]
+                        ):
+                            gr.HTML(
+                                """
+                                <div class="panel-label">镜头修改</div>
+                                <div class="assistant-note"><strong>先检查连续性。</strong><br>
+                                选择任一镜头修改景别、动作或节奏；确认整套分镜之前，
+                                不会调用真实视频服务。</div>
+                                """
+                            )
                             shot_choice = gr.Dropdown(label="选择镜头")
                             retake_feedback = gr.Textbox(
                                 label="Retake 要求",
                                 placeholder="例如：改成近景，动作更克制",
                                 lines=4,
                             )
-                            retake = gr.Button("重做这个镜头方案")
+                            retake = gr.Button(
+                                "重做这个镜头方案", elem_classes=["quiet-action"]
+                            )
                             confirm_storyboard = gr.Button(
                                 "确认整套分镜  →",
                                 variant="primary",
-                                elem_classes=["cinema-primary"],
+                                elem_classes=["primary-action"],
                             )
 
                 with gr.Tab("05  视频", id="video", elem_classes=["stage-surface"]):
