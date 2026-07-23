@@ -50,8 +50,10 @@ def run_selfplay(
     ideas = session.start_ideation(direction)
     session.auto_choose()
     selected_snapshot = [to_plain_data(card) for card in session.selected_cards]
-    draft = session.generate_draft()
-    session.confirm_draft()
+    story = session.generate_story()
+    session.confirm_story()
+    script = session.generate_script()
+    session.confirm_script()
     storyboard = session.build_storyboard()
     session.confirm_storyboard()
 
@@ -62,13 +64,13 @@ def run_selfplay(
 
     diversity, duplicate_rate = _idea_metrics(session)
     selected_ids = {card["idea_id"] for card in selected_snapshot}
-    recorded_ids = set(draft.field_sources["selected_ideas"].source_ids)
-    disclosure_denominator = max(1, len(draft.ai_filled_fields))
-    disclosed = sum(field in draft.field_sources for field in draft.ai_filled_fields)
+    recorded_ids = set(story.field_sources["selected_ideas"].source_ids)
+    disclosure_denominator = max(1, len(story.ai_filled_fields))
+    disclosed = sum(field in story.field_sources for field in story.ai_filled_fields)
     cameras = {shot.camera for shot in storyboard.shots}
     anchors = sum(bool(shot.visual_anchors) for shot in storyboard.shots)
     bench = {
-        "schema_version": 3,
+        "schema_version": 4,
         "idea_count": len(ideas.cards),
         "idea_diversity": diversity,
         "duplicate_rate": duplicate_rate,
@@ -78,7 +80,9 @@ def run_selfplay(
         "ai_fill_transparency": round(disclosed / disclosure_denominator, 3),
         "mandatory_followup_text_count": 0,
         "free_text_required_count": 1,
-        "clicks_to_draft": 2,
+        "clicks_to_story": 2,
+        "clicks_story_to_script": 1,
+        "script_scene_count": len(script.scenes),
         "target_seconds": target_seconds,
         "storyboard_seconds": storyboard.total_duration,
         "duration_within_tolerance": abs(storyboard.total_duration - target_seconds) <= 1,
@@ -93,20 +97,21 @@ def run_selfplay(
     target.mkdir(parents=True, exist_ok=True)
     artifacts = {
         "transcript.json": {
-            "schema_version": 3,
+            "schema_version": 4,
             "direction": direction,
             "chat": to_plain_data(session.chat_history),
         },
-        "ideas.json": {"schema_version": 3, "batches": to_plain_data(session.idea_batches)},
+        "ideas.json": {"schema_version": 4, "batches": to_plain_data(session.idea_batches)},
         "selection.json": {
-            "schema_version": 3,
+            "schema_version": 4,
             "ideas": selected_snapshot,
             "elements": to_plain_data(session.selected_elements),
         },
-        "draft.json": {"schema_version": 3, **to_plain_data(draft)},
-        "storyboard.json": {"schema_version": 3, **to_plain_data(storyboard)},
+        "story.json": {"schema_version": 4, **to_plain_data(story)},
+        "script.json": {"schema_version": 4, **to_plain_data(script)},
+        "storyboard.json": {"schema_version": 4, **to_plain_data(storyboard)},
         "prompt_log.json": {
-            "schema_version": 3,
+            "schema_version": 4,
             "prompts": [
                 {
                     "shot_id": shot.shot_id,

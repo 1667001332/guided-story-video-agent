@@ -18,7 +18,10 @@ from .models import (
     IdeaCard,
     SourceAttribution,
     StoryBeat,
+    StoryCharacter,
+    StoryDraft,
     StoryFacts,
+    StoryLocation,
     StoryOutline,
     StoryScene,
     StoryScript,
@@ -44,6 +47,21 @@ class StoryAgent(Protocol):
     ) -> IdeaBatch: ...
 
     def expand_elements(self, direction: str, selected_cards: list[IdeaCard]) -> ElementPalette: ...
+
+    def generate_story(
+        self,
+        direction: str,
+        selected_cards: list[IdeaCard],
+        selected_elements: dict[str, ElementOption],
+    ) -> StoryDraft: ...
+
+    def revise_story(self, story: StoryDraft, feedback: str) -> StoryDraft: ...
+
+    def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript: ...
+
+    def revise_script(
+        self, story: StoryDraft, script: StoryScript, feedback: str
+    ) -> StoryScript: ...
 
     def generate_draft(
         self,
@@ -304,13 +322,12 @@ class RuleBasedStoryAgent:
             }
         )
 
-    def generate_draft(
+    def generate_story(
         self,
         direction: str,
         selected_cards: list[IdeaCard],
         selected_elements: dict[str, ElementOption],
-        target_seconds: int,
-    ) -> DraftBundle:
+    ) -> StoryDraft:
         card = (
             selected_cards[0]
             if selected_cards
@@ -319,112 +336,198 @@ class RuleBasedStoryAgent:
         chosen = {kind: item.content for kind, item in selected_elements.items()}
         protagonist = chosen.get("character", card.protagonist)
         conflict = chosen.get("conflict", card.central_conflict)
-        turning = chosen.get("turning_point", f"主角发现：{card.hook}")
+        turning = chosen.get("turning_point", f"真正的线索藏在“{card.hook}”背后")
         ending = chosen.get("ending", card.ending_direction)
-        opening = f"{direction}。第一幅画面立刻出现异常：{card.hook}。"
-        goal = f"{protagonist}必须解决由“{direction}”引发的问题"
-        development = f"主角第一次行动后，{conflict}，局势因此升级"
-        source_ids = [item.idea_id for item in selected_cards]
-        beats = [
-            StoryBeat(1, "开场钩子", opening, "异常打破日常", "惊讶", 0, []),
-            StoryBeat(2, "目标触发", goal, "异常迫使主角行动", "决心", 0, []),
-            StoryBeat(3, "冲突升级", conflict, "行动带来更大代价", "压力", 0, []),
-            StoryBeat(4, "关键反转", turning, "新信息改变原计划", "震动", 0, []),
-            StoryBeat(5, "结局落点", ending, "主角作出不可逆选择", "释然", 0, []),
-        ]
-        durations = allocate_durations(target_seconds, 5, minimum=3, maximum=15)
-        for beat, duration in zip(beats, durations):
-            beat.duration = duration
-        outline = StoryOutline(
-            title=card.title,
-            logline=card.logline,
-            opening=opening,
-            protagonist_goal=goal,
-            conflict=conflict,
-            development=development,
-            turning_point=turning,
-            ending=ending,
-            source_turn_ids=[],
-            beats=beats,
+        story_text = (
+            f"{direction}。{protagonist}原本只想维持平静，却在最普通的一刻发现"
+            f"{card.hook}。这个异常不是偶然，它迫使主角立即作出选择。\n\n"
+            f"主角沿着异常留下的痕迹行动，逐渐确认{conflict}。每一次接近答案，"
+            "现实中的代价都会变得更具体，身边的人与原先相信的规则也开始动摇。\n\n"
+            f"当主角以为已经找到解决办法时，事情发生变化：{turning}。此前看似无关的"
+            "人物、地点和物件因此连成一条完整线索，主角也终于明白真正需要面对的并不是"
+            "表面的危险，而是自己一直回避的选择。\n\n"
+            f"主角承担选择带来的后果，并让故事走向{ending}。开场出现过的关键意象再次出现，"
+            "但它的含义已经改变，故事在行动完成后的余波中结束。"
         )
-        scenes = [
-            StoryScene(
-                scene_id=beat.beat_id,
-                title=beat.purpose,
-                location="故事核心场景",
-                time_of_day="连续时间",
-                characters=[protagonist],
-                action=beat.event,
-                visible_action=beat.event,
-                narration=beat.event,
-                dialogue="" if beat.beat_id != 5 else "我终于知道该留下什么了。",
-                props=["贯穿故事的关键物件"],
-                start_state=beat.causal_link,
-                end_state=beat.event,
-                emotional_change=beat.emotional_change,
-                duration=beat.duration,
-            )
-            for beat in beats
-        ]
-        script = StoryScript(title=card.title, target_seconds=target_seconds, scenes=scenes)
+        source_ids = [item.idea_id for item in selected_cards]
         source_type = "selected_card" if selected_cards else "ai_fill"
         fields = {
-            "opening": opening,
             "protagonist": protagonist,
-            "conflict": conflict,
+            "core_conflict": conflict,
             "turning_point": turning,
             "ending": ending,
         }
-        field_sources = {}
-        ai_filled = []
+        field_sources: dict[str, SourceAttribution] = {}
+        ai_filled_fields: list[str] = []
         for field, value in fields.items():
-            if field == "opening":
-                origin = "user"
-            elif field in selected_elements:
+            option_kind = "character" if field == "protagonist" else field
+            if option_kind in selected_elements:
                 origin = "selected_element"
             else:
                 origin = source_type
-            if origin == "ai_fill":
-                ai_filled.append(field)
             field_sources[field] = SourceAttribution(
                 field=field,
                 source_type=origin,
                 value=value,
                 source_ids=source_ids,
             )
-        production_fills = {
-            "scene_details": "故事核心场景",
-            "props": "贯穿故事的关键物件",
-            "narration": "克制旁白",
-            "dialogue": "简短可表演对白",
-            "transitions": "动作与物件匹配剪辑",
-        }
-        for field, value in production_fills.items():
-            ai_filled.append(field)
+            if origin == "ai_fill":
+                ai_filled_fields.append(field)
+        for field in ("story_text", "characters", "locations", "visual_anchors"):
             field_sources[field] = SourceAttribution(
                 field=field,
                 source_type="ai_fill",
-                value=value,
-                source_ids=[],
+                value="由故事生成阶段补全",
             )
+            ai_filled_fields.append(field)
+        return StoryDraft(
+            title=card.title,
+            logline=card.logline,
+            story_text=story_text,
+            characters=[
+                StoryCharacter(
+                    name=protagonist,
+                    description=f"{protagonist}必须在压力下完成一次不可回避的选择。",
+                    visual_identity="保持统一的脸部、发型、服装与标志性随身物件",
+                )
+            ],
+            locations=[
+                StoryLocation(
+                    name="故事核心场景",
+                    description=f"承载“{direction}”主要行动的连续空间",
+                    visual_identity="保持统一的空间结构、主色和光线方向",
+                )
+            ],
+            tone=card.tone,
+            theme="人在代价面前如何作出真正属于自己的选择",
+            core_conflict=conflict,
+            ending=ending,
+            visual_anchors=["主角固定服装", "贯穿故事的关键物件", "统一场景主色"],
+            field_sources=field_sources,
+            ai_filled_fields=ai_filled_fields,
+        )
+
+    def revise_story(self, story: StoryDraft, feedback: str) -> StoryDraft:
+        if not feedback.strip():
+            raise ValueError("请用一句话说明想怎样修改故事。")
+        revised = deepcopy(story)
+        revised.story_text = (
+            f"{story.story_text}\n\n根据创作者的新方向，故事进一步调整为：{feedback.strip()}。"
+        )
+        revised.version = story.version + 1
+        revised.confirmed = False
+        return revised
+
+    def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
+        scene_count = max(3, min(8, round(int(target_seconds) / 9)))
+        durations = allocate_durations(target_seconds, scene_count, minimum=3, maximum=15)
+        events = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？])", story.story_text)
+            if item.strip()
+        ]
+        if not events:
+            events = [story.logline]
+        locations = story.locations or [
+            StoryLocation("故事核心场景", "连续的故事空间", "统一空间与光线")
+        ]
+        character_names = [item.name for item in story.characters] or ["主角"]
+        scenes: list[StoryScene] = []
+        for index, duration in enumerate(durations, 1):
+            event = events[min(len(events) - 1, (index - 1) * len(events) // scene_count)]
+            location = locations[min(len(locations) - 1, (index - 1) * len(locations) // scene_count)]
+            scenes.append(
+                StoryScene(
+                    scene_id=index,
+                    title=f"故事片段 {index}",
+                    location=location.name,
+                    time_of_day="连续时间",
+                    characters=list(character_names),
+                    action=event,
+                    visible_action=event,
+                    narration=event,
+                    duration=duration,
+                    dialogue="" if index < scene_count else "我已经作出了选择。",
+                    props=list(story.visual_anchors[:2]),
+                    start_state="承接上一场的动作与人物状态",
+                    end_state=event,
+                    emotional_change=story.tone,
+                )
+            )
+        return StoryScript(title=story.title, target_seconds=target_seconds, scenes=scenes)
+
+    def revise_script(
+        self, story: StoryDraft, script: StoryScript, feedback: str
+    ) -> StoryScript:
+        if not feedback.strip():
+            raise ValueError("请用一句话说明想怎样修改剧本。")
+        revised = deepcopy(script)
+        for scene in revised.scenes:
+            scene.visible_action = (
+                f"按照“{feedback.strip()}”调整表演和镜头动作："
+                f"{scene.visible_action or scene.action}"
+            )
+            scene.action = scene.visible_action
+        revised.confirmed = False
+        return revised
+
+    def generate_draft(
+        self,
+        direction: str,
+        selected_cards: list[IdeaCard],
+        selected_elements: dict[str, ElementOption],
+        target_seconds: int,
+    ) -> DraftBundle:
+        story = self.generate_story(direction, selected_cards, selected_elements)
+        script = self.generate_script(story, target_seconds)
+        beats = [
+            StoryBeat(
+                beat_id=scene.scene_id,
+                purpose=scene.title,
+                event=scene.visible_action or scene.action,
+                causal_link=scene.start_state,
+                emotional_change=scene.emotional_change,
+                duration=scene.duration,
+            )
+            for scene in script.scenes
+        ]
+        opening = script.scenes[0].visible_action or script.scenes[0].action
+        development = "；".join(
+            scene.visible_action or scene.action for scene in script.scenes[1:-1]
+        )
+        outline = StoryOutline(
+            title=story.title,
+            logline=story.logline,
+            opening=opening,
+            protagonist_goal=story.characters[0].description if story.characters else story.logline,
+            conflict=story.core_conflict,
+            development=development,
+            turning_point=script.scenes[-2].visible_action if len(script.scenes) > 1 else development,
+            ending=story.ending,
+            source_turn_ids=[],
+            beats=beats,
+        )
         return DraftBundle(
             outline=outline,
             script=script,
-            field_sources=field_sources,
-            ai_filled_fields=ai_filled,
+            field_sources=deepcopy(story.field_sources),
+            ai_filled_fields=list(story.ai_filled_fields),
         )
 
     def revise_draft(self, draft: DraftBundle, feedback: str) -> DraftBundle:
         if not feedback.strip():
             raise ValueError("请用一句话说明想怎样修改。")
+        story = StoryDraft(
+            title=draft.outline.title,
+            logline=draft.outline.logline,
+            story_text="；".join(scene.visible_action or scene.action for scene in draft.script.scenes),
+            core_conflict=draft.outline.conflict,
+            ending=draft.outline.ending,
+        )
         revised = deepcopy(draft)
+        revised.script = self.revise_script(story, draft.script, feedback)
         revised.version += 1
-        revised.script.confirmed = False
         revised.outline.confirmed = False
-        revised.script.scenes[
-            0
-        ].action = f"根据“{feedback.strip()}”调整：{revised.script.scenes[0].action}"
-        revised.script.scenes[0].visible_action = revised.script.scenes[0].action
         return revised
 
     def build_outline(self, facts: StoryFacts, history: list[CreatorContribution]) -> StoryOutline:
@@ -460,7 +563,7 @@ class RuleBasedStoryAgent:
 
 
 class OpenAIStoryAgent(RuleBasedStoryAgent):
-    """Agnes/OpenAI-compatible creative agent with explicit fallback telemetry."""
+    """OpenAI-compatible creative agent with explicit fallback telemetry."""
 
     def __init__(self, client: Any | None, model: str, prompt_dir: Path | None = None) -> None:
         self.client = client
@@ -473,17 +576,29 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
     @classmethod
     def from_env(cls) -> OpenAIStoryAgent:
         load_dotenv()
-        api_key = os.getenv("AGNES_API_KEY", "").strip()
-        model = os.getenv("AGNES_TEXT_MODEL", "agnes-2.0-flash").strip()
+        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        legacy_api_key = os.getenv("AGNES_API_KEY", "").strip()
+        use_deepseek = bool(deepseek_api_key)
+        api_key = deepseek_api_key or legacy_api_key
+        if use_deepseek:
+            model = os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-v4-pro").strip()
+            base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            timeout = os.getenv("DEEPSEEK_TIMEOUT", "120")
+        else:
+            model = os.getenv("AGNES_TEXT_MODEL", "agnes-2.0-flash").strip()
+            base_url = os.getenv(
+                "AGNES_LLM_BASE_URL", "https://apihub.agnes-ai.com/v1"
+            )
+            timeout = os.getenv("AGNES_TIMEOUT", "120")
         if not api_key:
-            return cls(None, model)
+            return cls(None, os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-v4-pro").strip())
         try:
             from openai import OpenAI
 
             client = OpenAI(
                 api_key=api_key,
-                base_url=os.getenv("AGNES_LLM_BASE_URL", "https://apihub.agnes-ai.com/v1"),
-                timeout=float(os.getenv("AGNES_TIMEOUT", "120")),
+                base_url=base_url,
+                timeout=float(timeout),
                 max_retries=0,
             )
             return cls(client, model)
@@ -583,6 +698,87 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             self._mark_fallback("expand_elements", exc)
             return fallback
 
+    def generate_story(
+        self,
+        direction: str,
+        selected_cards: list[IdeaCard],
+        selected_elements: dict[str, ElementOption],
+    ) -> StoryDraft:
+        self.last_used_fallback = False
+        fallback = super().generate_story(direction, selected_cards, selected_elements)
+        if self.client is None:
+            self._mark_fallback("generate_story", "text API is not configured")
+            return fallback
+        try:
+            data = self._json_completion(
+                "story_writer.md",
+                {
+                    "direction": direction,
+                    "selected_cards": to_plain_data(selected_cards),
+                    "selected_elements": to_plain_data(selected_elements),
+                },
+            )
+            return self._story_from(data, fallback)
+        except Exception as exc:
+            self._mark_fallback("generate_story", exc)
+            return fallback
+
+    def revise_story(self, story: StoryDraft, feedback: str) -> StoryDraft:
+        self.last_used_fallback = False
+        fallback = super().revise_story(story, feedback)
+        if self.client is None:
+            self._mark_fallback("revise_story", "text API is not configured")
+            return fallback
+        try:
+            data = self._json_completion(
+                "story_rewriter.md",
+                {"story": to_plain_data(story), "feedback": feedback},
+            )
+            revised = self._story_from(data, fallback)
+            revised.version = story.version + 1
+            return revised
+        except Exception as exc:
+            self._mark_fallback("revise_story", exc)
+            return fallback
+
+    def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
+        self.last_used_fallback = False
+        fallback = super().generate_script(story, target_seconds)
+        if self.client is None:
+            self._mark_fallback("generate_script", "text API is not configured")
+            return fallback
+        try:
+            data = self._json_completion(
+                "script_writer.md",
+                {"confirmed_story": to_plain_data(story), "target_seconds": target_seconds},
+            )
+            return self._script_from_model(data, fallback, target_seconds)
+        except Exception as exc:
+            self._mark_fallback("generate_script", exc)
+            return fallback
+
+    def revise_script(
+        self, story: StoryDraft, script: StoryScript, feedback: str
+    ) -> StoryScript:
+        self.last_used_fallback = False
+        fallback = super().revise_script(story, script, feedback)
+        if self.client is None:
+            self._mark_fallback("revise_script", "text API is not configured")
+            return fallback
+        try:
+            data = self._json_completion(
+                "script_rewriter.md",
+                {
+                    "confirmed_story": to_plain_data(story),
+                    "script": to_plain_data(script),
+                    "feedback": feedback,
+                },
+            )
+            return self._script_from_model(data, fallback, script.target_seconds)
+        except Exception as exc:
+            self._mark_fallback("revise_script", exc)
+            return fallback
+
     def generate_draft(
         self,
         direction: str,
@@ -590,47 +786,22 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         selected_elements: dict[str, ElementOption],
         target_seconds: int,
     ) -> DraftBundle:
-        self.last_used_fallback = False
-        fallback = super().generate_draft(
+        story = self.generate_story(direction, selected_cards, selected_elements)
+        script = self.generate_script(story, target_seconds)
+        fallback = RuleBasedStoryAgent().generate_draft(
             direction, selected_cards, selected_elements, target_seconds
         )
-        if self.client is None:
-            self._mark_fallback("generate_draft", "text API is not configured")
-            return fallback
-        try:
-            durations = allocate_durations(target_seconds, 5, minimum=3, maximum=15)
-            data = self._json_completion(
-                "draft_writer.md",
-                {
-                    "direction": direction,
-                    "selected_cards": to_plain_data(selected_cards),
-                    "selected_elements": to_plain_data(selected_elements),
-                    "durations": durations,
-                },
-            )
-            return self._draft_from(data, fallback, durations)
-        except Exception as exc:
-            self._mark_fallback("generate_draft", exc)
-            return fallback
+        fallback.script = script
+        fallback.outline.title = story.title
+        fallback.outline.logline = story.logline
+        fallback.outline.conflict = story.core_conflict
+        fallback.outline.ending = story.ending
+        fallback.field_sources = deepcopy(story.field_sources)
+        fallback.ai_filled_fields = list(story.ai_filled_fields)
+        return fallback
 
     def revise_draft(self, draft: DraftBundle, feedback: str) -> DraftBundle:
-        self.last_used_fallback = False
-        fallback = super().revise_draft(draft, feedback)
-        if self.client is None:
-            self._mark_fallback("revise_draft", "text API is not configured")
-            return fallback
-        try:
-            data = self._json_completion(
-                "draft_rewriter.md",
-                {"draft": to_plain_data(draft), "feedback": feedback},
-            )
-            durations = [scene.duration for scene in draft.script.scenes]
-            revised = self._draft_from(data, fallback, durations)
-            revised.version = draft.version + 1
-            return revised
-        except Exception as exc:
-            self._mark_fallback("revise_draft", exc)
-            return fallback
+        return super().revise_draft(draft, feedback)
 
     def simulate_creator_direction(self) -> str:
         if self.client is None:
@@ -726,72 +897,96 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         )
 
     @staticmethod
-    def _draft_from(
-        data: dict[str, Any], fallback: DraftBundle, durations: list[int]
-    ) -> DraftBundle:
-        raw_outline = data.get("outline", {})
-        raw_scenes = data.get("script", {}).get("scenes", [])
-        if len(raw_scenes) != 5:
-            raise ValueError("draft must contain five scenes")
-        beats = []
-        for index, item in enumerate(raw_outline.get("beats", []), 1):
-            beats.append(
-                StoryBeat(
-                    beat_id=index,
-                    purpose=str(item["purpose"]),
-                    event=str(item["event"]),
-                    causal_link=str(item["causal_link"]),
-                    emotional_change=str(item["emotional_change"]),
-                    duration=durations[index - 1],
-                )
+    def _story_from(data: dict[str, Any], fallback: StoryDraft) -> StoryDraft:
+        raw = data.get("story", data)
+        story_text = str(raw.get("story_text", "")).strip()
+        if len(story_text) < 120:
+            raise ValueError("story_text is too short to support script adaptation")
+        characters = [
+            StoryCharacter(
+                name=str(item.get("name", "")).strip(),
+                description=str(item.get("description", "")).strip(),
+                visual_identity=str(item.get("visual_identity", "")).strip(),
             )
-        if len(beats) != 5:
-            raise ValueError("outline must contain five beats")
-        outline = StoryOutline(
-            title=str(raw_outline["title"]),
-            logline=str(raw_outline["logline"]),
-            opening=str(raw_outline["opening"]),
-            protagonist_goal=str(raw_outline["protagonist_goal"]),
-            conflict=str(raw_outline["conflict"]),
-            development=str(raw_outline["development"]),
-            turning_point=str(raw_outline["turning_point"]),
-            ending=str(raw_outline["ending"]),
-            source_turn_ids=[],
-            beats=beats,
+            for item in raw.get("characters", [])
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        ]
+        locations = [
+            StoryLocation(
+                name=str(item.get("name", "")).strip(),
+                description=str(item.get("description", "")).strip(),
+                visual_identity=str(item.get("visual_identity", "")).strip(),
+            )
+            for item in raw.get("locations", [])
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        ]
+        return StoryDraft(
+            title=str(raw.get("title", fallback.title)).strip() or fallback.title,
+            logline=str(raw.get("logline", fallback.logline)).strip() or fallback.logline,
+            story_text=story_text,
+            characters=characters or deepcopy(fallback.characters),
+            locations=locations or deepcopy(fallback.locations),
+            tone=str(raw.get("tone", fallback.tone)).strip(),
+            theme=str(raw.get("theme", fallback.theme)).strip(),
+            core_conflict=str(raw.get("core_conflict", fallback.core_conflict)).strip(),
+            ending=str(raw.get("ending", fallback.ending)).strip(),
+            visual_anchors=[
+                str(value).strip()
+                for value in raw.get("visual_anchors", fallback.visual_anchors)
+                if str(value).strip()
+            ],
+            field_sources=deepcopy(fallback.field_sources),
+            ai_filled_fields=[
+                str(value)
+                for value in data.get("ai_filled_fields", fallback.ai_filled_fields)
+            ],
         )
-        scenes = []
+
+    @staticmethod
+    def _script_from_model(
+        data: dict[str, Any], fallback: StoryScript, target_seconds: int
+    ) -> StoryScript:
+        raw = data.get("script", data)
+        raw_scenes = raw.get("scenes", [])
+        if not isinstance(raw_scenes, list) or not raw_scenes:
+            raise ValueError("script must contain at least one scene")
+        durations = allocate_durations(
+            target_seconds,
+            len(raw_scenes),
+            minimum=1,
+            maximum=target_seconds,
+        )
+        scenes: list[StoryScene] = []
         for index, (item, duration) in enumerate(zip(raw_scenes, durations), 1):
+            if not isinstance(item, dict):
+                raise ValueError("each script scene must be an object")
+            visible_action = str(
+                item.get("visible_action", item.get("action", ""))
+            ).strip()
+            if not visible_action:
+                raise ValueError("each script scene needs a visible action")
             scenes.append(
                 StoryScene(
                     scene_id=index,
-                    title=str(item["title"]),
-                    location=str(item["location"]),
-                    time_of_day=str(item.get("time_of_day", "连续时间")),
+                    title=str(item.get("title", f"场景 {index}")).strip(),
+                    location=str(item.get("location", "故事核心场景")).strip(),
+                    time_of_day=str(item.get("time_of_day", "连续时间")).strip(),
                     characters=[str(value) for value in item.get("characters", [])],
-                    action=str(item["visible_action"]),
-                    visible_action=str(item["visible_action"]),
-                    dialogue=str(item.get("dialogue", "")),
-                    narration=str(item.get("narration", "")),
+                    action=visible_action,
+                    visible_action=visible_action,
+                    dialogue=str(item.get("dialogue", "")).strip(),
+                    narration=str(item.get("narration", "")).strip(),
                     props=[str(value) for value in item.get("props", [])],
-                    start_state=str(item.get("start_state", "")),
-                    end_state=str(item.get("end_state", "")),
-                    emotional_change=str(item.get("emotional_change", "")),
+                    start_state=str(item.get("start_state", "")).strip(),
+                    end_state=str(item.get("end_state", "")).strip(),
+                    emotional_change=str(item.get("emotional_change", "")).strip(),
                     duration=duration,
                 )
             )
-        field_sources = deepcopy(fallback.field_sources)
-        ai_filled = [
-            str(value) for value in data.get("ai_filled_fields", fallback.ai_filled_fields)
-        ]
-        return DraftBundle(
-            outline=outline,
-            script=StoryScript(
-                title=outline.title,
-                target_seconds=sum(durations),
-                scenes=scenes,
-            ),
-            field_sources=field_sources,
-            ai_filled_fields=ai_filled,
+        return StoryScript(
+            title=str(raw.get("title", fallback.title)).strip() or fallback.title,
+            target_seconds=target_seconds,
+            scenes=scenes,
         )
 
     def _json_completion(self, prompt_name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -801,7 +996,13 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 {"role": "system", "content": self._load_prompt(prompt_name)},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            "temperature": 0.65 if "idea_" in prompt_name else 0.25,
+            "temperature": (
+                0.7
+                if prompt_name in {"story_writer.md", "story_rewriter.md"}
+                else 0.65
+                if "idea_" in prompt_name
+                else 0.35
+            ),
             "max_tokens": 4000,
             "response_format": {"type": "json_object"},
         }

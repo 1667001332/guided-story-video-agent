@@ -24,13 +24,18 @@ from .models import (
     SourceAttribution,
     Stage,
     StoryBeat,
+    StoryCharacter,
+    StoryDraft,
     StoryFacts,
+    StoryLocation,
     StoryOutline,
     StoryScene,
     StoryScript,
     StoryboardPlan,
     StoryboardShot,
     VideoArtifact,
+    VisualAsset,
+    VisualBible,
     to_plain_data,
 )
 from .storyboard import build_storyboard
@@ -40,7 +45,7 @@ from .timing import allocate_durations
 class GuidedStorySession:
     """Single source of truth for the low-pressure idea garden."""
 
-    schema_version = 3
+    schema_version = 4
 
     def __init__(
         self,
@@ -58,6 +63,8 @@ class GuidedStorySession:
         self.element_palette: ElementPalette | None = None
         self.selected_elements: dict[str, str] = {}
         self.chat_history: list[dict[str, str]] = []
+        self.story: StoryDraft | None = None
+        self.story_history: list[StoryDraft] = []
         self.draft: DraftBundle | None = None
         self.draft_history: list[DraftBundle] = []
         self.outline: StoryOutline | None = None
@@ -88,6 +95,7 @@ class GuidedStorySession:
         return SelectionState(
             selected_idea_ids=list(self.selected_idea_ids),
             selected_elements=dict(self.selected_elements),
+            can_generate_story=bool(self.direction),
             can_generate_draft=bool(self.direction),
         )
 
@@ -109,13 +117,13 @@ class GuidedStorySession:
 
     @property
     def can_build_script(self) -> bool:
-        return bool(self.direction)
+        return bool(self.story and self.story.confirmed)
 
     @property
     def current_question(self) -> str:
         if not self.direction:
             return "随便说一个方向就行，例如：校园里发生一件带点悬疑的事。"
-        return "你可以选卡、换一批、混合，或者现在就生成剧本草稿。"
+        return "你可以选卡、换一批、混合，或者现在就生成完整故事。"
 
     def start_ideation(self, direction: str) -> IdeaBatch:
         cleaned = " ".join(direction.split())
@@ -134,6 +142,8 @@ class GuidedStorySession:
         self.storyboard = None
         self.render_manifest = None
         self.chat_history = [{"role": "user", "content": cleaned}]
+        self.story = None
+        self.story_history = []
         self.free_text_count = 1
         batch = self.agent.generate_ideas(cleaned, round_number=1)
         self._validate_batch(batch, previous_cards=self.all_ideas)
@@ -246,87 +256,178 @@ class GuidedStorySession:
             self.chat_history.append({"role": "user", "content": cleaned})
             self.free_text_count += 1
             batch = self.refresh_ideas(cleaned)
-        message = f"已按“{cleaned}”换出8个新方向；你仍然可以直接生成草稿。"
+        message = f"已按“{cleaned}”换出8个新方向；你仍然可以直接生成完整故事。"
         self.chat_history.append({"role": "assistant", "content": message})
         return IdeationTurnResult(
             message=message,
             batch=batch,
             selection=self.selection_state,
-            available_actions=["select", "more_like", "mix", "expand", "draft"],
+            available_actions=["select", "more_like", "mix", "expand", "story"],
             used_fallback=bool(getattr(self.agent, "last_used_fallback", False)),
         )
 
-    def generate_draft(self) -> DraftBundle:
+    def generate_story(self) -> StoryDraft:
         self._require_direction()
         selected_options = {
             kind: self._element_by_id(kind, option_id)
             for kind, option_id in self.selected_elements.items()
         }
-        draft = self.agent.generate_draft(
+        story = self.agent.generate_story(
             self.direction,
             self.selected_cards,
             selected_options,
-            self.brief.target_seconds,
         )
-        self._preserve_user_choices(draft, selected_options)
-        self._validate_or_repair_draft(draft)
-        draft.version = len(self.draft_history) + 1
-        self.draft = draft
-        self.draft_history.append(deepcopy(draft))
-        self.outline = draft.outline
-        self.script = draft.script
+        self._preserve_user_choices(story, selected_options)
+        self._validate_story(story)
+        story.version = len(self.story_history) + 1
+        story.confirmed = False
+        self.story = story
+        self.story_history.append(deepcopy(story))
+        self.script = None
+        self.draft = None
         self.storyboard = None
         self.render_manifest = None
-        self.stage = Stage.DRAFT_REVIEW
+        self.stage = Stage.STORY_REVIEW
         self.user_action_count += 1
-        self._snapshot("draft", to_plain_data(draft))
-        return draft
+        self._snapshot("story", to_plain_data(story))
+        return story
 
-    def revise_draft(self, feedback: str) -> DraftBundle:
-        if self.draft is None:
-            raise RuntimeError("请先生成一版剧本草稿。")
-        revised = self.agent.revise_draft(self.draft, feedback)
+    def revise_story(self, feedback: str) -> StoryDraft:
+        if self.story is None:
+            raise RuntimeError("请先生成一版完整故事。")
+        revised = self.agent.revise_story(self.story, feedback)
         selected_options = {
             kind: self._element_by_id(kind, option_id)
             for kind, option_id in self.selected_elements.items()
         }
         self._preserve_user_choices(revised, selected_options)
-        self._validate_or_repair_draft(revised)
-        revised.version = len(self.draft_history) + 1
-        self.draft = revised
-        self.draft_history.append(deepcopy(revised))
-        self.outline = revised.outline
-        self.script = revised.script
+        self._validate_story(revised)
+        revised.version = len(self.story_history) + 1
+        revised.confirmed = False
+        self.story = revised
+        self.story_history.append(deepcopy(revised))
+        self.script = None
         self.storyboard = None
         self.render_manifest = None
-        self.stage = Stage.DRAFT_REVIEW
+        self.stage = Stage.STORY_REVIEW
         self.free_text_count += 1
-        self._snapshot("draft", to_plain_data(revised), user_feedback=feedback)
+        self._snapshot("story", to_plain_data(revised), user_feedback=feedback)
         return revised
 
     def back_to_ideation(self) -> None:
         self._require_direction()
         self.stage = Stage.IDEATING
 
-    def confirm_draft(self) -> None:
-        if self.draft is None or self.stage != Stage.DRAFT_REVIEW:
-            raise RuntimeError("当前没有等待确认的剧本草稿。")
-        review = self.review_current_artifact("draft")
+    def confirm_story(self) -> None:
+        if self.story is None:
+            raise RuntimeError("当前没有等待确认的完整故事。")
+        if self.story.confirmed:
+            return
+        if self.stage != Stage.STORY_REVIEW:
+            raise RuntimeError("当前没有等待确认的完整故事。")
+        review = self.review_current_artifact("story")
+        if not review.can_confirm:
+            raise RuntimeError("故事仍有必须修复的问题：" + "；".join(review.hard_errors))
+        self.story.confirmed = True
+        self._snapshot("story", to_plain_data(self.story), confirmed=True)
+
+    def generate_script(self) -> StoryScript:
+        if self.story is None or not self.story.confirmed:
+            raise RuntimeError("请先确认完整故事。")
+        self.script = self.agent.generate_script(self.story, self.brief.target_seconds)
+        self._validate_or_repair_script(self.script)
+        self.script.confirmed = False
+        self.storyboard = None
+        self.render_manifest = None
+        self.stage = Stage.SCRIPT_REVIEW
+        self.user_action_count += 1
+        self._snapshot("script", to_plain_data(self.script))
+        return self.script
+
+    def revise_script(self, feedback: str) -> StoryScript:
+        if self.story is None or not self.story.confirmed or self.script is None:
+            raise RuntimeError("请先确认故事并生成剧本。")
+        self.script = self.agent.revise_script(self.story, self.script, feedback)
+        self._validate_or_repair_script(self.script)
+        self.script.confirmed = False
+        self.storyboard = None
+        self.render_manifest = None
+        self.stage = Stage.SCRIPT_REVIEW
+        self.free_text_count += 1
+        self._snapshot("script", to_plain_data(self.script), user_feedback=feedback)
+        return self.script
+
+    def confirm_script(self) -> None:
+        if self.script is None or self.stage != Stage.SCRIPT_REVIEW:
+            raise RuntimeError("当前没有等待确认的剧本。")
+        review = self.review_current_artifact("script")
         if not review.can_confirm:
             raise RuntimeError("剧本仍有必须修复的问题：" + "；".join(review.hard_errors))
-        self.draft.outline.confirmed = True
-        self.draft.script.confirmed = True
-        self.outline = self.draft.outline
-        self.script = self.draft.script
-        self._snapshot("draft", to_plain_data(self.draft), confirmed=True)
+        self.script.confirmed = True
+        self._snapshot("script", to_plain_data(self.script), confirmed=True)
 
     def build_storyboard(self) -> StoryboardPlan:
-        if self.draft is None or not self.draft.script.confirmed:
-            raise RuntimeError("请先确认剧本草稿。")
-        self.storyboard = build_storyboard(self.draft.script, self._story_facts())
+        if self.script is None or not self.script.confirmed:
+            raise RuntimeError("请先确认剧本。")
+        self.storyboard = build_storyboard(self.script, self._story_facts())
         self.stage = Stage.STORYBOARD_REVIEW
         self._snapshot("storyboard", to_plain_data(self.storyboard))
         return self.storyboard
+
+    # v0.3 compatibility wrappers -------------------------------------------------
+    def generate_draft(self) -> DraftBundle:
+        warnings.warn(
+            "generate_draft 已被 generate_story/confirm_story/generate_script 取代",
+            DeprecationWarning,
+        )
+        story = self.generate_story()
+        self.confirm_story()
+        script = self.generate_script()
+        beats = [
+            StoryBeat(
+                scene.scene_id,
+                scene.title,
+                scene.visible_action or scene.action,
+                scene.start_state,
+                scene.emotional_change,
+                scene.duration,
+            )
+            for scene in script.scenes
+        ]
+        outline = StoryOutline(
+            title=story.title,
+            logline=story.logline,
+            opening=script.scenes[0].visible_action or script.scenes[0].action,
+            protagonist_goal=story.characters[0].description if story.characters else story.logline,
+            conflict=story.core_conflict,
+            development=story.story_text,
+            turning_point="",
+            ending=story.ending,
+            source_turn_ids=[],
+            beats=beats,
+        )
+        self.draft = DraftBundle(
+            outline=outline,
+            script=script,
+            field_sources=deepcopy(story.field_sources),
+            ai_filled_fields=list(story.ai_filled_fields),
+            version=len(self.draft_history) + 1,
+        )
+        self.draft_history.append(deepcopy(self.draft))
+        self.outline = outline
+        return self.draft
+
+    def revise_draft(self, feedback: str) -> DraftBundle:
+        warnings.warn("revise_draft 已被 revise_story/revise_script 取代", DeprecationWarning)
+        if self.draft is None:
+            raise RuntimeError("请先生成剧本。")
+        self.draft.script = self.revise_script(feedback)
+        self.draft.version += 1
+        return self.draft
+
+    def confirm_draft(self) -> None:
+        warnings.warn("confirm_draft 已被 confirm_script 取代", DeprecationWarning)
+        self.confirm_script()
 
     def update_storyboard_shot(self, shot_id: int, patch: dict[str, Any]) -> StoryboardPlan:
         if self.storyboard is None:
@@ -368,32 +469,54 @@ class GuidedStorySession:
         return self.render_manifest
 
     def review_current_artifact(self, artifact_type: str | None = None) -> ArtifactReview:
-        kind = artifact_type or ("storyboard" if self.storyboard else "draft")
+        kind = artifact_type or (
+            "storyboard" if self.storyboard else "script" if self.script else "story"
+        )
         review = ArtifactReview(artifact_type=kind)
-        if kind in ("draft", "script") and self.draft:
-            if abs(self.draft.script.total_duration - self.brief.target_seconds) > 1:
+        if kind == "story" and self.story:
+            if len(self.story.story_text.strip()) < 120:
+                review.hard_errors.append("故事正文过短，尚不足以改编成剧本")
+            if not self.story.characters:
+                review.hard_errors.append("故事缺少明确人物")
+            if not self.story.core_conflict.strip() or not self.story.ending.strip():
+                review.hard_errors.append("故事缺少核心冲突或结局")
+            review.scores["story_completeness"] = 1.0 if not review.hard_errors else 0.5
+            review.scores["ai_fill_disclosure"] = 1.0
+        elif kind in ("draft", "script") and self.script:
+            if abs(self.script.total_duration - self.brief.target_seconds) > 1:
                 review.hard_errors.append("剧本总时长不符合目标")
-            if len(self.draft.script.scenes) != 5:
-                review.hard_errors.append("剧本必须包含五个短片场景")
+            if not self.script.scenes:
+                review.hard_errors.append("剧本没有可转换的场景")
             if any(
                 not (scene.visible_action or scene.action).strip()
-                for scene in self.draft.script.scenes
+                for scene in self.script.scenes
             ):
                 review.hard_errors.append("存在无法拍摄的空动作场景")
             review.scores["filmability"] = 1.0 if not review.hard_errors else 0.5
-            review.scores["ai_fill_disclosure"] = 1.0
-        elif kind == "outline" and self.draft:
-            if len(self.draft.outline.beats) != 5:
-                review.hard_errors.append("大纲必须包含五个节点")
         elif kind == "storyboard" and self.storyboard:
             if abs(self.storyboard.total_duration - self.brief.target_seconds) > 1:
                 review.hard_errors.append("分镜总时长不符合目标")
-            if not 5 <= len(self.storyboard.shots) <= 10:
-                review.hard_errors.append("分镜数量必须在5到10之间")
+            minimum = max(1, (self.brief.target_seconds + 14) // 15)
+            maximum = max(1, self.brief.target_seconds // 3)
+            if not minimum <= len(self.storyboard.shots) <= maximum:
+                review.hard_errors.append(
+                    f"当前时长下分镜数量必须在{minimum}到{maximum}之间"
+                )
             if any(not 3 <= shot.duration <= 15 for shot in self.storyboard.shots):
                 review.hard_errors.append("存在超出3到15秒限制的镜头")
+            if any(
+                not shot.first_frame_prompt.strip()
+                or not shot.motion_prompt.strip()
+                or not shot.end_frame_prompt.strip()
+                for shot in self.storyboard.shots
+            ):
+                review.hard_errors.append("存在缺少首帧、动作或结束帧描述的镜头")
             cameras = {shot.camera for shot in self.storyboard.shots}
             review.scores["shot_diversity"] = min(1.0, len(cameras) / 4)
+            referenced = sum(bool(shot.reference_asset_ids) for shot in self.storyboard.shots)
+            review.scores["visual_identity_coverage"] = referenced / len(
+                self.storyboard.shots
+            )
         else:
             raise RuntimeError("当前没有可审查的产物。")
         return review
@@ -411,7 +534,7 @@ class GuidedStorySession:
             missing_fields=[],
             can_build_outline=True,
             readiness_score=1.0,
-            recommended_action="generate_draft",
+            recommended_action="generate_story",
             used_fallback=result.used_fallback,
         )
 
@@ -438,7 +561,7 @@ class GuidedStorySession:
             missing_fields=[],
             can_build_outline=True,
             readiness_score=1.0,
-            recommended_action="generate_draft",
+            recommended_action="generate_story",
         )
 
     def build_outline(self) -> StoryOutline:
@@ -446,25 +569,23 @@ class GuidedStorySession:
         return self.generate_draft().outline
 
     def confirm_outline(self) -> None:
-        if self.draft is None:
-            raise RuntimeError("尚未生成草稿。")
-        self.draft.outline.confirmed = True
+        if self.story is None:
+            raise RuntimeError("尚未生成故事。")
+        self.confirm_story()
 
     def build_script(self) -> StoryScript:
-        warnings.warn("build_script 已被 generate_draft 取代", DeprecationWarning)
-        return (self.draft or self.generate_draft()).script
-
-    def confirm_script(self) -> None:
-        self.confirm_draft()
-
-    def revise_script(self, feedback: str) -> StoryScript:
-        return self.revise_draft(feedback).script
+        warnings.warn("build_script 已被 generate_script 取代", DeprecationWarning)
+        if self.story is None:
+            self.generate_story()
+        if not self.story.confirmed:
+            self.confirm_story()
+        return self.generate_script()
 
     def update_script_scene(self, scene_id: int, patch: dict[str, Any]) -> StoryScript:
-        if self.draft is None:
-            raise RuntimeError("尚未生成剧本草稿。")
+        if self.script is None:
+            raise RuntimeError("尚未生成剧本。")
         scene = next(
-            (item for item in self.draft.script.scenes if item.scene_id == int(scene_id)), None
+            (item for item in self.script.scenes if item.scene_id == int(scene_id)), None
         )
         if scene is None:
             raise ValueError("场景不存在。")
@@ -472,9 +593,10 @@ class GuidedStorySession:
             if not hasattr(scene, field) or field == "scene_id":
                 raise ValueError(f"不支持的场景字段：{field}")
             setattr(scene, field, value)
-        self.draft.script.confirmed = False
-        self._snapshot("draft", to_plain_data(self.draft), user_feedback=f"edit scene {scene_id}")
-        return self.draft.script
+        self.script.confirmed = False
+        self.stage = Stage.SCRIPT_REVIEW
+        self._snapshot("script", to_plain_data(self.script), user_feedback=f"edit scene {scene_id}")
+        return self.script
 
     # persistence ----------------------------------------------------------------
     def save(self, path: str | Path) -> Path:
@@ -499,6 +621,9 @@ class GuidedStorySession:
             else None,
             "selected_elements": self.selected_elements,
             "chat_history": self.chat_history,
+            "story": to_plain_data(self.story) if self.story else None,
+            "story_history": to_plain_data(self.story_history),
+            "script": to_plain_data(self.script) if self.script else None,
             "draft": to_plain_data(self.draft) if self.draft else None,
             "draft_history": to_plain_data(self.draft_history),
             "storyboard": to_plain_data(self.storyboard) if self.storyboard else None,
@@ -518,9 +643,13 @@ class GuidedStorySession:
     def load(cls, path: str | Path, *, agent: StoryAgent | None = None) -> GuidedStorySession:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         session = cls(CreativeBrief(**data.get("brief", {})), agent=agent)
-        if int(data.get("schema_version", 1)) < 3:
+        schema_version = int(data.get("schema_version", 1))
+        if schema_version < 3:
             return session._load_v2(data)
-        session.stage = Stage(data.get("stage", Stage.IDEATING.value))
+        raw_stage = str(data.get("stage", Stage.IDEATING.value))
+        if schema_version == 3 and raw_stage == Stage.DRAFT_REVIEW.value:
+            raw_stage = Stage.SCRIPT_REVIEW.value
+        session.stage = Stage(raw_stage)
         session.direction = str(data.get("direction", ""))
         session.idea_batches = [session._batch_from(item) for item in data.get("idea_batches", [])]
         session.selected_idea_ids = [str(item) for item in data.get("selected_idea_ids", [])]
@@ -531,9 +660,21 @@ class GuidedStorySession:
             str(k): str(v) for k, v in data.get("selected_elements", {}).items()
         }
         session.chat_history = list(data.get("chat_history", []))
+        if data.get("story"):
+            session.story = session._story_from_data(data["story"])
+        session.story_history = [
+            session._story_from_data(item) for item in data.get("story_history", [])
+        ]
+        if data.get("script"):
+            session.script = session._script_from(data["script"])
         if data.get("draft"):
             session.draft = session._draft_from(data["draft"])
-            session.outline, session.script = session.draft.outline, session.draft.script
+            session.outline = session.draft.outline
+            if session.script is None:
+                session.script = session.draft.script
+            if session.story is None:
+                session.story = session._story_from_legacy_draft(session.draft)
+                session.story_history = [deepcopy(session.story)]
         session.draft_history = [
             session._draft_from(item) for item in data.get("draft_history", [])
         ]
@@ -573,7 +714,9 @@ class GuidedStorySession:
             )
             self.draft_history = [deepcopy(self.draft)]
             self.outline, self.script = outline, script
-            self.stage = Stage.DRAFT_REVIEW
+            self.story = self._story_from_legacy_draft(self.draft)
+            self.story_history = [deepcopy(self.story)]
+            self.stage = Stage.SCRIPT_REVIEW
         else:
             self.stage = Stage.IDEATING
         if data.get("storyboard"):
@@ -599,51 +742,63 @@ class GuidedStorySession:
         if fingerprints & previous:
             raise ValueError("新一批创意卡不能重复已经看过或淘汰的创意。")
 
-    def _validate_or_repair_draft(self, draft: DraftBundle) -> None:
-        if len(draft.script.scenes) != 5:
-            raise ValueError("自动修复失败：剧本必须包含五个场景。")
-        total = draft.script.total_duration
+    @staticmethod
+    def _validate_story(story: StoryDraft) -> None:
+        if not story.title.strip() or not story.logline.strip():
+            raise ValueError("故事缺少标题或一句话概述。")
+        if len(story.story_text.strip()) < 120:
+            raise ValueError("故事正文过短，尚不足以进入剧本改编。")
+        if not story.characters:
+            raise ValueError("故事至少需要一个明确人物。")
+        if not story.core_conflict.strip() or not story.ending.strip():
+            raise ValueError("故事必须明确核心冲突和结局。")
+
+    def _validate_or_repair_script(self, script: StoryScript) -> None:
+        if not script.scenes:
+            raise ValueError("剧本至少需要一个可拍摄场景。")
+        total = script.total_duration
         if abs(total - self.brief.target_seconds) > 1:
-            durations = allocate_durations(self.brief.target_seconds, 5, minimum=3, maximum=15)
-            for scene, beat, duration in zip(draft.script.scenes, draft.outline.beats, durations):
+            durations = allocate_durations(
+                self.brief.target_seconds,
+                len(script.scenes),
+                minimum=1,
+                maximum=self.brief.target_seconds,
+            )
+            for scene, duration in zip(script.scenes, durations):
                 scene.duration = duration
-                beat.duration = duration
-        for scene in draft.script.scenes:
+        for scene in script.scenes:
             if not (scene.visible_action or scene.action).strip():
                 scene.action = scene.narration or "主角完成一个清晰可见的动作"
                 scene.visible_action = scene.action
 
     def _preserve_user_choices(
         self,
-        draft: DraftBundle,
+        story: StoryDraft,
         selected_options: dict[str, ElementOption],
     ) -> None:
         """Apply choices after model output so an LLM cannot silently rewrite them."""
         cards = self.selected_cards
         source_ids = [card.idea_id for card in cards]
         if cards:
-            protagonists = "；".join(card.protagonist for card in cards)
             conflicts = "；".join(card.central_conflict for card in cards)
             endings = "；".join(card.ending_direction for card in cards)
-            hooks = "；".join(card.hook for card in cards)
             tones = " × ".join(card.tone for card in cards)
             titles = " × ".join(card.title for card in cards)
-            draft.outline.title = titles
-            draft.script.title = titles
-            tone_marker = f"（保留基调：{tones}）"
-            if tone_marker not in draft.outline.logline:
-                draft.outline.logline = f"{draft.outline.logline}{tone_marker}"
-            if hooks not in draft.outline.opening:
-                draft.outline.opening = f"{hooks}。{draft.outline.opening}"
-            if protagonists not in draft.outline.protagonist_goal:
-                draft.outline.protagonist_goal = f"{protagonists}：{draft.outline.protagonist_goal}"
-            draft.outline.conflict = conflicts
-            draft.outline.ending = endings
-            for scene in draft.script.scenes:
-                for protagonist in (card.protagonist for card in cards):
-                    if protagonist not in scene.characters:
-                        scene.characters.append(protagonist)
-            draft.field_sources["selected_ideas"] = SourceAttribution(
+            story.title = titles
+            story.tone = tones
+            story.core_conflict = conflicts
+            story.ending = endings
+            known_names = {item.name for item in story.characters}
+            for card in cards:
+                if card.protagonist not in known_names:
+                    story.characters.append(
+                        StoryCharacter(
+                            name=card.protagonist,
+                            description=card.logline,
+                            visual_identity="保持统一外观与服装",
+                        )
+                    )
+            story.field_sources["selected_ideas"] = SourceAttribution(
                 field="selected_ideas",
                 source_type="selected_card",
                 value=json.dumps(to_plain_data(cards), ensure_ascii=False),
@@ -651,35 +806,40 @@ class GuidedStorySession:
             )
         mapping = {
             "character": "protagonist",
-            "conflict": "conflict",
+            "conflict": "core_conflict",
             "turning_point": "turning_point",
             "ending": "ending",
         }
         for kind, option in selected_options.items():
             field = mapping[kind]
             if kind == "character":
-                draft.outline.protagonist_goal = option.content
-                for scene in draft.script.scenes:
-                    scene.characters = [option.content]
+                if story.characters:
+                    story.characters[0].description = option.content
+                else:
+                    story.characters = [StoryCharacter("主角", option.content)]
+            elif kind == "turning_point":
+                marker = f"确定发生的关键变化：{option.content}"
+                if option.content not in story.story_text:
+                    story.story_text = f"{story.story_text}\n\n{marker}。"
             else:
-                setattr(draft.outline, field, option.content)
-            draft.field_sources[field] = SourceAttribution(
+                setattr(story, field, option.content)
+            story.field_sources[field] = SourceAttribution(
                 field=field,
                 source_type="selected_element",
                 value=option.content,
                 source_ids=[option.option_id],
             )
-            if field in draft.ai_filled_fields:
-                draft.ai_filled_fields.remove(field)
-        for field, source in draft.field_sources.items():
-            if source.source_type == "ai_fill" and field not in draft.ai_filled_fields:
-                draft.ai_filled_fields.append(field)
-        for field in list(draft.ai_filled_fields):
-            if field not in draft.field_sources:
-                draft.field_sources[field] = SourceAttribution(
+            if field in story.ai_filled_fields:
+                story.ai_filled_fields.remove(field)
+        for field, source in story.field_sources.items():
+            if source.source_type == "ai_fill" and field not in story.ai_filled_fields:
+                story.ai_filled_fields.append(field)
+        for field in list(story.ai_filled_fields):
+            if field not in story.field_sources:
+                story.field_sources[field] = SourceAttribution(
                     field=field,
                     source_type="ai_fill",
-                    value="由AI在草稿生成阶段补全",
+                    value="由AI在故事生成阶段补全",
                 )
 
     def _require_direction(self) -> None:
@@ -708,25 +868,35 @@ class GuidedStorySession:
         return option
 
     def _story_facts(self) -> StoryFacts:
-        if self.draft:
-            sources = self.draft.field_sources
+        if self.story:
+            protagonist = "、".join(item.name for item in self.story.characters)
+            character_visuals = "；".join(
+                f"{item.name}：{item.visual_identity or item.description}"
+                for item in self.story.characters
+            )
+            scene_details = "；".join(
+                f"{item.name}：{item.visual_identity or item.description}"
+                for item in self.story.locations
+            )
             return StoryFacts(
                 premise=self.direction,
                 genre=self.brief.genre,
-                opening=self.draft.outline.opening,
-                protagonist=sources.get(
-                    "protagonist", SourceAttribution("", "", "统一外形的主角")
+                tone=self.story.tone,
+                theme=self.story.theme,
+                opening=self.story.story_text[:120],
+                protagonist=protagonist,
+                protagonist_goal=self.story.logline,
+                conflict=self.story.core_conflict,
+                development=self.story.story_text,
+                turning_point=self.story.field_sources.get(
+                    "turning_point", SourceAttribution("", "", "")
                 ).value,
-                protagonist_goal=self.draft.outline.protagonist_goal,
-                conflict=self.draft.outline.conflict,
-                development=self.draft.outline.development,
-                turning_point=self.draft.outline.turning_point,
-                ending=self.draft.outline.ending,
-                character_visuals="统一外形、服装和轮廓的主角",
-                scene_details="连续且具有统一色彩与光线的核心场景",
-                props="贯穿故事的关键物件",
+                ending=self.story.ending,
+                character_visuals=character_visuals or "保持人物外观一致",
+                scene_details=scene_details or "保持地点空间、光线和主色一致",
+                props="；".join(self.story.visual_anchors),
                 narration_style="克制旁白，只补充画面不可见信息",
-                visual_anchors="主角服装、关键物件、场景主色",
+                visual_anchors="；".join(self.story.visual_anchors),
                 transitions="动作方向和关键物件匹配剪辑",
             )
         return self.legacy_facts
@@ -756,7 +926,9 @@ class GuidedStorySession:
         return revision
 
     def undo_artifact(self, artifact_type: str | None = None) -> Any:
-        kind = artifact_type or ("storyboard" if self.storyboard else "draft")
+        kind = artifact_type or (
+            "storyboard" if self.storyboard else "script" if self.script else "story"
+        )
         cursor = self.revision_cursor.get(kind, -1)
         if cursor <= 0:
             raise RuntimeError("没有更早的版本可以撤销。")
@@ -765,7 +937,9 @@ class GuidedStorySession:
         return self._restore_revision(self.revisions[kind][cursor])
 
     def redo_artifact(self, artifact_type: str | None = None) -> Any:
-        kind = artifact_type or ("storyboard" if self.storyboard else "draft")
+        kind = artifact_type or (
+            "storyboard" if self.storyboard else "script" if self.script else "story"
+        )
         cursor = self.revision_cursor.get(kind, -1)
         history = self.revisions.get(kind, [])
         if cursor < 0 or cursor >= len(history) - 1:
@@ -775,10 +949,21 @@ class GuidedStorySession:
         return self._restore_revision(history[cursor])
 
     def _restore_revision(self, revision: ArtifactRevision) -> Any:
+        if revision.artifact_type == "story":
+            self.story = self._story_from_data(revision.payload)
+            self.stage = Stage.STORY_REVIEW
+            self.script = None
+            self.storyboard = None
+            return self.story
+        if revision.artifact_type == "script":
+            self.script = self._script_from(revision.payload)
+            self.stage = Stage.SCRIPT_REVIEW
+            self.storyboard = None
+            return self.script
         if revision.artifact_type == "draft":
             self.draft = self._draft_from(revision.payload)
             self.outline, self.script = self.draft.outline, self.draft.script
-            self.stage = Stage.DRAFT_REVIEW
+            self.stage = Stage.SCRIPT_REVIEW
             self.storyboard = None
             return self.draft
         if revision.artifact_type == "storyboard":
@@ -809,6 +994,74 @@ class GuidedStorySession:
                 str(kind): [ElementOption(**item) for item in values]
                 for kind, values in data.get("options", {}).items()
             }
+        )
+
+    @staticmethod
+    def _story_from_data(data: dict[str, Any]) -> StoryDraft:
+        return StoryDraft(
+            title=str(data.get("title", "")),
+            logline=str(data.get("logline", "")),
+            story_text=str(data.get("story_text", "")),
+            characters=[StoryCharacter(**item) for item in data.get("characters", [])],
+            locations=[StoryLocation(**item) for item in data.get("locations", [])],
+            tone=str(data.get("tone", "")),
+            theme=str(data.get("theme", "")),
+            core_conflict=str(data.get("core_conflict", "")),
+            ending=str(data.get("ending", "")),
+            visual_anchors=[str(item) for item in data.get("visual_anchors", [])],
+            field_sources={
+                str(kind): SourceAttribution(**item)
+                for kind, item in data.get("field_sources", {}).items()
+            },
+            ai_filled_fields=[str(item) for item in data.get("ai_filled_fields", [])],
+            version=int(data.get("version", 1)),
+            confirmed=bool(data.get("confirmed", False)),
+        )
+
+    @staticmethod
+    def _story_from_legacy_draft(draft: DraftBundle) -> StoryDraft:
+        story_text = draft.outline.development.strip() or "\n\n".join(
+            beat.event for beat in draft.outline.beats if beat.event.strip()
+        )
+        if len(story_text) < 120:
+            story_text = "\n\n".join(
+                [
+                    draft.outline.opening,
+                    draft.outline.protagonist_goal,
+                    draft.outline.conflict,
+                    draft.outline.development,
+                    draft.outline.turning_point,
+                    draft.outline.ending,
+                ]
+            )
+        names = []
+        for scene in draft.script.scenes:
+            for name in scene.characters:
+                if name not in names:
+                    names.append(name)
+        locations = []
+        for scene in draft.script.scenes:
+            if scene.location not in locations:
+                locations.append(scene.location)
+        return StoryDraft(
+            title=draft.outline.title,
+            logline=draft.outline.logline,
+            story_text=story_text,
+            characters=[
+                StoryCharacter(name, draft.outline.protagonist_goal, "保持旧版人物外观一致")
+                for name in (names or ["主角"])
+            ],
+            locations=[
+                StoryLocation(name, "从旧版剧本迁移的地点", "保持旧版空间与光线一致")
+                for name in (locations or ["故事核心场景"])
+            ],
+            core_conflict=draft.outline.conflict,
+            ending=draft.outline.ending,
+            visual_anchors=["旧版人物外观", "旧版关键道具", "旧版场景主色"],
+            field_sources=deepcopy(draft.field_sources),
+            ai_filled_fields=list(draft.ai_filled_fields),
+            version=draft.version,
+            confirmed=True,
         )
 
     @classmethod
@@ -849,11 +1102,64 @@ class GuidedStorySession:
 
     @staticmethod
     def _storyboard_from(data: dict[str, Any]) -> StoryboardPlan:
+        bible_data = data.get("visual_bible", {})
+        visual_bible = VisualBible(
+            visual_style=str(bible_data.get("visual_style", "电影感写实")),
+            color_palette=str(bible_data.get("color_palette", "统一、克制的电影色彩")),
+            lighting_rules=str(
+                bible_data.get("lighting_rules", "光源方向和时段连续，避免镜头间突变")
+            ),
+            camera_language=str(
+                bible_data.get("camera_language", "镜头服务于动作和情绪，不为变化而变化")
+            ),
+            assets=[
+                VisualAsset(
+                    asset_id=str(item.get("asset_id", "")),
+                    kind=str(item.get("kind", "")),
+                    name=str(item.get("name", "")),
+                    description=str(item.get("description", "")),
+                    reference_images=[
+                        str(path) for path in item.get("reference_images", [])
+                    ],
+                )
+                for item in bible_data.get("assets", [])
+            ],
+            continuity_rules=[
+                str(item) for item in bible_data.get("continuity_rules", [])
+            ],
+        )
         return StoryboardPlan(
             title=str(data.get("title", "")),
             target_seconds=int(data.get("target_seconds", 45)),
-            shots=[StoryboardShot(**item) for item in data.get("shots", [])],
+            shots=[
+                StoryboardShot(
+                    **{
+                        **item,
+                        "first_frame_prompt": str(
+                            item.get("first_frame_prompt")
+                            or item.get("start_frame")
+                            or item.get("video_prompt", "")
+                        ),
+                        "motion_prompt": str(
+                            item.get("motion_prompt")
+                            or item.get("action")
+                            or item.get("video_prompt", "")
+                        ),
+                        "end_frame_prompt": str(
+                            item.get("end_frame_prompt")
+                            or item.get("end_frame")
+                            or item.get("video_prompt", "")
+                        ),
+                        "reference_asset_ids": [
+                            str(value)
+                            for value in item.get("reference_asset_ids", [])
+                        ],
+                    }
+                )
+                for item in data.get("shots", [])
+            ],
             narration_text=str(data.get("narration_text", "")),
+            visual_bible=visual_bible,
             confirmed=bool(data.get("confirmed", False)),
             audio_path=str(data.get("audio_path", "")),
             subtitle_path=str(data.get("subtitle_path", "")),

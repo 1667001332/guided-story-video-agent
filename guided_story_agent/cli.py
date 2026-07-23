@@ -17,9 +17,10 @@ HELP = """可用命令：
 /pick 1 3       保留第1和第3张卡     /more 2      生成8个相似方向
 /refresh        换一批8张卡          /mix        混合已选卡
 /expand         展开四类故事零件      /choose ending 3  选择结局3
-/auto           让AI替你选择          /draft      随时生成剧本草稿
-/revise         用一句反馈改写         /back       回到灵感区
-/storyboard     接受草稿并生成分镜     /render     付费视频入口
+/auto           让AI替你选择          /story      生成完整故事
+/revise-story   修改故事               /script     确认故事并生成剧本
+/revise-script  修改剧本               /back       回到灵感区
+/storyboard     接受剧本并生成分镜     /render     付费视频入口
 /quit           保存并退出
 """
 
@@ -86,24 +87,35 @@ def run_interactive(
             elif raw == "/auto":
                 session.auto_choose()
                 output_fn(_selection_text(session))
-            elif raw in ("/draft", "/outline"):
-                draft = session.generate_draft()
-                _print_draft(draft, output_fn)
-            elif raw == "/revise":
-                feedback = input_fn("一句话修改：").strip()
-                draft = session.revise_draft(feedback)
-                _print_draft(draft, output_fn)
+            elif raw in ("/story", "/draft", "/outline"):
+                story = session.generate_story()
+                _print_story(story, output_fn)
+            elif raw in ("/revise-story", "/revise"):
+                feedback = input_fn("一句话修改故事：").strip()
+                story = session.revise_story(feedback)
+                _print_story(story, output_fn)
+            elif raw == "/script":
+                session.confirm_story()
+                script = session.generate_script()
+                _print_script(script, output_fn)
+            elif raw == "/revise-script":
+                feedback = input_fn("一句话修改剧本：").strip()
+                script = session.revise_script(feedback)
+                _print_script(script, output_fn)
             elif raw == "/back":
                 session.back_to_ideation()
                 _print_cards(session, output_fn)
             elif raw == "/storyboard":
-                session.confirm_draft()
+                session.confirm_script()
                 plan = session.build_storyboard()
                 output_fn(f"已生成 {len(plan.shots)} 个镜头，总时长 {plan.total_duration} 秒。")
             elif raw == "/confirm":
-                if session.stage == Stage.DRAFT_REVIEW:
-                    session.confirm_draft()
-                    output_fn("草稿已确认；输入 /storyboard 生成分镜。")
+                if session.stage == Stage.STORY_REVIEW:
+                    session.confirm_story()
+                    output_fn("故事已确认；输入 /script 生成剧本。")
+                elif session.stage == Stage.SCRIPT_REVIEW:
+                    session.confirm_script()
+                    output_fn("剧本已确认；输入 /storyboard 生成分镜。")
                 elif session.stage == Stage.STORYBOARD_REVIEW:
                     session.confirm_storyboard()
                     output_fn("分镜已确认。")
@@ -159,10 +171,15 @@ def _selection_text(session: GuidedStorySession) -> str:
     return "已保留：" + ("、".join(card.title for card in session.selected_cards) or "暂无")
 
 
-def _print_draft(draft, output_fn: Callable[[str], None]) -> None:
-    output_fn(f"\n《{draft.script.title}》第{draft.version}版")
-    output_fn("AI补全：" + ("、".join(draft.ai_filled_fields) or "无"))
-    for scene in draft.script.scenes:
+def _print_story(story, output_fn: Callable[[str], None]) -> None:
+    output_fn(f"\n《{story.title}》故事第{story.version}版")
+    output_fn(story.story_text)
+    output_fn("AI补全：" + ("、".join(story.ai_filled_fields) or "无"))
+
+
+def _print_script(script, output_fn: Callable[[str], None]) -> None:
+    output_fn(f"\n《{script.title}》剧本｜{script.total_duration}秒")
+    for scene in script.scenes:
         output_fn(
             f"场景{scene.scene_id} {scene.duration}秒｜{scene.title}｜"
             f"{scene.visible_action or scene.action}"

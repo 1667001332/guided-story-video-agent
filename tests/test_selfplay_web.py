@@ -9,7 +9,9 @@ from guided_story_agent.agent import OpenAIStoryAgent
 from guided_story_agent.web_app import (
     build_app,
     card_grid_payload,
+    generate_story_view,
     render_video_with_progress,
+    refresh_ideas_view,
     start_garden_view,
 )
 
@@ -40,6 +42,16 @@ class CreativeGardenWebTests(unittest.TestCase):
         self.assertIn("离线兜底", status)
         self.assertIn("不是 LLM 结果", status)
 
+    def test_followup_text_actions_keep_fallback_visible(self) -> None:
+        session, *_ = start_garden_view(
+            "校园悬疑", 30, OpenAIStoryAgent(None, "offline-test")
+        )
+        session, _, _, refresh_status = refresh_ideas_view(session)
+        self.assertIn("离线兜底", refresh_status)
+        session, _, _, story_status = generate_story_view(session)
+        self.assertIn("离线兜底", story_status)
+        self.assertIn("完整故事已生成", story_status)
+
     def test_app_has_native_multiselect_grid_and_no_dataframe(self) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -59,13 +71,14 @@ class CreativeGardenWebTests(unittest.TestCase):
             "select_ideas",
             "mix_selected",
             "auto_choose",
-            "generate_draft",
+            "generate_story",
+            "generate_script",
             "back_to_ideas",
             "render_video",
         ):
             self.assertIn(name, api_names)
 
-    def test_process_api_one_sentence_select_and_draft(self) -> None:
+    def test_process_api_one_sentence_select_story_and_script(self) -> None:
         from gradio.state_holder import SessionState
 
         with warnings.catch_warnings():
@@ -94,13 +107,17 @@ class CreativeGardenWebTests(unittest.TestCase):
             self.assertEqual(8, len(mixed["data"][1]["choices"]))
             auto = await app.process_api(indexes["auto_choose"], [None], state=state)
             self.assertEqual(1, len(auto["data"][1]["value"]))
-            drafted = await app.process_api(indexes["generate_draft"], [None], state=state)
-            self.assertIn("场景 1", drafted["data"][1])
-            state_id = app.fns[indexes["generate_draft"]].inputs[0]._id
+            written = await app.process_api(indexes["generate_story"], [None], state=state)
+            self.assertIn("完整故事", written["data"][3])
+            state_id = app.fns[indexes["generate_story"]].inputs[0]._id
             active = state[state_id]
-            self.assertEqual(Stage.DRAFT_REVIEW, active.stage)
+            self.assertEqual(Stage.STORY_REVIEW, active.stage)
+            scripted = await app.process_api(indexes["generate_script"], [None], state=state)
+            self.assertIn("场景 1", scripted["data"][1])
+            self.assertEqual(Stage.SCRIPT_REVIEW, active.stage)
             await app.process_api(indexes["back_to_ideas"], [None], state=state)
-            self.assertIsNotNone(active.draft)
+            self.assertIsNotNone(active.story)
+            self.assertIsNotNone(active.script)
 
         asyncio.run(process())
 
@@ -119,8 +136,14 @@ class CreativeGardenWebTests(unittest.TestCase):
         async def process() -> None:
             await app.process_api(indexes["start_ideation"], ["雨夜车站", 30], state=state)
             await app.process_api(indexes["auto_choose"], [None], state=state)
-            await app.process_api(indexes["generate_draft"], [None], state=state)
-            await app.process_api(indexes["build_storyboard"], [None], state=state)
+            await app.process_api(indexes["generate_story"], [None], state=state)
+            await app.process_api(indexes["generate_script"], [None], state=state)
+            planned = await app.process_api(
+                indexes["build_storyboard"], [None], state=state
+            )
+            self.assertIn("视觉圣经", planned["data"][1])
+            self.assertIn("首帧", planned["data"][1])
+            self.assertIn("引用资产", planned["data"][1])
             await app.process_api(indexes["confirm_storyboard"], [None], state=state)
             blocked = await app.process_api(indexes["render_video"], [None, False], state=state)
             self.assertIn("费用确认", blocked["data"][2])

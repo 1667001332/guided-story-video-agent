@@ -67,6 +67,7 @@ class StoryRenderer:
                     0.1 + 0.75 * ((index + 1) / len(plan.shots)),
                     f"复用镜头 {shot.shot_id}",
                 )
+                self._write_manifest(manifest, target)
                 continue
             attempt = 1 + sum(item.shot_id == shot.shot_id for item in plan.artifacts)
             try:
@@ -98,13 +99,25 @@ class StoryRenderer:
                 plan.artifacts.append(artifact)
                 manifest.artifacts.append(artifact)
                 manifest.failed_shots.append(shot.shot_id)
-                manifest.status = "failed"
-                manifest.error = f"镜头 {shot.shot_id} 生成失败：{exc}"
+                manifest.error = (
+                    f"{manifest.error}；" if manifest.error else ""
+                ) + f"镜头 {shot.shot_id} 生成失败：{exc}"
                 self._write_manifest(manifest, target)
-                return manifest
+                continue
             plan.artifacts.append(artifact)
             manifest.artifacts.append(artifact)
             manifest.generated_shots.append(shot.shot_id)
+            self._write_manifest(manifest, target)
+
+        if manifest.failed_shots:
+            manifest.status = "failed"
+            self._progress(
+                "incomplete",
+                0.88,
+                "部分镜头生成失败；成功镜头已经保存，下次只需重试失败镜头",
+            )
+            self._write_manifest(manifest, target)
+            return manifest
 
         clips = [item.local_path for item in manifest.artifacts if item.status == "succeeded"]
         try:

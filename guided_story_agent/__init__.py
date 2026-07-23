@@ -12,11 +12,16 @@ from .models import (
     IdeationTurnResult,
     RenderManifest,
     Stage,
+    StoryCharacter,
+    StoryDraft,
+    StoryLocation,
     StoryOutline,
     StoryScript,
     StoryboardPlan,
     StoryboardShot,
     SelectionState,
+    VisualAsset,
+    VisualBible,
 )
 from .session import GuidedStorySession
 
@@ -35,8 +40,13 @@ __all__ = [
     "RuleBasedStoryAgent",
     "SelectionState",
     "Stage",
+    "StoryCharacter",
+    "StoryDraft",
+    "StoryLocation",
     "StoryOutline",
     "StoryScript",
     "StoryboardPlan",
     "StoryboardShot",
+    "VisualAsset",
+    "VisualBible",
 ]
