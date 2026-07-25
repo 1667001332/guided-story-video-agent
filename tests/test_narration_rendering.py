@@ -92,7 +92,7 @@ class NarrationRenderingTests(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4, 5], manifest.generated_shots)
         self.assertEqual("finalize", events[-1])
 
-    def test_renderer_stops_after_failed_shot_and_keeps_manifest(self) -> None:
+    def test_renderer_keeps_successes_and_retries_only_failed_shots(self) -> None:
         class Narration:
             def synthesize(self, plan, output_dir):
                 return NarrationArtifact("", "")
@@ -102,13 +102,62 @@ class NarrationRenderingTests(unittest.TestCase):
             provider_name = "fake"
 
             def generate_shot(self, shot, output_dir, **kwargs):
-                raise RuntimeError("boom")
+                if shot.shot_id == 3:
+                    raise RuntimeError("boom")
+                path = Path(output_dir) / f"{shot.shot_id}.mp4"
+                path.write_bytes(b"video")
+                return VideoArtifact(
+                    f"a{shot.shot_id}",
+                    shot.shot_id,
+                    "fake",
+                    self.endpoint,
+                    "succeeded",
+                    str(path),
+                    "",
+                    shot.duration,
+                    shot.video_prompt,
+                    "now",
+                    attempt=kwargs.get("attempt", 1),
+                )
+
+        class RecoveredProvider(Provider):
+            def generate_shot(self, shot, output_dir, **kwargs):
+                path = Path(output_dir) / f"{shot.shot_id}.mp4"
+                path.write_bytes(b"video")
+                return VideoArtifact(
+                    f"recovered-{shot.shot_id}",
+                    shot.shot_id,
+                    "fake",
+                    self.endpoint,
+                    "succeeded",
+                    str(path),
+                    "",
+                    shot.duration,
+                    shot.video_prompt,
+                    "now",
+                    attempt=kwargs.get("attempt", 1),
+                )
+
+        def assemble(paths, output):
+            Path(output).write_bytes(b"silent")
+            return str(output)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = StoryRenderer(Provider(), narration=Narration()).render(make_plan(), temp_dir)
+            plan = make_plan()
+            manifest = StoryRenderer(Provider(), narration=Narration()).render(plan, temp_dir)
             self.assertTrue((Path(temp_dir) / "render_manifest.json").is_file())
-        self.assertEqual("failed", manifest.status)
-        self.assertEqual([1], manifest.failed_shots)
+            self.assertEqual("failed", manifest.status)
+            self.assertEqual([3], manifest.failed_shots)
+            self.assertEqual([1, 2, 4, 5], manifest.generated_shots)
+
+            recovered = StoryRenderer(
+                RecoveredProvider(),
+                narration=Narration(),
+                assembler=assemble,
+            ).render(plan, temp_dir)
+            self.assertEqual("succeeded", recovered.status)
+            self.assertEqual([1, 2, 4, 5], recovered.reused_shots)
+            self.assertEqual([3], recovered.generated_shots)
 
 
 if __name__ == "__main__":

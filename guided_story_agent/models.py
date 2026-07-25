@@ -8,6 +8,7 @@ from typing import Any
 
 class Stage(str, Enum):
     IDEATING = "ideating"
+    STORY_REVIEW = "story_review"
     DRAFT_REVIEW = "draft_review"
     COLLECTING = "collecting"
     OUTLINE_REVIEW = "outline_review"
@@ -20,15 +21,28 @@ class Stage(str, Enum):
 
 @dataclass(slots=True)
 class CreativeBrief:
-    target_seconds: int = 45
+    target_seconds: int | None = None
+    duration_mode: str = "auto"
+    resolved_target_seconds: int | None = None
     genre: str = "短片"
     visual_style: str = "电影感写实"
     language: str = "zh-CN"
     narration_enabled: bool = True
 
+    def __post_init__(self) -> None:
+        # v0.4.1 and older only stored target_seconds. Preserve those saved
+        # values as an explicit custom duration during migration.
+        if self.target_seconds is not None and self.duration_mode == "auto":
+            self.duration_mode = "custom"
+
     def validate(self) -> None:
-        if not 30 <= int(self.target_seconds) <= 60:
-            raise ValueError("目标视频时长必须在 30 到 60 秒之间。")
+        if self.duration_mode not in {"auto", "custom"}:
+            raise ValueError("时长模式必须是 auto 或 custom。")
+        if self.duration_mode == "custom" and self.target_seconds is None:
+            raise ValueError("自定义时长模式必须填写目标秒数。")
+        for value in (self.target_seconds, self.resolved_target_seconds):
+            if value is not None and not 15 <= int(value) <= 300:
+                raise ValueError("目标视频时长必须在 15 到 300 秒之间。")
 
 
 @dataclass(slots=True)
@@ -158,6 +172,7 @@ class ElementPalette:
 class SelectionState:
     selected_idea_ids: list[str] = field(default_factory=list)
     selected_elements: dict[str, str] = field(default_factory=dict)
+    can_generate_story: bool = False
     can_generate_draft: bool = False
 
 
@@ -167,6 +182,38 @@ class SourceAttribution:
     source_type: str
     value: str
     source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class StoryCharacter:
+    name: str
+    description: str
+    visual_identity: str = ""
+
+
+@dataclass(slots=True)
+class StoryLocation:
+    name: str
+    description: str
+    visual_identity: str = ""
+
+
+@dataclass(slots=True)
+class StoryDraft:
+    title: str
+    logline: str
+    story_text: str
+    characters: list[StoryCharacter] = field(default_factory=list)
+    locations: list[StoryLocation] = field(default_factory=list)
+    tone: str = ""
+    theme: str = ""
+    core_conflict: str = ""
+    ending: str = ""
+    visual_anchors: list[str] = field(default_factory=list)
+    field_sources: dict[str, SourceAttribution] = field(default_factory=dict)
+    ai_filled_fields: list[str] = field(default_factory=list)
+    version: int = 1
+    confirmed: bool = False
 
 
 @dataclass(slots=True)
@@ -269,6 +316,29 @@ class StoryScript:
 
 
 @dataclass(slots=True)
+class VisualAsset:
+    """A planned identity anchor that can later receive one or more reference images."""
+
+    asset_id: str
+    kind: str
+    name: str
+    description: str
+    reference_images: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class VisualBible:
+    """Provider-independent visual source of truth for every generated shot."""
+
+    visual_style: str = "电影感写实"
+    color_palette: str = "统一、克制的电影色彩"
+    lighting_rules: str = "光源方向和时段连续，避免镜头间突变"
+    camera_language: str = "镜头服务于动作和情绪，不为变化而变化"
+    assets: list[VisualAsset] = field(default_factory=list)
+    continuity_rules: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class StoryboardShot:
     shot_id: int
     scene_id: int
@@ -291,6 +361,11 @@ class StoryboardShot:
     start_frame: str = ""
     end_frame: str = ""
     visual_anchors: list[str] = field(default_factory=list)
+    shot_kind: str = "action"
+    first_frame_prompt: str = ""
+    motion_prompt: str = ""
+    end_frame_prompt: str = ""
+    reference_asset_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -316,6 +391,7 @@ class StoryboardPlan:
     target_seconds: int
     shots: list[StoryboardShot]
     narration_text: str
+    visual_bible: VisualBible = field(default_factory=VisualBible)
     confirmed: bool = False
     audio_path: str = ""
     subtitle_path: str = ""

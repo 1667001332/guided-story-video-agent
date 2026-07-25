@@ -32,7 +32,7 @@ def _idea_metrics(session: GuidedStorySession) -> tuple[float, float]:
 def run_selfplay(
     *,
     agent: StoryAgent,
-    target_seconds: int = 45,
+    target_seconds: int | None = None,
     max_turns: int = 12,
     output_dir: str | Path,
     render: bool = False,
@@ -45,13 +45,21 @@ def run_selfplay(
     if require_live_text and getattr(agent, "client", None) is None:
         raise RuntimeError("--require-live-text 已启用，但没有可用的真实文本 API 配置。")
 
-    session = GuidedStorySession(CreativeBrief(target_seconds=target_seconds), agent=agent)
+    session = GuidedStorySession(
+        CreativeBrief(
+            target_seconds=target_seconds,
+            duration_mode="custom" if target_seconds is not None else "auto",
+        ),
+        agent=agent,
+    )
     direction = agent.simulate_creator_direction()
     ideas = session.start_ideation(direction)
     session.auto_choose()
     selected_snapshot = [to_plain_data(card) for card in session.selected_cards]
-    draft = session.generate_draft()
-    session.confirm_draft()
+    story = session.generate_story()
+    session.confirm_story()
+    script = session.generate_script()
+    session.confirm_script()
     storyboard = session.build_storyboard()
     session.confirm_storyboard()
 
@@ -62,13 +70,13 @@ def run_selfplay(
 
     diversity, duplicate_rate = _idea_metrics(session)
     selected_ids = {card["idea_id"] for card in selected_snapshot}
-    recorded_ids = set(draft.field_sources["selected_ideas"].source_ids)
-    disclosure_denominator = max(1, len(draft.ai_filled_fields))
-    disclosed = sum(field in draft.field_sources for field in draft.ai_filled_fields)
+    recorded_ids = set(story.field_sources["selected_ideas"].source_ids)
+    disclosure_denominator = max(1, len(story.ai_filled_fields))
+    disclosed = sum(field in story.field_sources for field in story.ai_filled_fields)
     cameras = {shot.camera for shot in storyboard.shots}
     anchors = sum(bool(shot.visual_anchors) for shot in storyboard.shots)
     bench = {
-        "schema_version": 3,
+        "schema_version": 4,
         "idea_count": len(ideas.cards),
         "idea_diversity": diversity,
         "duplicate_rate": duplicate_rate,
@@ -78,10 +86,15 @@ def run_selfplay(
         "ai_fill_transparency": round(disclosed / disclosure_denominator, 3),
         "mandatory_followup_text_count": 0,
         "free_text_required_count": 1,
-        "clicks_to_draft": 2,
-        "target_seconds": target_seconds,
+        "clicks_to_story": 2,
+        "clicks_story_to_script": 1,
+        "script_scene_count": len(script.scenes),
+        "duration_mode": session.brief.duration_mode,
+        "target_seconds": script.target_seconds,
         "storyboard_seconds": storyboard.total_duration,
-        "duration_within_tolerance": abs(storyboard.total_duration - target_seconds) <= 1,
+        "duration_within_tolerance": (
+            abs(storyboard.total_duration - script.target_seconds) <= 1
+        ),
         "visual_anchor_coverage": round(anchors / max(1, len(storyboard.shots)), 3),
         "shot_diversity": round(len(cameras) / max(1, len(storyboard.shots)), 3),
         "video_requested": bool(render),
@@ -93,20 +106,21 @@ def run_selfplay(
     target.mkdir(parents=True, exist_ok=True)
     artifacts = {
         "transcript.json": {
-            "schema_version": 3,
+            "schema_version": 4,
             "direction": direction,
             "chat": to_plain_data(session.chat_history),
         },
-        "ideas.json": {"schema_version": 3, "batches": to_plain_data(session.idea_batches)},
+        "ideas.json": {"schema_version": 4, "batches": to_plain_data(session.idea_batches)},
         "selection.json": {
-            "schema_version": 3,
+            "schema_version": 4,
             "ideas": selected_snapshot,
             "elements": to_plain_data(session.selected_elements),
         },
-        "draft.json": {"schema_version": 3, **to_plain_data(draft)},
-        "storyboard.json": {"schema_version": 3, **to_plain_data(storyboard)},
+        "story.json": {"schema_version": 4, **to_plain_data(story)},
+        "script.json": {"schema_version": 4, **to_plain_data(script)},
+        "storyboard.json": {"schema_version": 4, **to_plain_data(storyboard)},
         "prompt_log.json": {
-            "schema_version": 3,
+            "schema_version": 4,
             "prompts": [
                 {
                     "shot_id": shot.shot_id,
@@ -135,7 +149,12 @@ def run_selfplay(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="一句方向到分镜的创意花园自演测试")
-    parser.add_argument("--target-seconds", type=int, default=45, choices=range(30, 61))
+    parser.add_argument(
+        "--target-seconds",
+        type=int,
+        default=None,
+        help="自定义成片秒数（15–300）；省略时根据完整故事自动估算",
+    )
     parser.add_argument(
         "--max-turns",
         type=int,
