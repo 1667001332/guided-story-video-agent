@@ -200,7 +200,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
             )
         previous_location = scene.location
 
-    maximum = max(1, min(12, script.target_seconds // 3))
+    maximum = max(1, script.target_seconds // 3)
     minimum = max(
         math.ceil(script.target_seconds / 15),
         min(len(script.scenes), maximum),

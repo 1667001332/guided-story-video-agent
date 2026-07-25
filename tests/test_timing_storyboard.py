@@ -4,10 +4,19 @@ import unittest
 
 from guided_story_agent.models import StoryFacts, StoryScene, StoryScript
 from guided_story_agent.storyboard import build_storyboard
-from guided_story_agent.timing import allocate_durations
+from guided_story_agent.timing import allocate_durations, estimate_story_duration
 
 
 class TimingTests(unittest.TestCase):
+    def test_story_duration_estimate_scales_and_stays_within_bounds(self) -> None:
+        short = estimate_story_duration("女孩发现一封没有署名的信。她把信交给老师。")
+        long = estimate_story_duration(
+            "。".join(f"事件{i}推动人物作出新的选择" for i in range(30)),
+            character_count=4,
+            location_count=5,
+        )
+        self.assertTrue(15 <= short < long <= 300)
+
     def test_30_45_60_second_plans_are_exact(self) -> None:
         for target in (30, 45, 60):
             values = allocate_durations(target, 5)

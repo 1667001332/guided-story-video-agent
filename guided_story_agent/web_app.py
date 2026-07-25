@@ -49,10 +49,16 @@ def start_garden_view(
     direction: str,
     target_seconds: int | float = 45,
     agent: StoryAgent | None = None,
+    duration_mode: str = "custom",
 ) -> tuple[GuidedStorySession | None, dict[str, Any], str, list[dict[str, str]], str]:
     try:
+        mode = str(duration_mode).strip().lower()
+        custom_seconds = int(target_seconds) if mode == "custom" else None
         session = GuidedStorySession(
-            brief=CreativeBrief(target_seconds=int(target_seconds)),
+            brief=CreativeBrief(
+                target_seconds=custom_seconds,
+                duration_mode=mode,
+            ),
             agent=agent or RuleBasedStoryAgent(),
         )
         session.start_ideation(direction)
@@ -272,7 +278,10 @@ def generate_script_view(
         return (
             session,
             _script_markdown(script),
-            _text_status(session, "故事已确认，剧本已根据故事生成。"),
+            _text_status(
+                session,
+                f"故事已确认，剧本已按{script.target_seconds}秒生成。",
+            ),
         )
     except Exception as exc:
         return session, "", str(exc)
@@ -447,14 +456,18 @@ def build_app(agent_factory: Callable[[], StoryAgent] | None = None):
 
     IdeaCardGrid = _idea_card_grid_class(gr)
 
-    def start(direction, seconds):
+    def start(direction, duration_mode, seconds):
         return start_garden_view(
             direction,
             seconds,
             agent=(agent_factory() if agent_factory else RuleBasedStoryAgent()),
+            duration_mode=duration_mode,
         )
 
     start.__name__ = "start_garden_view"
+
+    def toggle_custom_duration(duration_mode):
+        return _gr_update(visible=duration_mode == "custom")
 
     def story_and_open(session):
         return (*generate_story_view(session), _gr_update(selected="story"))
@@ -700,13 +713,24 @@ footer{display:none!important}
                                     lines=2,
                                 )
                                 with gr.Row():
-                                    target_seconds = gr.Slider(
-                                        30,
-                                        60,
-                                        value=45,
-                                        step=1,
-                                        label="预计成片时长",
+                                    duration_mode = gr.Radio(
+                                        choices=[
+                                            ("自动估算（推荐）", "auto"),
+                                            ("自定义", "custom"),
+                                        ],
+                                        value="auto",
+                                        label="成片时长",
                                         scale=3,
+                                    )
+                                    target_seconds = gr.Number(
+                                        value=90,
+                                        minimum=15,
+                                        maximum=300,
+                                        step=5,
+                                        precision=0,
+                                        label="自定义秒数",
+                                        visible=False,
+                                        scale=2,
                                     )
                                     begin = gr.Button(
                                         "生成 8 个灵感方向",
@@ -946,8 +970,22 @@ footer{display:none!important}
             )
 
         base_outputs = [session_state, card_grid, selection, chat, status]
-        begin.click(start, [direction, target_seconds], base_outputs, api_name="start_ideation")
-        direction.submit(start, [direction, target_seconds], base_outputs)
+        duration_mode.change(
+            toggle_custom_duration,
+            [duration_mode],
+            [target_seconds],
+        )
+        begin.click(
+            start,
+            [direction, duration_mode, target_seconds],
+            base_outputs,
+            api_name="start_ideation",
+        )
+        direction.submit(
+            start,
+            [direction, duration_mode, target_seconds],
+            base_outputs,
+        )
         card_grid.input(
             select_cards_view,
             [session_state, card_grid],

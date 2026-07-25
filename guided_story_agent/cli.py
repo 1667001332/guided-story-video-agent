@@ -28,7 +28,7 @@ HELP = """可用命令：
 def run_interactive(
     *,
     agent: StoryAgent | None = None,
-    target_seconds: int = 45,
+    target_seconds: int | None = None,
     output_dir: str | Path = "outputs/manual_cli",
     allow_render: bool = False,
     require_live_text: bool = False,
@@ -40,7 +40,13 @@ def run_interactive(
     fallback_before = int(getattr(active_agent, "fallback_count", 0))
     if require_live_text and getattr(active_agent, "client", None) is None:
         raise RuntimeError("--require-live-text 已启用，但没有可用的真实文本API配置。")
-    session = GuidedStorySession(CreativeBrief(target_seconds=target_seconds), active_agent)
+    session = GuidedStorySession(
+        CreativeBrief(
+            target_seconds=target_seconds,
+            duration_mode="custom" if target_seconds is not None else "auto",
+        ),
+        active_agent,
+    )
     target = Path(output_dir).expanduser().resolve()
     output_fn("一句话剧本创意花园：你只需要先说一个方向。")
     direction = input_fn("方向：").strip()
@@ -188,7 +194,12 @@ def _print_script(script, output_fn: Callable[[str], None]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="一句话剧本创意花园CLI")
-    parser.add_argument("--target-seconds", type=int, default=45, choices=range(30, 61))
+    parser.add_argument(
+        "--target-seconds",
+        type=int,
+        default=None,
+        help="自定义成片秒数（15–300）；省略时根据完整故事自动估算",
+    )
     parser.add_argument("--output", default="")
     parser.add_argument("--require-live-text", action="store_true")
     parser.add_argument("--render", action="store_true", help="允许二次确认后的付费视频生成")

@@ -26,6 +26,25 @@ class RepairableScriptAgent(RuleBasedStoryAgent):
 
 
 class GuidedStorySessionV4Tests(unittest.TestCase):
+    def test_auto_duration_is_resolved_from_complete_story(self) -> None:
+        session = GuidedStorySession(CreativeBrief(), RuleBasedStoryAgent())
+        session.start_ideation("一名邮差在雨夜收到未来自己的来信")
+        session.generate_story()
+        session.confirm_story()
+        script = session.generate_script()
+        self.assertEqual("auto", session.brief.duration_mode)
+        self.assertEqual(script.target_seconds, session.brief.resolved_target_seconds)
+        self.assertTrue(15 <= script.target_seconds <= 300)
+
+    def test_custom_duration_accepts_15_to_300_seconds(self) -> None:
+        for seconds in (15, 90, 300):
+            brief = CreativeBrief(target_seconds=seconds)
+            brief.validate()
+            self.assertEqual("custom", brief.duration_mode)
+        for seconds in (14, 301):
+            with self.assertRaisesRegex(ValueError, "15 到 300"):
+                GuidedStorySession(CreativeBrief(target_seconds=seconds))
+
     def test_direction_immediately_creates_eight_distinct_cards(self) -> None:
         session = started()
         self.assertEqual(Stage.IDEATING, session.stage)
@@ -149,6 +168,17 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
             self.assertTrue(all(shot.end_frame_prompt for shot in storyboard.shots))
         self.assertGreater(len(scene_counts), 1)
         self.assertGreater(len(shot_counts), 1)
+
+    def test_long_custom_duration_is_not_capped_at_twelve_shots(self) -> None:
+        session = started(300)
+        session.generate_story()
+        session.confirm_story()
+        session.generate_script()
+        session.confirm_script()
+        storyboard = session.build_storyboard()
+        self.assertEqual(300, storyboard.total_duration)
+        self.assertGreater(len(storyboard.shots), 12)
+        self.assertTrue(all(3 <= shot.duration <= 15 for shot in storyboard.shots))
 
     def test_render_is_blocked_until_confirmation(self) -> None:
         session = started()

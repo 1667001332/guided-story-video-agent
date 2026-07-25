@@ -21,15 +21,28 @@ class Stage(str, Enum):
 
 @dataclass(slots=True)
 class CreativeBrief:
-    target_seconds: int = 45
+    target_seconds: int | None = None
+    duration_mode: str = "auto"
+    resolved_target_seconds: int | None = None
     genre: str = "短片"
     visual_style: str = "电影感写实"
     language: str = "zh-CN"
     narration_enabled: bool = True
 
+    def __post_init__(self) -> None:
+        # v0.4.1 and older only stored target_seconds. Preserve those saved
+        # values as an explicit custom duration during migration.
+        if self.target_seconds is not None and self.duration_mode == "auto":
+            self.duration_mode = "custom"
+
     def validate(self) -> None:
-        if not 30 <= int(self.target_seconds) <= 60:
-            raise ValueError("目标视频时长必须在 30 到 60 秒之间。")
+        if self.duration_mode not in {"auto", "custom"}:
+            raise ValueError("时长模式必须是 auto 或 custom。")
+        if self.duration_mode == "custom" and self.target_seconds is None:
+            raise ValueError("自定义时长模式必须填写目标秒数。")
+        for value in (self.target_seconds, self.resolved_target_seconds):
+            if value is not None and not 15 <= int(value) <= 300:
+                raise ValueError("目标视频时长必须在 15 到 300 秒之间。")
 
 
 @dataclass(slots=True)

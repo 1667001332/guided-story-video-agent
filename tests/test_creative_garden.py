@@ -55,10 +55,13 @@ class CreativeGardenIntegrationTests(unittest.TestCase):
             "也接受自己再也无法证明这场相遇。天亮后，空信封里只剩一枚停止走动的怀表。"
         )
 
+        calls: list[str] = []
+
         class Completions:
             def create(self, **request):
                 system = request["messages"][0]["content"]
-                if "故事创作者" in system:
+                calls.append(system)
+                if "故事创作者" in system or "故事因果连续性编辑" in system:
                     payload = {
                         "story": {
                             "title": "写给明天的信",
@@ -117,6 +120,10 @@ class CreativeGardenIntegrationTests(unittest.TestCase):
         script = session.generate_script()
         self.assertEqual(2, len(script.scenes))
         self.assertEqual(30, script.total_duration)
+        self.assertGreaterEqual(len(calls), 4)
+        self.assertTrue(any("故事因果连续性编辑" in item for item in calls))
+        self.assertTrue(any("影视剧本连续性编辑" in item for item in calls))
+        self.assertFalse(session.agent.last_used_fallback)
 
     def test_selfplay_uses_one_text_input_and_no_video(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

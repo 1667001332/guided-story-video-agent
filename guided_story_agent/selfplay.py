@@ -32,7 +32,7 @@ def _idea_metrics(session: GuidedStorySession) -> tuple[float, float]:
 def run_selfplay(
     *,
     agent: StoryAgent,
-    target_seconds: int = 45,
+    target_seconds: int | None = None,
     max_turns: int = 12,
     output_dir: str | Path,
     render: bool = False,
@@ -45,7 +45,13 @@ def run_selfplay(
     if require_live_text and getattr(agent, "client", None) is None:
         raise RuntimeError("--require-live-text 已启用，但没有可用的真实文本 API 配置。")
 
-    session = GuidedStorySession(CreativeBrief(target_seconds=target_seconds), agent=agent)
+    session = GuidedStorySession(
+        CreativeBrief(
+            target_seconds=target_seconds,
+            duration_mode="custom" if target_seconds is not None else "auto",
+        ),
+        agent=agent,
+    )
     direction = agent.simulate_creator_direction()
     ideas = session.start_ideation(direction)
     session.auto_choose()
@@ -83,9 +89,12 @@ def run_selfplay(
         "clicks_to_story": 2,
         "clicks_story_to_script": 1,
         "script_scene_count": len(script.scenes),
-        "target_seconds": target_seconds,
+        "duration_mode": session.brief.duration_mode,
+        "target_seconds": script.target_seconds,
         "storyboard_seconds": storyboard.total_duration,
-        "duration_within_tolerance": abs(storyboard.total_duration - target_seconds) <= 1,
+        "duration_within_tolerance": (
+            abs(storyboard.total_duration - script.target_seconds) <= 1
+        ),
         "visual_anchor_coverage": round(anchors / max(1, len(storyboard.shots)), 3),
         "shot_diversity": round(len(cameras) / max(1, len(storyboard.shots)), 3),
         "video_requested": bool(render),
@@ -140,7 +149,12 @@ def run_selfplay(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="一句方向到分镜的创意花园自演测试")
-    parser.add_argument("--target-seconds", type=int, default=45, choices=range(30, 61))
+    parser.add_argument(
+        "--target-seconds",
+        type=int,
+        default=None,
+        help="自定义成片秒数（15–300）；省略时根据完整故事自动估算",
+    )
     parser.add_argument(
         "--max-turns",
         type=int,

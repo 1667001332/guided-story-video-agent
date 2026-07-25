@@ -39,7 +39,7 @@ from .models import (
     to_plain_data,
 )
 from .storyboard import build_storyboard
-from .timing import allocate_durations
+from .timing import allocate_durations, estimate_story_duration
 
 
 class GuidedStorySession:
@@ -118,6 +118,18 @@ class GuidedStorySession:
     @property
     def can_build_script(self) -> bool:
         return bool(self.story and self.story.confirmed)
+
+    @property
+    def effective_target_seconds(self) -> int:
+        if self.script is not None:
+            return int(self.script.target_seconds)
+        if self.storyboard is not None:
+            return int(self.storyboard.target_seconds)
+        if self.brief.resolved_target_seconds is not None:
+            return int(self.brief.resolved_target_seconds)
+        if self.brief.target_seconds is not None:
+            return int(self.brief.target_seconds)
+        raise RuntimeError("自动时长将在完整故事确认后计算。")
 
     @property
     def current_question(self) -> str:
@@ -283,6 +295,8 @@ class GuidedStorySession:
         story.confirmed = False
         self.story = story
         self.story_history.append(deepcopy(story))
+        if self.brief.duration_mode == "auto":
+            self.brief.resolved_target_seconds = None
         self.script = None
         self.draft = None
         self.storyboard = None
@@ -306,6 +320,8 @@ class GuidedStorySession:
         revised.confirmed = False
         self.story = revised
         self.story_history.append(deepcopy(revised))
+        if self.brief.duration_mode == "auto":
+            self.brief.resolved_target_seconds = None
         self.script = None
         self.storyboard = None
         self.render_manifest = None
@@ -334,7 +350,8 @@ class GuidedStorySession:
     def generate_script(self) -> StoryScript:
         if self.story is None or not self.story.confirmed:
             raise RuntimeError("请先确认完整故事。")
-        self.script = self.agent.generate_script(self.story, self.brief.target_seconds)
+        target_seconds = self._resolve_target_seconds()
+        self.script = self.agent.generate_script(self.story, target_seconds)
         self._validate_or_repair_script(self.script)
         self.script.confirmed = False
         self.storyboard = None
@@ -483,7 +500,8 @@ class GuidedStorySession:
             review.scores["story_completeness"] = 1.0 if not review.hard_errors else 0.5
             review.scores["ai_fill_disclosure"] = 1.0
         elif kind in ("draft", "script") and self.script:
-            if abs(self.script.total_duration - self.brief.target_seconds) > 1:
+            target_seconds = self.effective_target_seconds
+            if abs(self.script.total_duration - target_seconds) > 1:
                 review.hard_errors.append("剧本总时长不符合目标")
             if not self.script.scenes:
                 review.hard_errors.append("剧本没有可转换的场景")
@@ -494,10 +512,11 @@ class GuidedStorySession:
                 review.hard_errors.append("存在无法拍摄的空动作场景")
             review.scores["filmability"] = 1.0 if not review.hard_errors else 0.5
         elif kind == "storyboard" and self.storyboard:
-            if abs(self.storyboard.total_duration - self.brief.target_seconds) > 1:
+            target_seconds = self.effective_target_seconds
+            if abs(self.storyboard.total_duration - target_seconds) > 1:
                 review.hard_errors.append("分镜总时长不符合目标")
-            minimum = max(1, (self.brief.target_seconds + 14) // 15)
-            maximum = max(1, self.brief.target_seconds // 3)
+            minimum = max(1, (target_seconds + 14) // 15)
+            maximum = max(1, target_seconds // 3)
             if not minimum <= len(self.storyboard.shots) <= maximum:
                 review.hard_errors.append(
                     f"当前时长下分镜数量必须在{minimum}到{maximum}之间"
@@ -756,13 +775,14 @@ class GuidedStorySession:
     def _validate_or_repair_script(self, script: StoryScript) -> None:
         if not script.scenes:
             raise ValueError("剧本至少需要一个可拍摄场景。")
+        target_seconds = self.effective_target_seconds
         total = script.total_duration
-        if abs(total - self.brief.target_seconds) > 1:
+        if abs(total - target_seconds) > 1:
             durations = allocate_durations(
-                self.brief.target_seconds,
+                target_seconds,
                 len(script.scenes),
                 minimum=1,
-                maximum=self.brief.target_seconds,
+                maximum=target_seconds,
             )
             for scene, duration in zip(script.scenes, durations):
                 scene.duration = duration
@@ -770,6 +790,23 @@ class GuidedStorySession:
             if not (scene.visible_action or scene.action).strip():
                 scene.action = scene.narration or "主角完成一个清晰可见的动作"
                 scene.visible_action = scene.action
+
+    def _resolve_target_seconds(self) -> int:
+        if self.story is None:
+            raise RuntimeError("请先生成完整故事。")
+        if self.brief.duration_mode == "custom":
+            if self.brief.target_seconds is None:
+                raise RuntimeError("自定义时长尚未填写。")
+            target = int(self.brief.target_seconds)
+        else:
+            target = estimate_story_duration(
+                self.story.story_text,
+                character_count=len(self.story.characters),
+                location_count=len(self.story.locations),
+            )
+        self.brief.resolved_target_seconds = target
+        self.brief.validate()
+        return target
 
     def _preserve_user_choices(
         self,

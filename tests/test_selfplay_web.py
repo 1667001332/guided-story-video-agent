@@ -94,7 +94,7 @@ class CreativeGardenWebTests(unittest.TestCase):
 
         async def process() -> None:
             started = await app.process_api(
-                indexes["start_ideation"], ["校园悬疑", 30], state=state
+                indexes["start_ideation"], ["校园悬疑", "auto", 90], state=state
             )
             grid = started["data"][1]
             self.assertEqual(8, len(grid["choices"]))
@@ -115,6 +115,11 @@ class CreativeGardenWebTests(unittest.TestCase):
             scripted = await app.process_api(indexes["generate_script"], [None], state=state)
             self.assertIn("场景 1", scripted["data"][1])
             self.assertEqual(Stage.SCRIPT_REVIEW, active.stage)
+            self.assertEqual("auto", active.brief.duration_mode)
+            self.assertEqual(
+                active.script.target_seconds,
+                active.brief.resolved_target_seconds,
+            )
             await app.process_api(indexes["back_to_ideas"], [None], state=state)
             self.assertIsNotNone(active.story)
             self.assertIsNotNone(active.script)
@@ -134,7 +139,11 @@ class CreativeGardenWebTests(unittest.TestCase):
         }
 
         async def process() -> None:
-            await app.process_api(indexes["start_ideation"], ["雨夜车站", 30], state=state)
+            await app.process_api(
+                indexes["start_ideation"],
+                ["雨夜车站", "custom", 30],
+                state=state,
+            )
             await app.process_api(indexes["auto_choose"], [None], state=state)
             await app.process_api(indexes["generate_story"], [None], state=state)
             await app.process_api(indexes["generate_script"], [None], state=state)

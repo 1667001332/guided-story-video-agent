@@ -419,7 +419,7 @@ class RuleBasedStoryAgent:
         return revised
 
     def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
-        scene_count = max(3, min(8, round(int(target_seconds) / 9)))
+        scene_count = max(3, round(int(target_seconds) / 9))
         durations = allocate_durations(target_seconds, scene_count, minimum=3, maximum=15)
         events = [
             item.strip()
@@ -718,10 +718,11 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "selected_elements": to_plain_data(selected_elements),
                 },
             )
-            return self._story_from(data, fallback)
+            story = self._story_from(data, fallback)
         except Exception as exc:
             self._mark_fallback("generate_story", exc)
             return fallback
+        return self._review_story_continuity(story, operation="generate_story_review")
 
     def revise_story(self, story: StoryDraft, feedback: str) -> StoryDraft:
         self.last_used_fallback = False
@@ -736,10 +737,15 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             revised = self._story_from(data, fallback)
             revised.version = story.version + 1
-            return revised
         except Exception as exc:
             self._mark_fallback("revise_story", exc)
             return fallback
+        reviewed = self._review_story_continuity(
+            revised,
+            operation="revise_story_review",
+        )
+        reviewed.version = story.version + 1
+        return reviewed
 
     def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
         self.last_used_fallback = False
@@ -752,10 +758,15 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 "script_writer.md",
                 {"confirmed_story": to_plain_data(story), "target_seconds": target_seconds},
             )
-            return self._script_from_model(data, fallback, target_seconds)
+            script = self._script_from_model(data, fallback, target_seconds)
         except Exception as exc:
             self._mark_fallback("generate_script", exc)
             return fallback
+        return self._review_script_continuity(
+            story,
+            script,
+            operation="generate_script_review",
+        )
 
     def revise_script(
         self, story: StoryDraft, script: StoryScript, feedback: str
@@ -774,10 +785,15 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "feedback": feedback,
                 },
             )
-            return self._script_from_model(data, fallback, script.target_seconds)
+            revised = self._script_from_model(data, fallback, script.target_seconds)
         except Exception as exc:
             self._mark_fallback("revise_script", exc)
             return fallback
+        return self._review_script_continuity(
+            story,
+            revised,
+            operation="revise_script_review",
+        )
 
     def generate_draft(
         self,
@@ -989,7 +1005,53 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             scenes=scenes,
         )
 
+    def _review_story_continuity(
+        self,
+        story: StoryDraft,
+        *,
+        operation: str,
+    ) -> StoryDraft:
+        try:
+            data = self._json_completion(
+                "story_continuity_reviewer.md",
+                {"story": to_plain_data(story)},
+            )
+            reviewed = self._story_from(data, story)
+            reviewed.field_sources = deepcopy(story.field_sources)
+            reviewed.ai_filled_fields = list(story.ai_filled_fields)
+            return reviewed
+        except Exception as exc:
+            self._mark_fallback(operation, exc)
+            return story
+
+    def _review_script_continuity(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        *,
+        operation: str,
+    ) -> StoryScript:
+        try:
+            data = self._json_completion(
+                "script_continuity_reviewer.md",
+                {
+                    "confirmed_story": to_plain_data(story),
+                    "script": to_plain_data(script),
+                    "target_seconds": script.target_seconds,
+                },
+            )
+            return self._script_from_model(data, script, script.target_seconds)
+        except Exception as exc:
+            self._mark_fallback(operation, exc)
+            return script
+
     def _json_completion(self, prompt_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if prompt_name.startswith("story_"):
+            max_tokens = 8000
+        elif prompt_name.startswith("script_"):
+            max_tokens = 6000
+        else:
+            max_tokens = 4000
         request = {
             "model": self.model,
             "messages": [
@@ -999,11 +1061,13 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             "temperature": (
                 0.7
                 if prompt_name in {"story_writer.md", "story_rewriter.md"}
+                else 0.2
+                if "continuity_reviewer" in prompt_name
                 else 0.65
                 if "idea_" in prompt_name
                 else 0.35
             ),
-            "max_tokens": 4000,
+            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         }
         try:
