@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from guided_story_agent.models import StoryboardPlan, StoryboardShot, VideoArtifact
 from guided_story_agent.narration import NarrationArtifact, build_srt
@@ -42,6 +44,66 @@ class NarrationRenderingTests(unittest.TestCase):
         called = []
         provider = AgnesVideoProvider(api_key="", submit_fn=lambda payload: called.append(payload) or {})
         with self.assertRaises(VideoProviderNotConfigured):
+            provider.generate_shot(make_plan().shots[0], "outputs")
+        self.assertEqual([], called)
+
+    def test_video_from_env_prefers_generic_config(self) -> None:
+        environment = {
+            "VIDEO_PROVIDER": "agnes",
+            "VIDEO_API_KEY": "generic-video-key",
+            "VIDEO_API_ROOT": "https://video.example.test",
+            "VIDEO_MODEL": "mentor-video-model",
+            "VIDEO_TIMEOUT": "90",
+            "VIDEO_POLL_INTERVAL": "2",
+            "VIDEO_MAX_POLL_SECONDS": "600",
+            "AGNES_API_KEY": "legacy-video-key",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            provider = AgnesVideoProvider.from_env()
+
+        self.assertEqual("generic-video-key", provider.api_key)
+        self.assertEqual("https://video.example.test", provider.api_root)
+        self.assertEqual("mentor-video-model", provider.model)
+        self.assertEqual(90.0, provider.timeout)
+        self.assertEqual(2.0, provider.poll_interval)
+        self.assertEqual(600.0, provider.max_poll_seconds)
+        self.assertEqual("VIDEO_*", provider.config_source)
+
+    def test_video_from_env_keeps_agnes_legacy_compatibility(self) -> None:
+        environment = {
+            "AGNES_API_KEY": "legacy-video-key",
+            "AGNES_API_ROOT": "https://legacy.example.test",
+            "AGNES_VIDEO_MODEL": "legacy-video-model",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            provider = AgnesVideoProvider.from_env()
+
+        self.assertEqual("legacy-video-key", provider.api_key)
+        self.assertEqual("https://legacy.example.test", provider.api_root)
+        self.assertEqual("legacy-video-model", provider.model)
+        self.assertEqual("AGNES_* (legacy)", provider.config_source)
+
+    def test_unsupported_video_provider_fails_before_submit(self) -> None:
+        called = []
+        environment = {
+            "VIDEO_PROVIDER": "vidu",
+            "VIDEO_API_KEY": "video-key",
+            "VIDEO_MODEL": "video-model",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            provider = AgnesVideoProvider.from_env()
+        provider._submit_fn = lambda payload: called.append(payload) or {}
+
+        with self.assertRaisesRegex(VideoProviderNotConfigured, "VIDEO_PROVIDER=vidu"):
             provider.generate_shot(make_plan().shots[0], "outputs")
         self.assertEqual([], called)
 

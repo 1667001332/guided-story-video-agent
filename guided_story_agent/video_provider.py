@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import time
 import urllib.error
@@ -12,9 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
 from .models import StoryboardShot, VideoArtifact
+from .provider_config import VideoProviderConfig
 
 
 ProgressCallback = Callable[[str, float, str], None]
@@ -47,6 +45,8 @@ class AgnesVideoProvider:
         download_fn: Callable[[str, Path], None] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         monotonic_fn: Callable[[], float] = time.monotonic,
+        config_source: str = "constructor",
+        configuration_error: str = "",
     ) -> None:
         self.api_key = (api_key or "").strip()
         self.api_root = api_root.rstrip("/") or DEFAULT_API_ROOT
@@ -55,6 +55,8 @@ class AgnesVideoProvider:
         self.timeout = max(1.0, float(timeout))
         self.poll_interval = max(0.0, float(poll_interval))
         self.max_poll_seconds = max(1.0, float(max_poll_seconds))
+        self.config_source = config_source
+        self.configuration_error = configuration_error
         self._submit_fn = submit_fn
         self._status_fn = status_fn
         self._download_fn = download_fn or self._download_file
@@ -63,14 +65,19 @@ class AgnesVideoProvider:
 
     @classmethod
     def from_env(cls) -> AgnesVideoProvider:
-        load_dotenv()
+        config = VideoProviderConfig.from_env(
+            default_api_root=DEFAULT_API_ROOT,
+            default_model=DEFAULT_MODEL,
+        )
         return cls(
-            api_key=os.getenv("AGNES_API_KEY", ""),
-            api_root=os.getenv("AGNES_API_ROOT", DEFAULT_API_ROOT),
-            model=os.getenv("AGNES_VIDEO_MODEL", DEFAULT_MODEL),
-            timeout=float(os.getenv("AGNES_TIMEOUT", "120")),
-            poll_interval=float(os.getenv("AGNES_POLL_INTERVAL", "5")),
-            max_poll_seconds=float(os.getenv("AGNES_MAX_POLL_SECONDS", "900")),
+            api_key=config.api_key,
+            api_root=config.api_root,
+            model=config.model,
+            timeout=config.timeout,
+            poll_interval=config.poll_interval,
+            max_poll_seconds=config.max_poll_seconds,
+            config_source=config.source,
+            configuration_error=config.error,
         )
 
     def generate_shot(
@@ -81,9 +88,11 @@ class AgnesVideoProvider:
         attempt: int = 1,
         progress_callback: ProgressCallback | None = None,
     ) -> VideoArtifact:
+        if self.configuration_error:
+            raise VideoProviderNotConfigured(self.configuration_error)
         if not self.api_key:
             raise VideoProviderNotConfigured(
-                "未配置 AGNES_API_KEY，尚未发起视频任务。"
+                "未配置 VIDEO_API_KEY（旧版可使用 AGNES_API_KEY），尚未发起视频任务。"
             )
         if shot.duration not in range(3, 16):
             raise ValueError("单镜头时长必须是 3 到 15 秒之间的整数。")
