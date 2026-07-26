@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol
-
-from dotenv import load_dotenv
 
 from .models import (
     CreatorContribution,
@@ -27,6 +24,7 @@ from .models import (
     StoryScript,
     to_plain_data,
 )
+from .provider_config import TextProviderConfig
 from .timing import allocate_durations
 
 
@@ -565,45 +563,68 @@ class RuleBasedStoryAgent:
 class OpenAIStoryAgent(RuleBasedStoryAgent):
     """OpenAI-compatible creative agent with explicit fallback telemetry."""
 
-    def __init__(self, client: Any | None, model: str, prompt_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        client: Any | None,
+        model: str,
+        prompt_dir: Path | None = None,
+        *,
+        provider_name: str = "openai_compatible",
+        config_source: str = "constructor",
+        json_mode: str = "auto",
+        configuration_error: str = "",
+    ) -> None:
         self.client = client
         self.model = model
         self.prompt_dir = prompt_dir or Path(__file__).resolve().parents[1] / "prompts"
+        self.provider_name = provider_name
+        self.config_source = config_source
+        self.json_mode = json_mode
+        self.configuration_error = configuration_error
         self.last_used_fallback = False
         self.fallback_count = 0
         self.last_fallback_reason = ""
 
     @classmethod
     def from_env(cls) -> OpenAIStoryAgent:
-        load_dotenv()
-        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-        legacy_api_key = os.getenv("AGNES_API_KEY", "").strip()
-        use_deepseek = bool(deepseek_api_key)
-        api_key = deepseek_api_key or legacy_api_key
-        if use_deepseek:
-            model = os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-v4-pro").strip()
-            base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-            timeout = os.getenv("DEEPSEEK_TIMEOUT", "120")
-        else:
-            model = os.getenv("AGNES_TEXT_MODEL", "agnes-2.0-flash").strip()
-            base_url = os.getenv(
-                "AGNES_LLM_BASE_URL", "https://apihub.agnes-ai.com/v1"
+        config = TextProviderConfig.from_env()
+        model = config.model or "unconfigured"
+        if not config.configured:
+            return cls(
+                None,
+                model,
+                provider_name=config.provider,
+                config_source=config.source,
+                json_mode=config.json_mode,
+                configuration_error=config.error,
             )
-            timeout = os.getenv("AGNES_TIMEOUT", "120")
-        if not api_key:
-            return cls(None, os.getenv("DEEPSEEK_TEXT_MODEL", "deepseek-v4-pro").strip())
         try:
             from openai import OpenAI
 
-            client = OpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                timeout=float(timeout),
-                max_retries=0,
+            client_args: dict[str, Any] = {
+                "api_key": config.api_key,
+                "timeout": config.timeout,
+                "max_retries": 0,
+            }
+            if config.base_url:
+                client_args["base_url"] = config.base_url
+            client = OpenAI(**client_args)
+            return cls(
+                client,
+                model,
+                provider_name=config.provider,
+                config_source=config.source,
+                json_mode=config.json_mode,
             )
-            return cls(client, model)
         except Exception as exc:
-            agent = cls(None, model)
+            agent = cls(
+                None,
+                model,
+                provider_name=config.provider,
+                config_source=config.source,
+                json_mode=config.json_mode,
+                configuration_error=f"文本客户端初始化失败：{exc}",
+            )
             agent._mark_fallback("client_init", exc)
             return agent
 
@@ -627,7 +648,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             anchors=anchors,
         )
         if self.client is None:
-            self._mark_fallback("generate_ideas", "text API is not configured")
+            self._mark_fallback("generate_ideas", self._unavailable_reason)
             return fallback
         prompt = {
             "diverge": "idea_divergence.md",
@@ -671,7 +692,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_used_fallback = False
         fallback = super().expand_elements(direction, selected_cards)
         if self.client is None:
-            self._mark_fallback("expand_elements", "text API is not configured")
+            self._mark_fallback("expand_elements", self._unavailable_reason)
             return fallback
         try:
             data = self._json_completion(
@@ -707,7 +728,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_used_fallback = False
         fallback = super().generate_story(direction, selected_cards, selected_elements)
         if self.client is None:
-            self._mark_fallback("generate_story", "text API is not configured")
+            self._mark_fallback("generate_story", self._unavailable_reason)
             return fallback
         try:
             data = self._json_completion(
@@ -728,7 +749,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_used_fallback = False
         fallback = super().revise_story(story, feedback)
         if self.client is None:
-            self._mark_fallback("revise_story", "text API is not configured")
+            self._mark_fallback("revise_story", self._unavailable_reason)
             return fallback
         try:
             data = self._json_completion(
@@ -751,7 +772,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_used_fallback = False
         fallback = super().generate_script(story, target_seconds)
         if self.client is None:
-            self._mark_fallback("generate_script", "text API is not configured")
+            self._mark_fallback("generate_script", self._unavailable_reason)
             return fallback
         try:
             data = self._json_completion(
@@ -774,7 +795,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_used_fallback = False
         fallback = super().revise_script(story, script, feedback)
         if self.client is None:
-            self._mark_fallback("revise_script", "text API is not configured")
+            self._mark_fallback("revise_script", self._unavailable_reason)
             return fallback
         try:
             data = self._json_completion(
@@ -821,7 +842,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
 
     def simulate_creator_direction(self) -> str:
         if self.client is None:
-            self._mark_fallback("simulate_creator_direction", "text API is not configured")
+            self._mark_fallback("simulate_creator_direction", self._unavailable_reason)
             return super().simulate_creator_direction()
         try:
             response = self.client.chat.completions.create(
@@ -1045,6 +1066,14 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             self._mark_fallback(operation, exc)
             return script
 
+    @property
+    def provider_label(self) -> str:
+        return f"{self.provider_name} · {self.model}"
+
+    @property
+    def _unavailable_reason(self) -> str:
+        return self.configuration_error or "文本 API 未配置。"
+
     def _json_completion(self, prompt_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         if prompt_name.startswith("story_"):
             max_tokens = 8000
@@ -1068,13 +1097,17 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 else 0.35
             ),
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
         }
+        if self.json_mode != "disabled":
+            request["response_format"] = {"type": "json_object"}
         try:
             response = self.client.chat.completions.create(**request)
         except Exception as exc:
             message = str(exc).lower()
-            if "response_format" not in message and "json_object" not in message:
+            can_retry_without_json_mode = self.json_mode == "auto" and (
+                "response_format" in message or "json_object" in message
+            )
+            if not can_retry_without_json_mode:
                 raise
             request.pop("response_format")
             response = self.client.chat.completions.create(**request)

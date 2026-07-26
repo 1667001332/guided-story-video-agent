@@ -1,4 +1,4 @@
-# 一句话故事视频创意花园 v0.5.0
+# 一句话故事视频创意花园 v0.5.1
 
 这是一个低压力的短片创作 Agent。你只需要给出一句模糊方向，AI 一次铺开 8 张完整创意卡；你可以挑选、换一批、找相似方向或混合 1–3 张，也可以什么都不补，先生成完整故事。
 
@@ -9,7 +9,7 @@
 → 视觉圣经 → 内容驱动的动态分镜 → 用户确认费用 → 视频生成
 ```
 
-v0.5.0 取消了固定五节点大纲、固定五场剧本、固定 5–10 镜头模板以及30–60秒总时长限制。故事先作为独立产物生成，并经过一次因果连续性审查；确认后再按自动估算或15–300秒自定义时长改编剧本，剧本生成后逐场检查状态衔接。每个镜头仍保持3–15秒的 Provider 能力约束，并保存首帧、连续动作、结束帧和参考资产 ID。
+v0.5.1 取消了固定五节点大纲、固定五场剧本、固定 5–10 镜头模板以及30–60秒总时长限制，并将文本、视频 API 配置改为平台无关的 `TEXT_*` / `VIDEO_*`。故事先作为独立产物生成，并经过一次因果连续性审查；确认后再按自动估算或15–300秒自定义时长改编剧本，剧本生成后逐场检查状态衔接。每个镜头仍保持3–15秒的 Provider 能力约束，并保存首帧、连续动作、结束帧和参考资产 ID。
 
 研究取舍见 [研究与设计依据](docs/research-basis.md)，代码迁移边界见 [来源说明](docs/provenance.md)。
 
@@ -22,9 +22,35 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-这是独立的新项目目录，旧项目 agent开发/.env 不会被 Python 自动读取。故事和剧本默认使用 DeepSeek 文本接口，视频 Provider 保持独立配置。请确认 API Key 填在当前目录的 .env 中；网页会明确显示当前结果来自真实文本模型、离线演示还是 API 失败后的离线兜底。
+这是独立的新项目目录，旧项目 agent开发/.env 不会被 Python 自动读取。请确认 API Key 填在当前目录的 `.env` 中；网页会明确显示当前结果来自哪个真实文本 Provider 和模型，或来自离线演示、API 失败后的离线兜底。
 
 不配置密钥时，创意、故事、剧本、分镜和自动测试使用确定性的本地 Agent，不发送网络请求。
+
+### API 配置
+
+文本生成当前支持 OpenAI `chat/completions` 兼容接口：
+
+```env
+TEXT_PROVIDER=openai_compatible
+TEXT_API_KEY=
+TEXT_BASE_URL=
+TEXT_MODEL=
+TEXT_TIMEOUT=120
+TEXT_JSON_MODE=auto
+```
+
+`TEXT_API_KEY` 和 `TEXT_MODEL` 必填。`TEXT_BASE_URL` 留空时使用 OpenAI SDK 默认地址；使用 DeepSeek、网关或其他兼容平台时填写该平台的兼容地址。`TEXT_JSON_MODE=auto` 会在 Provider 不支持 `response_format` 时自动重试普通 JSON 提示；也可设为 `required` 或 `disabled`。
+
+视频生成当前只实现 Agnes，但使用统一变量：
+
+```env
+VIDEO_PROVIDER=agnes
+VIDEO_API_KEY=
+VIDEO_API_ROOT=https://apihub.agnes-ai.com
+VIDEO_MODEL=agnes-video-v2.0
+```
+
+旧版 `DEEPSEEK_*`、`AGNES_*` 变量仍可读取，新版通用变量优先。Gemini、Claude 等原生非 OpenAI 协议目前会给出明确“不支持”诊断，需要单独实现 Provider 适配器。交给他人测试时不要发送自己的 `.env`，只发送 `.env.example`。完整交接步骤见 [师兄 API 测试指南](docs/mentor-testing-guide.md)。
 
 ## 网页创作
 
@@ -66,7 +92,7 @@ guided-story-cli --require-live-text
 python scripts/run_guided_story_selfplay.py --output outputs/selfplay_auto
 ```
 
-要求每次文本调用都成功走真实 DeepSeek 接口，任何本地降级都判失败：
+要求每次文本调用都成功走已配置的真实文本接口，任何本地降级都判失败：
 
 ```powershell
 python scripts/run_guided_story_selfplay.py --target-seconds 30 --output outputs/live_text --require-live-text
@@ -108,6 +134,6 @@ git diff --check
 ## 项目边界
 
 - 这是可复现的研究 MVP，不包含账号、数据库、多人协作和商业任务队列。
-- 故事与剧本使用 DeepSeek 的 OpenAI 兼容接口；视频生成使用独立 Provider。真实接口是否可用，需要用户显式运行在线测试确认。
+- 故事与剧本使用可配置的 OpenAI 兼容接口；视频生成使用独立 Provider。原生非兼容接口需要新增适配器，真实接口是否可用需要用户显式运行在线测试确认。
 - Edge TTS 旁白和字幕在视频请求前准备；当前不做角色口型同步。
 - 本项目独立于已冻结的 `interactive-movie-agent v0.1.0`。

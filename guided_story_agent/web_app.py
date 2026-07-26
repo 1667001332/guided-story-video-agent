@@ -1104,6 +1104,10 @@ def _selection_text(session: GuidedStorySession) -> str:
     return f"**已保留创意：** {card_text}  \n**已保留故事零件：** {element_text}"
 
 
+def _provider_label(agent: StoryAgent) -> str:
+    return str(getattr(agent, "provider_label", "真实文本模型"))
+
+
 def _status_text(session: GuidedStorySession) -> str:
     if bool(getattr(session.agent, "last_used_fallback", False)):
         reason = str(getattr(session.agent, "last_fallback_reason", "文本 API 不可用"))
@@ -1113,7 +1117,10 @@ def _status_text(session: GuidedStorySession) -> str:
         )
     if session.stage == Stage.IDEATING:
         if isinstance(session.agent, OpenAIStoryAgent):
-            return "✓ 已使用真实文本模型生成。选卡、聊天或直接生成完整故事都可以。"
+            return (
+                f"✓ 已使用真实文本模型生成（{_provider_label(session.agent)}）。"
+                "选卡、聊天或直接生成完整故事都可以。"
+            )
         return "离线演示模式：选卡、聊天或直接生成完整故事都可以。"
     if session.stage == Stage.STORY_REVIEW:
         return f"当前是故事第{session.story.version}版，可以改写或确认后生成剧本。"
@@ -1131,7 +1138,10 @@ def _text_status(session: GuidedStorySession, success_message: str) -> str:
             f"{success_message}原因：{reason}。请检查当前项目的 .env 后重试。"
         )
     if isinstance(session.agent, OpenAIStoryAgent):
-        return f"✓ {success_message}本次使用真实文本模型。"
+        return (
+            f"✓ {success_message}本次使用真实文本模型"
+            f"（{_provider_label(session.agent)}）。"
+        )
     return f"离线演示模式：{success_message}"
 
 

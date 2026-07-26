@@ -21,7 +21,7 @@ from guided_story_agent.selfplay import run_selfplay
 
 
 class CreativeGardenIntegrationTests(unittest.TestCase):
-    def test_from_env_prefers_deepseek_for_text_generation(self) -> None:
+    def test_from_env_prefers_generic_text_config(self) -> None:
         captured: dict[str, object] = {}
 
         class FakeOpenAI:
@@ -30,22 +30,108 @@ class CreativeGardenIntegrationTests(unittest.TestCase):
 
         fake_module = SimpleNamespace(OpenAI=FakeOpenAI)
         environment = {
-            "DEEPSEEK_API_KEY": "deepseek-test-key",
-            "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
-            "DEEPSEEK_TEXT_MODEL": "deepseek-v4-pro",
-            "DEEPSEEK_TIMEOUT": "90",
+            "TEXT_PROVIDER": "openai_compatible",
+            "TEXT_API_KEY": "generic-test-key",
+            "TEXT_BASE_URL": "https://example.test/v1",
+            "TEXT_MODEL": "mentor-model",
+            "TEXT_TIMEOUT": "90",
+            "TEXT_JSON_MODE": "disabled",
+            "DEEPSEEK_API_KEY": "legacy-key",
             "AGNES_API_KEY": "agnes-video-key",
         }
         with (
             patch.dict(os.environ, environment, clear=True),
             patch.dict(sys.modules, {"openai": fake_module}),
+            patch("guided_story_agent.provider_config.load_dotenv"),
         ):
             agent = OpenAIStoryAgent.from_env()
 
-        self.assertEqual("deepseek-v4-pro", agent.model)
+        self.assertEqual("mentor-model", agent.model)
+        self.assertEqual("generic-test-key", captured["api_key"])
+        self.assertEqual("https://example.test/v1", captured["base_url"])
+        self.assertEqual(90.0, captured["timeout"])
+        self.assertEqual("disabled", agent.json_mode)
+        self.assertEqual("TEXT_*", agent.config_source)
+
+    def test_from_env_keeps_deepseek_legacy_compatibility(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        environment = {
+            "DEEPSEEK_API_KEY": "deepseek-test-key",
+            "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+            "DEEPSEEK_TEXT_MODEL": "deepseek-chat",
+            "DEEPSEEK_TIMEOUT": "75",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.dict(
+                sys.modules,
+                {"openai": SimpleNamespace(OpenAI=FakeOpenAI)},
+            ),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            agent = OpenAIStoryAgent.from_env()
+
+        self.assertEqual("deepseek-chat", agent.model)
         self.assertEqual("deepseek-test-key", captured["api_key"])
         self.assertEqual("https://api.deepseek.com", captured["base_url"])
-        self.assertEqual(90.0, captured["timeout"])
+        self.assertEqual(75.0, captured["timeout"])
+        self.assertEqual("DEEPSEEK_* (legacy)", agent.config_source)
+
+    def test_from_env_explains_unsupported_text_provider(self) -> None:
+        environment = {
+            "TEXT_PROVIDER": "gemini_native",
+            "TEXT_API_KEY": "test-key",
+            "TEXT_MODEL": "gemini-model",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            agent = OpenAIStoryAgent.from_env()
+
+        self.assertIsNone(agent.client)
+        self.assertIn("暂不支持", agent.configuration_error)
+        self.assertIn("gemini_native", agent.configuration_error)
+
+    def test_json_mode_disabled_omits_response_format(self) -> None:
+        requests: list[dict[str, object]] = []
+
+        class Completions:
+            def create(self, **request):
+                requests.append(request)
+                message = SimpleNamespace(content="{}")
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        agent = OpenAIStoryAgent(client, "fake-model", json_mode="disabled")
+        agent._json_completion("idea_divergence.md", {})
+
+        self.assertEqual(1, len(requests))
+        self.assertNotIn("response_format", requests[0])
+
+    def test_json_mode_auto_retries_provider_without_response_format(self) -> None:
+        requests: list[dict[str, object]] = []
+
+        class Completions:
+            def create(self, **request):
+                requests.append(request)
+                if "response_format" in request:
+                    raise RuntimeError("response_format is unsupported")
+                message = SimpleNamespace(content="{}")
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        agent = OpenAIStoryAgent(client, "fake-model", json_mode="auto")
+        agent._json_completion("idea_divergence.md", {})
+
+        self.assertEqual(2, len(requests))
+        self.assertIn("response_format", requests[0])
+        self.assertNotIn("response_format", requests[1])
 
     def test_model_script_accepts_story_driven_scene_count(self) -> None:
         story_text = (
