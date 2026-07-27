@@ -25,6 +25,10 @@ HELP = """可用命令：
 """
 
 
+class LiveTextRequiredError(RuntimeError):
+    """Raised when strict CLI mode observes any local text fallback."""
+
+
 def run_interactive(
     *,
     agent: StoryAgent | None = None,
@@ -39,7 +43,7 @@ def run_interactive(
     active_agent = agent or RuleBasedStoryAgent()
     fallback_before = int(getattr(active_agent, "fallback_count", 0))
     if require_live_text and getattr(active_agent, "client", None) is None:
-        raise RuntimeError("--require-live-text 已启用，但没有可用的真实文本API配置。")
+        raise LiveTextRequiredError("--require-live-text 已启用，但没有可用的真实文本 API 配置。")
     session = GuidedStorySession(
         CreativeBrief(
             target_seconds=target_seconds,
@@ -51,6 +55,7 @@ def run_interactive(
     output_fn("一句话剧本创意花园：你只需要先说一个方向。")
     direction = input_fn("方向：").strip()
     session.start_ideation(direction)
+    _enforce_live_text(active_agent, fallback_before, require_live_text)
     _print_cards(session, output_fn)
     output_fn(HELP)
 
@@ -66,12 +71,17 @@ def run_interactive(
             elif raw.startswith("/pick") or raw.startswith("/use"):
                 command = "/pick" if raw.startswith("/pick") else "/use"
                 indexes = [int(item) for item in raw.removeprefix(command).split()]
+                if not indexes:
+                    raise ValueError("请至少提供一个创意卡序号。")
                 cards = session.current_batch.cards
-                session.select_ideas([cards[index - 1].idea_id for index in indexes])
+                session.select_ideas(
+                    [_one_based_item(cards, index, "创意卡").idea_id for index in indexes]
+                )
                 output_fn(_selection_text(session))
             elif raw.startswith("/more"):
                 index = int(raw.removeprefix("/more").strip())
-                session.more_like(session.current_batch.cards[index - 1].idea_id)
+                card = _one_based_item(session.current_batch.cards, index, "创意卡")
+                session.more_like(card.idea_id)
                 _print_cards(session, output_fn)
             elif raw in ("/refresh", "/suggest"):
                 session.refresh_ideas()
@@ -87,7 +97,16 @@ def run_interactive(
                         output_fn(f"  {index}. {option.title}｜{option.content}")
             elif raw.startswith("/choose"):
                 _, kind, index_text = raw.split(maxsplit=2)
-                option = session.element_palette.options[kind][int(index_text) - 1]
+                if session.element_palette is None:
+                    raise RuntimeError("请先输入 /expand 展开故事零件。")
+                options = session.element_palette.options.get(kind)
+                if options is None:
+                    raise ValueError(f"未知故事零件类型：{kind}")
+                option = _one_based_item(
+                    options,
+                    int(index_text),
+                    f"{kind} 选项",
+                )
                 session.choose_element(kind, option.option_id)
                 output_fn(f"已保留 {kind}：{option.title}")
             elif raw == "/auto":
@@ -152,12 +171,9 @@ def run_interactive(
                 output_fn(result.message)
                 _print_cards(session, output_fn)
 
-            if (
-                require_live_text
-                and int(getattr(active_agent, "fallback_count", 0)) > fallback_before
-            ):
-                reason = str(getattr(active_agent, "last_fallback_reason", "未知原因"))
-                raise RuntimeError(f"真实文本链路发生本地降级：{reason}")
+            _enforce_live_text(active_agent, fallback_before, require_live_text)
+        except LiveTextRequiredError:
+            raise
         except (RuntimeError, ValueError, IndexError) as exc:
             output_fn(f"未执行：{exc}")
 
@@ -165,6 +181,22 @@ def run_interactive(
     session.save(target / "session.json")
     output_fn(f"会话已保存：{target / 'session.json'}")
     return session
+
+
+def _one_based_item(items, index: int, label: str):
+    if isinstance(index, bool) or not 1 <= index <= len(items):
+        raise ValueError(f"{label}序号必须在 1 到 {len(items)} 之间。")
+    return items[index - 1]
+
+
+def _enforce_live_text(agent: StoryAgent, baseline: int, required: bool) -> None:
+    if not required:
+        return
+    if int(getattr(agent, "fallback_count", 0)) <= baseline:
+        return
+    reason = str(getattr(agent, "last_fallback_reason", "未知原因"))
+    kind = str(getattr(agent, "last_fallback_kind", "whole") or "whole")
+    raise LiveTextRequiredError(f"真实文本链路发生{kind}本地降级：{reason}")
 
 
 def _print_cards(session: GuidedStorySession, output_fn: Callable[[str], None]) -> None:
@@ -201,18 +233,27 @@ def main() -> None:
         help="自定义成片秒数（15–300）；省略时根据完整故事自动估算",
     )
     parser.add_argument("--output", default="")
-    parser.add_argument("--require-live-text", action="store_true")
+    text_mode = parser.add_mutually_exclusive_group()
+    text_mode.add_argument(
+        "--offline",
+        action="store_true",
+        help="强制使用本地规则代理，不读取文本模型配置，也不调用文本 API",
+    )
+    text_mode.add_argument("--require-live-text", action="store_true")
     parser.add_argument("--render", action="store_true", help="允许二次确认后的付费视频生成")
     args = parser.parse_args()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or f"outputs/manual_cli/{stamp}"
-    run_interactive(
-        agent=OpenAIStoryAgent.from_env(),
-        target_seconds=args.target_seconds,
-        output_dir=output,
-        allow_render=args.render,
-        require_live_text=args.require_live_text,
-    )
+    try:
+        run_interactive(
+            agent=RuleBasedStoryAgent() if args.offline else OpenAIStoryAgent.from_env(),
+            target_seconds=args.target_seconds,
+            output_dir=output,
+            allow_render=args.render,
+            require_live_text=args.require_live_text,
+        )
+    except LiveTextRequiredError as exc:
+        parser.exit(2, f"{exc}\n")
 
 
 if __name__ == "__main__":

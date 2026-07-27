@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 
+from .continuity import assign_continuity_modes, continuity_state_to_dict
 from .models import (
+    ContinuityState,
     StoryFacts,
     StoryScene,
     StoryScript,
@@ -12,8 +17,13 @@ from .models import (
     StoryboardShot,
     VisualAsset,
     VisualBible,
+    to_plain_data,
 )
-from .timing import allocate_durations
+from .timing import (
+    ShotTimingDemand,
+    allocate_weighted_durations,
+    estimate_shot_duration,
+)
 
 
 @dataclass(slots=True)
@@ -109,25 +119,148 @@ def build_storyboard(
         raise RuntimeError("请先确认剧本，再生成分镜。")
     if not script.scenes:
         raise ValueError("剧本没有可转换的场景。")
-    bible = visual_bible or build_visual_bible(script, facts)
-    units = _plan_shot_units(script)
-    durations = allocate_durations(script.target_seconds, len(units), minimum=3, maximum=15)
+    normalized = deepcopy(script)
+    normalized.scenes = fit_scenes_to_duration(
+        normalized.scenes,
+        normalized.target_seconds,
+        minimum=3,
+    )
+    normalized_durations = allocate_weighted_durations(
+        normalized.target_seconds,
+        [_scene_duration_weight(scene) for scene in normalized.scenes],
+        minimum=3,
+        maximum=normalized.target_seconds,
+        keys=[f"scene-{scene.scene_id}-{scene.title}" for scene in normalized.scenes],
+    )
+    for scene, duration in zip(normalized.scenes, normalized_durations):
+        scene.duration = duration
+    bible = visual_bible or build_visual_bible(normalized, facts)
+    units = _plan_shot_units(normalized)
+    scene_shot_counts = {
+        scene_id: sum(unit.scene.scene_id == scene_id for unit in units)
+        for scene_id in {unit.scene.scene_id for unit in units}
+    }
+    timing = [
+        estimate_shot_duration(
+            ShotTimingDemand(
+                shot_kind=unit.kind,
+                purpose=unit.purpose,
+                priority=unit.priority,
+                action=unit.action,
+                dialogue=unit.scene.dialogue if unit.kind == "dialogue" else "",
+                narration=unit.scene.narration,
+                emotional_change=unit.scene.emotional_change,
+                scene_duration=unit.scene.duration,
+                scene_shot_count=scene_shot_counts[unit.scene.scene_id],
+            )
+        )
+        for unit in units
+    ]
+    durations = allocate_weighted_durations(
+        normalized.target_seconds,
+        [item[1] for item in timing],
+        minimum=3,
+        maximum=15,
+        keys=[
+            f"{unit.scene.scene_id}:{unit.kind}:{unit.purpose}:{index}"
+            for index, unit in enumerate(units, start=1)
+        ],
+    )
+    states = _derive_continuity_states(units, bible)
+    base_seed = derive_storyboard_seed(normalized, facts)
     shots = [
-        _build_shot(index, unit, duration, bible, facts, len(units))
+        _build_shot(
+            index,
+            unit,
+            duration,
+            bible,
+            facts,
+            len(units),
+            start_state=states[index - 1][0],
+            end_state=states[index - 1][1],
+            estimated_duration=timing[index - 1][0],
+            duration_weight=timing[index - 1][1],
+            duration_reason=timing[index - 1][2],
+            seed=derive_shot_seed(
+                base_seed,
+                unit.scene.scene_id,
+                index,
+            ),
+        )
         for index, (unit, duration) in enumerate(zip(units, durations), start=1)
     ]
+    _assign_narration_timeline(shots, normalized.scenes)
+    assign_continuity_modes(shots)
     plan = StoryboardPlan(
-        title=script.title,
-        target_seconds=script.target_seconds,
+        title=normalized.title,
+        target_seconds=normalized.target_seconds,
         shots=shots,
-        narration_text="\n".join(
-            scene.narration for scene in script.scenes if scene.narration.strip()
-        ),
+        narration_text="\n".join(shot.narration for shot in shots if shot.narration),
         visual_bible=bible,
+        base_seed=base_seed,
     )
-    if abs(plan.total_duration - script.target_seconds) > 1:
+    if plan.total_duration != normalized.target_seconds:
         raise ValueError("分镜总时长与目标时长不一致。")
     return plan
+
+
+def fit_scenes_to_duration(
+    scenes: list[StoryScene],
+    target_seconds: int,
+    *,
+    minimum: int = 3,
+) -> list[StoryScene]:
+    """Merge consecutive scenes until every scene can receive ``minimum`` seconds.
+
+    The merge is deterministic and carries every causal/action text field into
+    the resulting scene instead of sampling scenes away later in storyboarding.
+    """
+
+    if not scenes:
+        raise ValueError("剧本至少需要一个可拍摄场景。")
+    target = int(target_seconds)
+    maximum_count = target // int(minimum)
+    if maximum_count < 1:
+        raise ValueError("目标时长不足以容纳一个可拍摄场景。")
+    if len(scenes) <= maximum_count:
+        result = deepcopy(scenes)
+        for index, scene in enumerate(result, start=1):
+            scene.scene_id = index
+        return result
+
+    group_count = maximum_count
+    result: list[StoryScene] = []
+    for group_index in range(group_count):
+        start = group_index * len(scenes) // group_count
+        end = (group_index + 1) * len(scenes) // group_count
+        group = scenes[start:end]
+        result.append(_merge_scene_group(group_index + 1, group))
+    return result
+
+
+def _merge_scene_group(scene_id: int, group: list[StoryScene]) -> StoryScene:
+    if not group:
+        raise ValueError("不能合并空场景组。")
+
+    def joined(values, separator: str = "；随后，") -> str:
+        return separator.join(str(value).strip() for value in values if str(value).strip())
+
+    return StoryScene(
+        scene_id=scene_id,
+        title=joined((scene.title for scene in group), " / "),
+        location=joined((scene.location for scene in group), " → "),
+        time_of_day=joined(_unique(scene.time_of_day for scene in group), " → "),
+        characters=_unique(character for scene in group for character in scene.characters),
+        action=joined((scene.visible_action or scene.action for scene in group)),
+        visible_action=joined((scene.visible_action or scene.action for scene in group)),
+        narration=joined((scene.narration for scene in group), "\n"),
+        duration=sum(max(0, int(scene.duration)) for scene in group),
+        dialogue=joined((scene.dialogue for scene in group), "\n"),
+        props=_unique(prop for scene in group for prop in scene.props),
+        start_state=group[0].start_state,
+        end_state=group[-1].end_state,
+        emotional_change=joined((scene.emotional_change for scene in group)),
+    )
 
 
 def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
@@ -251,6 +384,13 @@ def _build_shot(
     bible: VisualBible,
     facts: StoryFacts,
     total_shots: int,
+    *,
+    start_state: ContinuityState,
+    end_state: ContinuityState,
+    estimated_duration: float,
+    duration_weight: float,
+    duration_reason: str,
+    seed: int,
 ) -> StoryboardShot:
     scene = unit.scene
     camera, movement, composition = CAMERA_BY_KIND[unit.kind]
@@ -261,12 +401,16 @@ def _build_shot(
             "保留动作结果、人物关系和情绪余韵",
         )
     character = scene.characters[0] if scene.characters else "主角"
-    start_frame = scene.start_state or f"{character}位于{scene.location}，动作尚未完成"
-    end_frame = scene.end_state or unit.action
+    start_frame = _state_frame_summary(
+        start_state,
+        scene.start_state or f"{character}位于{scene.location}，动作尚未完成",
+    )
+    end_frame = _state_frame_summary(
+        end_state,
+        scene.end_state or unit.action,
+    )
     reference_ids = _reference_ids(bible, scene)
-    anchors = [
-        asset.description for asset in bible.assets if asset.asset_id in reference_ids
-    ]
+    anchors = [asset.description for asset in bible.assets if asset.asset_id in reference_ids]
     first_frame_prompt = (
         f"电影分镜首帧。地点与时段：{scene.location}，{scene.time_of_day}。"
         f"人物：{_join(scene.characters) or character}。起始状态：{start_frame}。"
@@ -304,7 +448,7 @@ def _build_shot(
         camera=camera,
         lighting=bible.lighting_rules,
         mood=facts.tone or scene.emotional_change or "克制、连贯、电影感",
-        narration=scene.narration,
+        narration="",
         video_prompt=prompt,
         negative_prompt=(
             "inconsistent identity, changed face, changed costume, duplicated character, "
@@ -318,11 +462,318 @@ def _build_shot(
         end_frame=end_frame,
         visual_anchors=anchors,
         shot_kind=unit.kind,
+        duration_reason=duration_reason,
+        duration_weight=duration_weight,
+        estimated_duration=estimated_duration,
         first_frame_prompt=first_frame_prompt,
         motion_prompt=motion_prompt,
         end_frame_prompt=end_frame_prompt,
         reference_asset_ids=reference_ids,
+        continuity_state={
+            "start": continuity_state_to_dict(start_state),
+            "end": continuity_state_to_dict(end_state),
+        },
+        continuity_start_state=start_state,
+        continuity_end_state=end_state,
+        seed=seed,
     )
+
+
+def _assign_narration_timeline(
+    shots: list[StoryboardShot],
+    scenes: list[StoryScene],
+) -> None:
+    """Distribute each scene narration once across its shot timeline."""
+    for shot in shots:
+        shot.narration = ""
+    for scene in scenes:
+        scene_shots = [shot for shot in shots if shot.scene_id == scene.scene_id]
+        chunks = _split_narration(scene.narration)
+        if not scene_shots or not chunks:
+            continue
+        if len(chunks) <= len(scene_shots):
+            for index, chunk in enumerate(chunks):
+                shot_index = min(
+                    len(scene_shots) - 1,
+                    index * len(scene_shots) // len(chunks),
+                )
+                scene_shots[shot_index].narration = chunk
+            continue
+        for shot_index, shot in enumerate(scene_shots):
+            start = shot_index * len(chunks) // len(scene_shots)
+            end = (shot_index + 1) * len(chunks) // len(scene_shots)
+            shot.narration = " ".join(chunks[start:end])
+
+
+def _split_narration(text: str) -> list[str]:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return []
+    chunks = [
+        item.strip()
+        for item in re.findall(r".+?(?:[。！？!?；;]|$)", cleaned)
+        if item.strip()
+    ]
+    return chunks or [cleaned]
+
+
+def derive_storyboard_seed(script: StoryScript, facts: StoryFacts) -> int:
+    """Derive a stable base seed from confirmed story-to-script inputs."""
+    payload = {
+        "script": to_plain_data(script),
+        "facts": to_plain_data(facts),
+    }
+    return _stable_seed(payload)
+
+
+def derive_shot_seed(base_seed: int, scene_id: int, shot_id: int) -> int:
+    """Derive a stable positive 31-bit seed for one confirmed shot."""
+    return _stable_seed(
+        {
+            "base_seed": int(base_seed),
+            "scene_id": int(scene_id),
+            "shot_id": int(shot_id),
+        }
+    )
+
+
+def derive_retake_seed(
+    previous_seed: int | None,
+    shot_id: int,
+    revision_payload: object,
+) -> int:
+    """Retakes deliberately move to a new deterministic seed."""
+    return _stable_seed(
+        {
+            "previous_seed": previous_seed,
+            "shot_id": int(shot_id),
+            "revision": revision_payload,
+        }
+    )
+
+
+def _derive_continuity_states(
+    units: list[_ShotUnit],
+    bible: VisualBible,
+) -> list[tuple[ContinuityState, ContinuityState]]:
+    """Advance formal state shot by shot while preserving cross-scene identity."""
+    result: list[tuple[ContinuityState, ContinuityState]] = []
+    current: ContinuityState | None = None
+    previous_scene_id: int | None = None
+    for unit in units:
+        if current is None or unit.scene.scene_id != previous_scene_id:
+            start = _new_scene_state(current, unit.scene, bible)
+        else:
+            start = deepcopy(current)
+        end = _apply_shot_transition(start, unit)
+        result.append((start, end))
+        current = deepcopy(end)
+        previous_scene_id = unit.scene.scene_id
+    return result
+
+
+def _new_scene_state(
+    previous: ContinuityState | None,
+    scene: StoryScene,
+    bible: VisualBible,
+) -> ContinuityState:
+    if previous is None:
+        state = ContinuityState()
+    else:
+        state = ContinuityState(
+            character_appearance=deepcopy(previous.character_appearance),
+            character_clothing=deepcopy(previous.character_clothing),
+            character_knowledge=deepcopy(previous.character_knowledge),
+            character_injuries=deepcopy(previous.character_injuries),
+            character_held_props=deepcopy(previous.character_held_props),
+            prop_positions=deepcopy(previous.prop_positions),
+        )
+    descriptions = {
+        asset.name: asset.description
+        for asset in bible.assets
+        if asset.kind == "character"
+    }
+    start_description = (
+        scene.start_state.strip()
+        or f"{_join(scene.characters) or '人物'}位于{scene.location}"
+    )
+    for name in scene.characters:
+        anchor = descriptions.get(name, f"{name}外观沿用已确认人物设定")
+        state.character_appearance.setdefault(name, anchor)
+        state.character_clothing.setdefault(name, anchor)
+        state.character_positions[name] = start_description
+        state.character_emotions.pop(name, None)
+    state.location = scene.location
+    state.time_of_day = scene.time_of_day or "未说明时段"
+    state.weather = _weather_from_scene(scene)
+    state.key_light_direction = _light_from_scene(scene, bible)
+    for prop in scene.props:
+        state.prop_positions.setdefault(prop, start_description)
+        if any(marker in start_description for marker in ("手中", "拿着", "握着", "口袋")):
+            holder = scene.characters[0] if scene.characters else "主角"
+            held = state.character_held_props.setdefault(holder, [])
+            if prop not in held:
+                held.append(prop)
+    _update_injuries(state, scene.characters, start_description)
+    return state
+
+
+def _apply_shot_transition(
+    start: ContinuityState,
+    unit: _ShotUnit,
+) -> ContinuityState:
+    end = deepcopy(start)
+    scene = unit.scene
+    action = unit.action.strip()
+    position = (
+        scene.end_state.strip()
+        if unit.kind == "transition" and scene.end_state.strip()
+        else action
+    )
+    for name in scene.characters:
+        end.character_positions[name] = position
+    if unit.kind == "reaction" and scene.emotional_change.strip():
+        for name in scene.characters:
+            end.character_emotions[name] = scene.emotional_change.strip()
+    if unit.kind == "dialogue" or any(
+        marker in f"{unit.purpose}{action}"
+        for marker in ("揭示", "证据", "发现", "确认", "真相", "得知")
+    ):
+        learned = scene.dialogue.strip() or action
+        for name in scene.characters:
+            knowledge = end.character_knowledge.setdefault(name, [])
+            if learned and learned not in knowledge:
+                knowledge.append(learned)
+    _update_prop_state(end, scene, action)
+    _update_injuries(end, scene.characters, action)
+    return end
+
+
+def _update_prop_state(
+    state: ContinuityState,
+    scene: StoryScene,
+    action: str,
+) -> None:
+    if not scene.props:
+        return
+    actor = scene.characters[0] if scene.characters else "主角"
+    receiver = scene.characters[1] if len(scene.characters) > 1 else ""
+    for prop in scene.props:
+        if prop not in action:
+            continue
+        if any(marker in action for marker in ("拿", "握", "捡", "拾", "接过", "取出", "掏出")):
+            held = state.character_held_props.setdefault(actor, [])
+            if prop not in held:
+                held.append(prop)
+            state.prop_positions[prop] = f"{actor}手中：{action}"
+        if any(marker in action for marker in ("放", "推", "扔", "丢", "藏")):
+            for props in state.character_held_props.values():
+                if prop in props:
+                    props.remove(prop)
+            state.prop_positions[prop] = action
+        if any(marker in action for marker in ("递给", "交给")):
+            for name, props in state.character_held_props.items():
+                if name != receiver and prop in props:
+                    props.remove(prop)
+            if receiver:
+                held = state.character_held_props.setdefault(receiver, [])
+                if prop not in held:
+                    held.append(prop)
+                state.prop_positions[prop] = f"{receiver}手中：{action}"
+            else:
+                state.prop_positions[prop] = action
+
+
+def _update_injuries(
+    state: ContinuityState,
+    characters: list[str],
+    text: str,
+) -> None:
+    if not any(
+        marker in text
+        for marker in ("受伤", "伤口", "流血", "中弹", "割伤", "擦伤", "骨折")
+    ):
+        return
+    for name in characters:
+        if name in text or len(characters) == 1:
+            state.character_injuries[name] = text
+
+
+def _weather_from_scene(scene: StoryScene) -> str:
+    source = f"{scene.location} {scene.time_of_day} {scene.action} {scene.start_state}"
+    for marker, value in (
+        ("暴雨", "暴雨"),
+        ("雨", "雨"),
+        ("暴雪", "暴雪"),
+        ("雪", "雪"),
+        ("雾", "雾"),
+        ("晴", "晴"),
+        ("阴", "阴"),
+    ):
+        if marker in source:
+            return value
+    if any(marker in scene.location for marker in ("室", "房", "厅", "车内", "仓库")):
+        return "室内，天气不适用"
+    return "天气未说明"
+
+
+def _light_from_scene(scene: StoryScene, bible: VisualBible) -> str:
+    source = f"{scene.time_of_day} {scene.start_state} {bible.lighting_rules}"
+    direction = next(
+        (
+            label
+            for marker, label in (
+                ("左", "画面左侧"),
+                ("右", "画面右侧"),
+                ("逆光", "人物后方"),
+                ("顶光", "人物上方"),
+                ("正面", "镜头方向"),
+            )
+            if marker in source
+        ),
+        "延续场景既定主光方向",
+    )
+    return f"{direction}（{scene.time_of_day or '未说明时段'}）"
+
+
+def _state_frame_summary(state: ContinuityState, fallback: str) -> str:
+    positions = "；".join(
+        f"{name}:{value}" for name, value in state.character_positions.items()
+    )
+    props = "；".join(f"{name}:{value}" for name, value in state.prop_positions.items())
+    emotions = "；".join(
+        f"{name}:{value}" for name, value in state.character_emotions.items()
+    )
+    parts = [
+        fallback.strip(),
+        f"人物位置[{positions}]" if positions else "",
+        f"道具位置[{props}]" if props else "",
+        f"情绪[{emotions}]" if emotions else "",
+    ]
+    return "；".join(item for item in parts if item)
+
+
+def _scene_duration_weight(scene: StoryScene) -> float:
+    content = " ".join(
+        (
+            scene.visible_action or scene.action,
+            scene.dialogue,
+            scene.narration,
+            scene.emotional_change,
+        )
+    )
+    return max(1.0, float(max(0, scene.duration)) + len(content.strip()) / 20.0)
+
+
+def _stable_seed(payload: object) -> int:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(encoded).digest()[:4], "big")
+    return value & 0x7FFFFFFF
 
 
 def _reference_ids(bible: VisualBible, scene: StoryScene) -> list[str]:
@@ -340,11 +791,7 @@ def _matching_anchor(name: str, source: str, fallback: str) -> str:
 
 
 def _split_anchors(source: str) -> list[str]:
-    return [
-        item.strip()
-        for item in re.split(r"[；，,、\n]", source)
-        if item.strip()
-    ]
+    return [item.strip() for item in re.split(r"[；，,、\n]", source) if item.strip()]
 
 
 def _unique(values) -> list[str]:

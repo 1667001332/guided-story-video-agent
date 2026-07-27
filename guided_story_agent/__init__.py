@@ -3,6 +3,7 @@
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent
 from .models import (
     CreativeBrief,
+    ContinuityState,
     DraftBundle,
     ElementOption,
     ElementPalette,
@@ -11,6 +12,7 @@ from .models import (
     IdeaCard,
     IdeationTurnResult,
     RenderManifest,
+    ProviderCapabilities,
     Stage,
     StoryCharacter,
     StoryDraft,
@@ -22,11 +24,13 @@ from .models import (
     SelectionState,
     VisualAsset,
     VisualBible,
+    VisualReference,
 )
 from .session import GuidedStorySession
 
 __all__ = [
     "CreativeBrief",
+    "ContinuityState",
     "DraftBundle",
     "ElementOption",
     "ElementPalette",
@@ -36,6 +40,7 @@ __all__ = [
     "IdeaCard",
     "IdeationTurnResult",
     "OpenAIStoryAgent",
+    "ProviderCapabilities",
     "RenderManifest",
     "RuleBasedStoryAgent",
     "SelectionState",
@@ -49,4 +54,5 @@ __all__ = [
     "StoryboardShot",
     "VisualAsset",
     "VisualBible",
+    "VisualReference",
 ]

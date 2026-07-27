@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .agent import OpenAIStoryAgent, StoryAgent
+from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .models import CreativeBrief, to_plain_data
 from .rendering import StoryRenderer
 from .session import GuidedStorySession
@@ -32,6 +32,7 @@ def _idea_metrics(session: GuidedStorySession) -> tuple[float, float]:
 def run_selfplay(
     *,
     agent: StoryAgent,
+    direction: str | None = None,
     target_seconds: int | None = None,
     max_turns: int = 12,
     output_dir: str | Path,
@@ -52,8 +53,8 @@ def run_selfplay(
         ),
         agent=agent,
     )
-    direction = agent.simulate_creator_direction()
-    ideas = session.start_ideation(direction)
+    active_direction = (direction or "").strip() or agent.simulate_creator_direction()
+    ideas = session.start_ideation(active_direction)
     session.auto_choose()
     selected_snapshot = [to_plain_data(card) for card in session.selected_cards]
     story = session.generate_story()
@@ -75,6 +76,12 @@ def run_selfplay(
     disclosed = sum(field in story.field_sources for field in story.ai_filled_fields)
     cameras = {shot.camera for shot in storyboard.shots}
     anchors = sum(bool(shot.visual_anchors) for shot in storyboard.shots)
+    if require_live_text:
+        text_api_mode = "live-required"
+    elif isinstance(agent, RuleBasedStoryAgent) and not isinstance(agent, OpenAIStoryAgent):
+        text_api_mode = "offline"
+    else:
+        text_api_mode = "fallback-allowed"
     bench = {
         "schema_version": 4,
         "idea_count": len(ideas.cards),
@@ -92,14 +99,14 @@ def run_selfplay(
         "duration_mode": session.brief.duration_mode,
         "target_seconds": script.target_seconds,
         "storyboard_seconds": storyboard.total_duration,
-        "duration_within_tolerance": (
-            abs(storyboard.total_duration - script.target_seconds) <= 1
-        ),
+        "duration_within_tolerance": (abs(storyboard.total_duration - script.target_seconds) <= 1),
         "visual_anchor_coverage": round(anchors / max(1, len(storyboard.shots)), 3),
         "shot_diversity": round(len(cameras) / max(1, len(storyboard.shots)), 3),
         "video_requested": bool(render),
-        "text_api_mode": "live-required" if require_live_text else "fallback-allowed",
+        "text_api_mode": text_api_mode,
         "text_fallback_count": fallback_after - fallback_before,
+        "text_provider": str(getattr(agent, "provider_name", type(agent).__name__)),
+        "text_model": str(getattr(agent, "model", "rule-based")),
     }
 
     target = Path(output_dir).expanduser().resolve()
@@ -107,7 +114,7 @@ def run_selfplay(
     artifacts = {
         "transcript.json": {
             "schema_version": 4,
-            "direction": direction,
+            "direction": active_direction,
             "chat": to_plain_data(session.chat_history),
         },
         "ideas.json": {"schema_version": 4, "batches": to_plain_data(session.idea_batches)},
@@ -138,9 +145,13 @@ def run_selfplay(
 
     if render:
         active_renderer = renderer or StoryRenderer(AgnesVideoProvider.from_env())
-        manifest = session.render_confirmed_plan(active_renderer, target / "video")
-        bench["render_status"] = manifest.status
-        bench["failed_shots"] = manifest.failed_shots
+        try:
+            manifest = session.render_confirmed_plan(active_renderer, target / "video")
+            bench["render_status"] = manifest.status
+            bench["render_warning"] = manifest.error
+            bench["failed_shots"] = manifest.failed_shots
+        finally:
+            session.save(target / "session.json")
         (target / "bench.json").write_text(
             json.dumps(bench, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -156,6 +167,11 @@ def main() -> None:
         help="自定义成片秒数（15–300）；省略时根据完整故事自动估算",
     )
     parser.add_argument(
+        "--direction",
+        default="",
+        help="指定测试方向；省略时由自演创建者生成一句方向",
+    )
+    parser.add_argument(
         "--max-turns",
         type=int,
         default=12,
@@ -164,15 +180,32 @@ def main() -> None:
     parser.add_argument("--output", default="")
     parser.add_argument("--render", action="store_true", help="显式允许付费视频请求")
     parser.add_argument(
+        "--confirm-paid-video",
+        default="",
+        help="与 --render 同用时必须精确填写 RENDER",
+    )
+    parser.add_argument(
         "--require-live-text",
         action="store_true",
         help="文本 API 不可用或发生本地降级时判定失败",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="强制使用本地规则，不读取或请求真实文本 API",
+    )
     args = parser.parse_args()
+    if args.render and args.confirm_paid_video != "RENDER":
+        parser.error("--render 会调用付费视频 API，必须同时填写 --confirm-paid-video RENDER")
+    if not args.render and args.confirm_paid_video:
+        parser.error("--confirm-paid-video 只能与 --render 同时使用。")
+    if args.offline and args.require_live_text:
+        parser.error("--offline 与 --require-live-text 不能同时使用。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or f"outputs/selfplay/{stamp}"
     result = run_selfplay(
-        agent=OpenAIStoryAgent.from_env(),
+        agent=RuleBasedStoryAgent() if args.offline else OpenAIStoryAgent.from_env(),
+        direction=args.direction,
         target_seconds=args.target_seconds,
         max_turns=args.max_turns,
         output_dir=output,
@@ -186,6 +219,11 @@ def main() -> None:
             indent=2,
         )
     )
+    if args.render and result["bench"].get("render_status") not in {
+        "succeeded",
+        "succeeded_with_warnings",
+    }:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

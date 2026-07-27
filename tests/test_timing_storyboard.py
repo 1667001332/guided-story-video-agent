@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from guided_story_agent.models import StoryFacts, StoryScene, StoryScript
+from guided_story_agent.models import StoryFacts, StoryScene, StoryScript, to_plain_data
 from guided_story_agent.storyboard import build_storyboard
-from guided_story_agent.timing import allocate_durations, estimate_story_duration
+from guided_story_agent.timing import (
+    allocate_durations,
+    allocate_weighted_durations,
+    estimate_story_duration,
+)
 
 
 class TimingTests(unittest.TestCase):
@@ -19,13 +23,144 @@ class TimingTests(unittest.TestCase):
 
     def test_30_45_60_second_plans_are_exact(self) -> None:
         for target in (30, 45, 60):
-            values = allocate_durations(target, 5)
-            self.assertEqual(target, sum(values))
-            self.assertTrue(all(3 <= value <= 15 for value in values))
+            script = StoryScript(
+                f"{target}秒",
+                target,
+                [
+                    StoryScene(
+                        1,
+                        "交接证据",
+                        "雨夜车站",
+                        "雨夜",
+                        ["邮差", "警探"],
+                        "邮差取出怀表，穿过站台，随后把怀表交给警探",
+                        "末班车进站前，警探必须确认怀表的来源。",
+                        target,
+                        dialogue="我只剩这一班车的时间说明真相。",
+                        props=["铜怀表"],
+                        visible_action="邮差取出怀表，穿过站台，随后把怀表交给警探",
+                        start_state="邮差站在雨中，右手握着铜怀表",
+                        end_state="铜怀表已经交到警探手中",
+                        emotional_change="邮差从迟疑转为决绝",
+                    )
+                ],
+                confirmed=True,
+            )
+            plan = build_storyboard(script, StoryFacts(character_visuals="邮差：深蓝制服"))
+            self.assertEqual(target, plan.total_duration)
+            self.assertTrue(all(3 <= shot.duration <= 15 for shot in plan.shots))
+            self.assertTrue(
+                all(f"在{shot.duration}秒内" in shot.motion_prompt for shot in plan.shots)
+            )
 
     def test_impossible_duration_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             allocate_durations(20, 10)
+
+    def test_weighted_allocation_is_deterministic_and_not_front_loaded(self) -> None:
+        first = allocate_weighted_durations(
+            31,
+            [1, 1, 1, 1, 1],
+            keys=["a", "b", "c", "d", "e"],
+        )
+        second = allocate_weighted_durations(
+            31,
+            [1, 1, 1, 1, 1],
+            keys=["a", "b", "c", "d", "e"],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(31, sum(first))
+        self.assertNotEqual(7, first[0])
+        self.assertIn(7, first)
+
+    def test_long_dialogue_and_complex_action_outweigh_simple_detail(self) -> None:
+        scene = StoryScene(
+            1,
+            "供出真相",
+            "审讯室",
+            "深夜",
+            ["证人", "警探"],
+            "证人取出钥匙，打开铁盒，翻出照片，随后把照片推给警探",
+            "",
+            45,
+            dialogue=(
+                "我看见他在十一点四十分进入仓库，随后关掉所有灯，"
+                "又把这张照片塞进铁盒。他威胁我，如果说出去就再也见不到家人。"
+            ),
+            props=["钥匙", "铁盒", "照片"],
+            visible_action="证人取出钥匙，打开铁盒，翻出照片，随后把照片推给警探",
+            start_state="铁盒锁着，照片仍在盒内",
+            end_state="照片停在警探手边",
+            emotional_change="证人从恐惧转为释然",
+        )
+        plan = build_storyboard(
+            StoryScript("供词", 45, [scene], confirmed=True),
+            StoryFacts(),
+        )
+        dialogue = next(shot for shot in plan.shots if shot.shot_kind == "dialogue")
+        details = [shot for shot in plan.shots if shot.shot_kind == "detail"]
+        simple_detail = min(details, key=lambda shot: shot.duration_weight)
+        self.assertGreater(dialogue.duration_weight, simple_detail.duration_weight)
+        self.assertGreater(dialogue.duration, simple_detail.duration)
+
+    def test_same_storyboard_input_is_fully_deterministic(self) -> None:
+        script = StoryScript(
+            "重复生成",
+            30,
+            [
+                StoryScene(
+                    1,
+                    "奔跑",
+                    "雨夜街道",
+                    "雨夜",
+                    ["女孩"],
+                    "女孩越过水洼，推开铁门，冲进亮灯的门厅",
+                    "她必须赶在钟声结束前送到信。",
+                    30,
+                    visible_action="女孩越过水洼，推开铁门，冲进亮灯的门厅",
+                    emotional_change="焦急转为如释重负",
+                )
+            ],
+            confirmed=True,
+        )
+        first = build_storyboard(script, StoryFacts())
+        second = build_storyboard(script, StoryFacts())
+        self.assertEqual(to_plain_data(first), to_plain_data(second))
+
+    def test_formal_storyboard_advances_weather_clothing_and_injury_state(self) -> None:
+        script = StoryScript(
+            "雨中伤员",
+            30,
+            [
+                StoryScene(
+                    1,
+                    "包扎",
+                    "雨夜站台",
+                    "雨夜",
+                    ["邮差"],
+                    "邮差按住流血的左臂，拿起绷带完成包扎",
+                    "",
+                    30,
+                    props=["绷带"],
+                    visible_action="邮差按住流血的左臂，拿起绷带完成包扎",
+                    start_state="邮差左臂受伤流血，绷带在长椅上",
+                    end_state="绷带缠在邮差左臂，伤口不再流血",
+                )
+            ],
+            confirmed=True,
+        )
+        plan = build_storyboard(
+            script,
+            StoryFacts(character_visuals="邮差：短发，深蓝制服，左臂受伤"),
+        )
+        self.assertTrue(all(shot.continuity_start_state.weather == "雨" for shot in plan.shots))
+        self.assertIn("邮差", plan.shots[0].continuity_start_state.character_clothing)
+        self.assertIn("邮差", plan.shots[0].continuity_start_state.character_injuries)
+        for previous, current in zip(plan.shots, plan.shots[1:]):
+            self.assertEqual(
+                to_plain_data(previous.continuity_end_state),
+                to_plain_data(current.continuity_start_state),
+            )
 
     def test_storyboard_requires_confirmed_script(self) -> None:
         script = StoryScript("测试", 30, [])

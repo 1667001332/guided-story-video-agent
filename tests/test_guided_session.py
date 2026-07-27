@@ -91,6 +91,7 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
         session.select_ideas(ids)
         story = session.generate_story()
         self.assertEqual(set(ids), set(story.field_sources["selected_ideas"].source_ids))
+        session.back_to_ideation()
         with self.assertRaisesRegex(ValueError, "最多"):
             session.select_ideas([card.idea_id for card in session.current_batch.cards[:4]])
 

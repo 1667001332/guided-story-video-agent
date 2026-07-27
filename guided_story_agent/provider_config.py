@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
 import os
+import urllib.parse
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -27,8 +30,14 @@ def _value(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def _has_any(names: tuple[str, ...]) -> bool:
-    return any(name in os.environ for name in names)
+def _load_project_dotenv(dotenv_path: str | os.PathLike[str] | None) -> Path:
+    target = (
+        Path(dotenv_path).expanduser().resolve()
+        if dotenv_path is not None
+        else (Path.cwd() / ".env").resolve()
+    )
+    load_dotenv(dotenv_path=target, override=False)
+    return target
 
 
 def _number(value: str, default: float) -> float:
@@ -54,18 +63,22 @@ class TextProviderConfig:
         return not self.error and self.provider != "offline"
 
     @classmethod
-    def from_env(cls) -> TextProviderConfig:
-        load_dotenv()
-        generic_names = (
-            "TEXT_PROVIDER",
-            "TEXT_API_KEY",
-            "TEXT_BASE_URL",
-            "TEXT_MODEL",
-            "TEXT_TIMEOUT",
-            "TEXT_JSON_MODE",
-        )
-        if _has_any(generic_names):
-            provider_raw = _value("TEXT_PROVIDER", "openai_compatible").lower()
+    def from_env(
+        cls,
+        *,
+        dotenv_path: str | os.PathLike[str] | None = None,
+    ) -> TextProviderConfig:
+        _load_project_dotenv(dotenv_path)
+        provider_setting = _value("TEXT_PROVIDER").lower()
+        provider_raw = provider_setting or "openai_compatible"
+        provider = TEXT_PROVIDER_ALIASES.get(provider_raw, provider_raw)
+        explicit_mode = bool(provider_setting)
+        generic_key_present = bool(_value("TEXT_API_KEY"))
+        if (
+            generic_key_present
+            or (explicit_mode and provider == "offline")
+            or (explicit_mode and provider not in {"openai_compatible", "offline"})
+        ):
             provider = TEXT_PROVIDER_ALIASES.get(provider_raw, provider_raw)
             config = cls(
                 provider=provider,
@@ -104,6 +117,18 @@ class TextProviderConfig:
             )
             return config._validated("agnes")
 
+        if explicit_mode:
+            config = cls(
+                provider=provider,
+                api_key="",
+                base_url=_value("TEXT_BASE_URL"),
+                model=_value("TEXT_MODEL"),
+                timeout=_number(_value("TEXT_TIMEOUT", "120"), 120),
+                json_mode=_value("TEXT_JSON_MODE", "auto").lower(),
+                source="TEXT_*",
+            )
+            return config._validated(provider_raw)
+
         return cls(
             provider="openai_compatible",
             api_key="",
@@ -112,9 +137,7 @@ class TextProviderConfig:
             timeout=120,
             json_mode="auto",
             source="none",
-            error=(
-                "未配置 TEXT_API_KEY，也未发现旧版 DEEPSEEK_API_KEY 或 AGNES_API_KEY。"
-            ),
+            error=("未配置 TEXT_API_KEY，也未发现旧版 DEEPSEEK_API_KEY 或 AGNES_API_KEY。"),
         )
 
     def _validated(self, provider_raw: str) -> TextProviderConfig:
@@ -125,17 +148,13 @@ class TextProviderConfig:
         if self.provider == "offline":
             return self._with_error("TEXT_PROVIDER 已设为 offline，真实文本 API 已关闭。")
         if self.json_mode not in TEXT_JSON_MODES:
-            return self._with_error(
-                "TEXT_JSON_MODE 必须是 auto、required 或 disabled。"
-            )
+            return self._with_error("TEXT_JSON_MODE 必须是 auto、required 或 disabled。")
         if not self.api_key:
-            return self._with_error(
-                f"{self.source} 缺少文本 API Key；请填写 TEXT_API_KEY。"
-            )
+            return self._with_error(f"{self.source} 缺少文本 API Key；请填写 TEXT_API_KEY。")
         if not self.model:
-            return self._with_error(
-                f"{self.source} 缺少模型 ID；请填写 TEXT_MODEL。"
-            )
+            return self._with_error(f"{self.source} 缺少模型 ID；请填写 TEXT_MODEL。")
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            return self._with_error("TEXT_TIMEOUT 必须是大于 0 的有限数字。")
         return self
 
     def _with_error(self, error: str) -> TextProviderConfig:
@@ -161,6 +180,8 @@ class VideoProviderConfig:
     poll_interval: float
     max_poll_seconds: float
     source: str
+    reference_root: str = ""
+    reference_base_url: str = ""
     error: str = ""
 
     @property
@@ -173,19 +194,19 @@ class VideoProviderConfig:
         *,
         default_api_root: str,
         default_model: str,
+        dotenv_path: str | os.PathLike[str] | None = None,
     ) -> VideoProviderConfig:
-        load_dotenv()
-        generic_names = (
-            "VIDEO_PROVIDER",
-            "VIDEO_API_KEY",
-            "VIDEO_API_ROOT",
-            "VIDEO_MODEL",
-            "VIDEO_TIMEOUT",
-            "VIDEO_POLL_INTERVAL",
-            "VIDEO_MAX_POLL_SECONDS",
-        )
-        if _has_any(generic_names):
-            provider_raw = _value("VIDEO_PROVIDER", "agnes").lower()
+        _load_project_dotenv(dotenv_path)
+        provider_setting = _value("VIDEO_PROVIDER").lower()
+        provider_raw = provider_setting or "agnes"
+        provider = VIDEO_PROVIDER_ALIASES.get(provider_raw, provider_raw)
+        explicit_mode = bool(provider_setting)
+        generic_key_present = bool(_value("VIDEO_API_KEY"))
+        if (
+            generic_key_present
+            or (explicit_mode and provider == "disabled")
+            or (explicit_mode and provider not in {"agnes", "disabled"})
+        ):
             provider = VIDEO_PROVIDER_ALIASES.get(provider_raw, provider_raw)
             config = cls(
                 provider=provider,
@@ -194,24 +215,40 @@ class VideoProviderConfig:
                 model=_value("VIDEO_MODEL", default_model),
                 timeout=_number(_value("VIDEO_TIMEOUT", "120"), 120),
                 poll_interval=_number(_value("VIDEO_POLL_INTERVAL", "5"), 5),
-                max_poll_seconds=_number(
-                    _value("VIDEO_MAX_POLL_SECONDS", "900"), 900
-                ),
+                max_poll_seconds=_number(_value("VIDEO_MAX_POLL_SECONDS", "900"), 900),
                 source="VIDEO_*",
+                reference_root=_value("VIDEO_REFERENCE_ROOT"),
+                reference_base_url=_value("VIDEO_REFERENCE_BASE_URL"),
             )
             return config._validated(provider_raw)
 
+        agnes_key = _value("AGNES_API_KEY")
+        if agnes_key:
+            config = cls(
+                provider="agnes",
+                api_key=agnes_key,
+                api_root=_value("AGNES_API_ROOT", default_api_root),
+                model=_value("AGNES_VIDEO_MODEL", default_model),
+                timeout=_number(_value("AGNES_TIMEOUT", "120"), 120),
+                poll_interval=_number(_value("AGNES_POLL_INTERVAL", "5"), 5),
+                max_poll_seconds=_number(_value("AGNES_MAX_POLL_SECONDS", "900"), 900),
+                source="AGNES_* (legacy)",
+                reference_root=_value("VIDEO_REFERENCE_ROOT"),
+                reference_base_url=_value("VIDEO_REFERENCE_BASE_URL"),
+            )
+            return config._validated("agnes")
+
         config = cls(
-            provider="agnes",
-            api_key=_value("AGNES_API_KEY"),
-            api_root=_value("AGNES_API_ROOT", default_api_root),
-            model=_value("AGNES_VIDEO_MODEL", default_model),
-            timeout=_number(_value("AGNES_TIMEOUT", "120"), 120),
-            poll_interval=_number(_value("AGNES_POLL_INTERVAL", "5"), 5),
-            max_poll_seconds=_number(
-                _value("AGNES_MAX_POLL_SECONDS", "900"), 900
-            ),
-            source="AGNES_* (legacy)" if _value("AGNES_API_KEY") else "none",
+            provider=provider,
+            api_key="",
+            api_root=_value("VIDEO_API_ROOT", default_api_root),
+            model=_value("VIDEO_MODEL", default_model),
+            timeout=_number(_value("VIDEO_TIMEOUT", "120"), 120),
+            poll_interval=_number(_value("VIDEO_POLL_INTERVAL", "5"), 5),
+            max_poll_seconds=_number(_value("VIDEO_MAX_POLL_SECONDS", "900"), 900),
+            source="VIDEO_*" if explicit_mode else "none",
+            reference_root=_value("VIDEO_REFERENCE_ROOT"),
+            reference_base_url=_value("VIDEO_REFERENCE_BASE_URL"),
         )
         return config._validated("agnes")
 
@@ -223,13 +260,25 @@ class VideoProviderConfig:
         if self.provider == "disabled":
             return self._with_error("VIDEO_PROVIDER 已设为 disabled，付费视频 API 已关闭。")
         if not self.api_key:
-            return self._with_error(
-                f"{self.source} 缺少视频 API Key；请填写 VIDEO_API_KEY。"
-            )
+            return self._with_error(f"{self.source} 缺少视频 API Key；请填写 VIDEO_API_KEY。")
         if not self.model:
+            return self._with_error(f"{self.source} 缺少视频模型 ID；请填写 VIDEO_MODEL。")
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            return self._with_error("VIDEO_TIMEOUT 必须是大于 0 的有限数字。")
+        if not math.isfinite(self.poll_interval) or self.poll_interval < 0:
+            return self._with_error("VIDEO_POLL_INTERVAL 必须是大于等于 0 的有限数字。")
+        if not math.isfinite(self.max_poll_seconds) or self.max_poll_seconds <= 0:
+            return self._with_error("VIDEO_MAX_POLL_SECONDS 必须是大于 0 的有限数字。")
+        if bool(self.reference_root) != bool(self.reference_base_url):
             return self._with_error(
-                f"{self.source} 缺少视频模型 ID；请填写 VIDEO_MODEL。"
+                "VIDEO_REFERENCE_ROOT 与 VIDEO_REFERENCE_BASE_URL 必须同时填写或同时留空。"
             )
+        if self.reference_base_url:
+            parsed = urllib.parse.urlsplit(self.reference_base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return self._with_error(
+                    "VIDEO_REFERENCE_BASE_URL 必须是有效的 http(s) URL。"
+                )
         return self
 
     def _with_error(self, error: str) -> VideoProviderConfig:
@@ -242,5 +291,7 @@ class VideoProviderConfig:
             poll_interval=self.poll_interval,
             max_poll_seconds=self.max_poll_seconds,
             source=self.source,
+            reference_root=self.reference_root,
+            reference_base_url=self.reference_base_url,
             error=error,
         )

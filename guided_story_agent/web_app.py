@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable, Iterator
+from hashlib import sha256
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 from typing import Any
+from uuid import uuid4
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .models import CreativeBrief, ElementPalette, Stage
 from .rendering import StoryRenderer
 from .session import GuidedStorySession
 from .video_provider import AgnesVideoProvider
+
+
+VISUAL_USAGE_CHOICES = [
+    ("人物身份参考", "identity_reference"),
+    ("地点参考", "location_reference"),
+    ("道具参考", "prop_reference"),
+    ("场景气氛参考", "scene_reference"),
+    ("视频首帧", "start_frame"),
+]
 
 
 def card_grid_payload(session: GuidedStorySession | None) -> dict[str, Any]:
@@ -186,8 +198,12 @@ def chat_ideation_view(
     try:
         result = session.chat_ideation(cleaned)
         chat.append({"role": "assistant", "content": result.message})
-        return session, _card_grid_update(session), chat, "", _text_status(
-            session, "已按你的补充换出8个新方向。"
+        return (
+            session,
+            _card_grid_update(session),
+            chat,
+            "",
+            _text_status(session, "已按你的补充换出8个新方向。"),
         )
     except Exception as exc:
         return session, _card_grid_update(session), chat, "", str(exc)
@@ -246,7 +262,13 @@ def generate_story_view(
             _text_status(session, "完整故事已生成；确认后才能改编剧本。"),
         )
     except Exception as exc:
-        return session, "", "", str(exc)
+        story = session.story if session else None
+        return (
+            session,
+            _story_markdown(story) if story else "",
+            _ai_fill_markdown(story) if story else "",
+            str(exc),
+        )
 
 
 def revise_story_view(
@@ -264,7 +286,14 @@ def revise_story_view(
             _text_status(session, f"已生成故事第{story.version}版。"),
         )
     except Exception as exc:
-        return session, "", "", feedback, str(exc)
+        current = session.story if session else None
+        return (
+            session,
+            _story_markdown(current) if current else "",
+            _ai_fill_markdown(current) if current else "",
+            feedback,
+            str(exc),
+        )
 
 
 def generate_script_view(
@@ -284,7 +313,8 @@ def generate_script_view(
             ),
         )
     except Exception as exc:
-        return session, "", str(exc)
+        current = session.script if session else None
+        return session, _script_markdown(current) if current else "", str(exc)
 
 
 def revise_script_view(
@@ -301,7 +331,8 @@ def revise_script_view(
             _text_status(session, "剧本已按反馈改写。"),
         )
     except Exception as exc:
-        return session, "", feedback, str(exc)
+        current = session.script if session else None
+        return session, _script_markdown(current) if current else "", feedback, str(exc)
 
 
 def back_to_ideas_view(
@@ -321,17 +352,182 @@ def build_storyboard_view(
     try:
         session.confirm_script()
         plan = session.build_storyboard()
-        choices = [
-            (f"镜头 {shot.shot_id}｜{shot.shot_purpose}", str(shot.shot_id)) for shot in plan.shots
-        ]
         return (
             session,
             _storyboard_markdown(plan),
-            _gr_update(choices=choices, value=choices[0][1]),
+            _shot_choices_update(plan),
             "分镜已生成；确认前不会调用视频API。",
         )
     except Exception as exc:
-        return session, "", None, str(exc)
+        current = session.storyboard if session else None
+        return (
+            session,
+            _storyboard_markdown(current),
+            _shot_choices_update(current),
+            str(exc),
+        )
+
+
+def add_visual_reference_view(
+    session: GuidedStorySession | None,
+    uploaded_image: Any,
+    usage: str,
+    binding: str | None,
+    content_summary: str = "",
+) -> tuple[
+    GuidedStorySession | None,
+    str,
+    str,
+    Any,
+    Any,
+    Any,
+    str,
+    str,
+    Any,
+]:
+    if session is None or session.storyboard is None:
+        return (
+            session,
+            "",
+            "",
+            _visual_binding_choices_update(None),
+            _visual_reference_choices_update(None),
+            uploaded_image,
+            content_summary,
+            "请先生成分镜。",
+            _gr_update(value=False),
+        )
+    try:
+        source = _uploaded_image_path(uploaded_image)
+        if not source:
+            raise ValueError("请先上传一张参考图。")
+        binding_kind, binding_id = _parse_visual_binding(binding)
+        if binding_kind == "asset" and usage == "start_frame":
+            raise ValueError("start_frame 只能绑定到具体镜头，不能绑定到通用资产。")
+        persisted = _persist_visual_upload(source)
+        reference = session.add_visual_reference(
+            path=persisted,
+            usage=usage,
+            binding_kind=binding_kind,
+            binding_id=binding_id,
+            content_summary=content_summary,
+        )
+        return (
+            session,
+            _storyboard_markdown(session.storyboard),
+            _visual_inputs_markdown(session.storyboard),
+            _visual_binding_choices_update(session.storyboard),
+            _visual_reference_choices_update(session.storyboard),
+            None,
+            "",
+            (
+                f"参考图 {reference.reference_id} 已绑定但尚未冻结。"
+                "请点击“确认这些参考图”，然后重新确认整套分镜。"
+            ),
+            _gr_update(value=False),
+        )
+    except Exception as exc:
+        return (
+            session,
+            _storyboard_markdown(session.storyboard),
+            _visual_inputs_markdown(session.storyboard),
+            _visual_binding_choices_update(session.storyboard),
+            _visual_reference_choices_update(session.storyboard),
+            uploaded_image,
+            content_summary,
+            str(exc),
+            _gr_update(value=False),
+        )
+
+
+def remove_visual_reference_view(
+    session: GuidedStorySession | None,
+    reference_id: str | None,
+) -> tuple[
+    GuidedStorySession | None,
+    str,
+    str,
+    Any,
+    Any,
+    str,
+    Any,
+]:
+    if session is None or session.storyboard is None:
+        return (
+            session,
+            "",
+            "",
+            _visual_binding_choices_update(None),
+            _visual_reference_choices_update(None),
+            "请先生成分镜。",
+            _gr_update(value=False),
+        )
+    try:
+        session.remove_visual_reference(str(reference_id or ""))
+        return (
+            session,
+            _storyboard_markdown(session.storyboard),
+            _visual_inputs_markdown(session.storyboard),
+            _visual_binding_choices_update(session.storyboard),
+            _visual_reference_choices_update(session.storyboard),
+            "参考图绑定已删除；原分镜确认已失效，请重新确认。",
+            _gr_update(value=False),
+        )
+    except Exception as exc:
+        return (
+            session,
+            _storyboard_markdown(session.storyboard),
+            _visual_inputs_markdown(session.storyboard),
+            _visual_binding_choices_update(session.storyboard),
+            _visual_reference_choices_update(session.storyboard),
+            str(exc),
+            _gr_update(value=False),
+        )
+
+
+def confirm_visual_inputs_view(
+    session: GuidedStorySession | None,
+) -> tuple[
+    GuidedStorySession | None,
+    str,
+    str,
+    Any,
+    Any,
+    str,
+    Any,
+]:
+    if session is None or session.storyboard is None:
+        return (
+            session,
+            "",
+            "",
+            _visual_binding_choices_update(None),
+            _visual_reference_choices_update(None),
+            "请先生成分镜。",
+            _gr_update(value=False),
+        )
+    try:
+        diagnostics = session.confirm_visual_inputs()
+        warning = f"；另有 {len(diagnostics)} 条未绑定资产提示" if diagnostics else ""
+        return (
+            session,
+            _storyboard_markdown(session.storyboard),
+            _visual_inputs_markdown(session.storyboard),
+            _visual_binding_choices_update(session.storyboard),
+            _visual_reference_choices_update(session.storyboard),
+            f"参考图内容与用途已冻结{warning}。请重新确认整套分镜。",
+            _gr_update(value=False),
+        )
+    except Exception as exc:
+        return (
+            session,
+            _storyboard_markdown(session.storyboard),
+            _visual_inputs_markdown(session.storyboard),
+            _visual_binding_choices_update(session.storyboard),
+            _visual_reference_choices_update(session.storyboard),
+            str(exc),
+            _gr_update(value=False),
+        )
 
 
 def retake_shot_view(
@@ -341,28 +537,23 @@ def retake_shot_view(
         return session, "", feedback, "请先选择镜头。"
     try:
         shot = next(item for item in session.storyboard.shots if item.shot_id == int(shot_id))
+        pending = next(
+            (
+                item
+                for item in reversed(session.storyboard.artifacts)
+                if item.shot_id == shot.shot_id and item.status == "pending" and item.request_id
+            ),
+            None,
+        )
+        if pending is not None:
+            raise RuntimeError(
+                f"镜头 {shot.shot_id} 的远端任务仍在处理中"
+                f"（任务 ID：{pending.request_id}），暂不能 Retake，避免重复付费。"
+            )
         requirement = feedback.strip()
         if not requirement:
             raise ValueError("请先写一句 Retake 要求。")
-        new_action = f"根据 Retake 要求“{requirement}”：{shot.action}"
-        new_motion = (
-            f"{new_action} 摄影机运动：{shot.camera_movement}。"
-            "保持人物身份、动作方向、道具位置与首帧连续。"
-        )
-        new_prompt = (
-            f"Cinematic narrative shot. Purpose: {shot.shot_purpose}. "
-            f"FIRST FRAME: {shot.first_frame_prompt} "
-            f"MOTION: {new_motion} "
-            f"END FRAME: {shot.end_frame_prompt}"
-        )
-        session.update_storyboard_shot(
-            int(shot_id),
-            {
-                "action": new_action,
-                "motion_prompt": new_motion,
-                "video_prompt": new_prompt,
-            },
-        )
+        session.update_storyboard_shot(int(shot_id), _retake_patch(shot, requirement))
         return session, _storyboard_markdown(session.storyboard), "", "该镜头已生成新版本。"
     except Exception as exc:
         return (
@@ -371,6 +562,77 @@ def retake_shot_view(
             feedback,
             str(exc),
         )
+
+
+def _retake_patch(shot, requirement: str) -> dict[str, str]:
+    camera = shot.camera
+    composition = shot.composition
+    camera_label = ""
+    for markers, value, label in (
+        (("大特写", "极近特写"), "extreme close-up", "极近特写"),
+        (("特写",), "close-up", "特写"),
+        (("近景",), "medium close-up", "近景"),
+        (("中景",), "medium", "中景"),
+        (("全景", "远景", "广角"), "wide", "全景"),
+        (("俯拍",), "high-angle", "俯拍"),
+        (("仰拍",), "low-angle", "仰拍"),
+    ):
+        if any(marker in requirement for marker in markers):
+            camera = value
+            camera_label = label
+            composition = f"{label}构图，主体与环境关系清晰"
+            break
+
+    camera_movement = shot.camera_movement
+    for markers, value in (
+        (("快速推进", "快速推近"), "fast dolly in"),
+        (("缓慢推进", "慢慢推进", "缓慢推近"), "slow dolly in"),
+        (("推进", "推镜头", "推近"), "dolly in"),
+        (("快速拉远", "快速后拉"), "fast dolly out"),
+        (("拉远", "后拉"), "dolly out"),
+        (("横摇", "摇镜"), "pan"),
+        (("跟拍", "跟随"), "tracking"),
+        (("环绕",), "orbit"),
+        (("手持",), "handheld"),
+        (("静止", "固定镜头"), "static"),
+    ):
+        if any(marker in requirement for marker in markers):
+            camera_movement = value
+            break
+
+    first_frame = shot.first_frame_prompt
+    end_frame = shot.end_frame_prompt
+    if camera_label:
+        first_frame = f"{camera_label}。{first_frame}"
+        end_frame = f"{camera_label}。{end_frame}"
+    if "首帧" in requirement or "开场画面" in requirement:
+        first_frame = f"Retake 首帧要求：{requirement}。原始连续性：{shot.first_frame_prompt}"
+    if any(marker in requirement for marker in ("结束帧", "尾帧", "末帧", "结尾画面")):
+        end_frame = f"Retake 结束帧要求：{requirement}。原始连续性：{shot.end_frame_prompt}"
+
+    action = f"按 Retake 要求“{requirement}”重做动作：{shot.action}"
+    motion = (
+        f"在{shot.duration}秒内完成：{action} 摄影机运动："
+        f"{camera_movement or 'static'}。"
+        "保持人物身份、动作方向、道具位置与相邻镜头连续。"
+    )
+    video_prompt = (
+        f"Cinematic narrative shot. Purpose: {shot.shot_purpose}. "
+        f"CAMERA: {camera}. COMPOSITION: {composition}. "
+        f"FIRST FRAME: {first_frame} "
+        f"MOTION: {motion} "
+        f"END FRAME: {end_frame}"
+    )
+    return {
+        "camera": camera,
+        "composition": composition,
+        "camera_movement": camera_movement,
+        "first_frame_prompt": first_frame,
+        "end_frame_prompt": end_frame,
+        "action": action,
+        "motion_prompt": motion,
+        "video_prompt": video_prompt,
+    }
 
 
 def confirm_storyboard_view(
@@ -391,12 +653,36 @@ def render_video_with_progress(
     *,
     provider=None,
     output_dir: str | Path | None = None,
-) -> Iterator[tuple[GuidedStorySession | None, str | None, str]]:
+) -> Iterator[tuple[GuidedStorySession | None, str | None, str, Any]]:
+    reset_confirmation = _gr_update(value=False)
+    previous_video = (
+        session.render_manifest.final_video_path
+        if session and session.render_manifest and session.render_manifest.final_video_path
+        else None
+    )
+    if session is not None and bool(getattr(session, "render_in_progress", False)):
+        yield (
+            session,
+            previous_video,
+            "当前会话已有视频任务在运行，请等待完成后再试。",
+            reset_confirmation,
+        )
+        return
     if session is None or session.stage != Stage.RENDER_READY:
-        yield session, None, "必须先确认完整分镜，才能生成真实视频。"
+        yield (
+            session,
+            previous_video,
+            "必须先确认完整分镜，才能生成真实视频。",
+            reset_confirmation,
+        )
         return
     if not cost_confirmed:
-        yield session, None, "请先勾选费用确认；当前没有调用视频API。"
+        yield (
+            session,
+            previous_video,
+            "请先勾选费用确认；当前没有调用视频API。",
+            reset_confirmation,
+        )
         return
     queue: Queue[tuple[float, str]] = Queue()
     result: dict[str, object] = {}
@@ -409,32 +695,77 @@ def render_video_with_progress(
             renderer = StoryRenderer(
                 provider or AgnesVideoProvider.from_env(), progress_callback=progress
             )
-            target = output_dir or os.getenv("VIDEO_OUTPUT_DIR", "outputs/videos")
-            result["manifest"] = session.render_confirmed_plan(renderer, target)
+            base = (
+                Path(output_dir or os.getenv("VIDEO_OUTPUT_DIR", "outputs/videos"))
+                .expanduser()
+                .resolve()
+            )
+            target = base / f"render_{uuid4().hex}"
+            target.mkdir(parents=True, exist_ok=False)
+            result["output_dir"] = target
+            session.save(target / "session_before_render.json")
+            try:
+                result["manifest"] = session.render_confirmed_plan(renderer, target)
+            finally:
+                session.save(target / "session.json")
         except Exception as exc:
             result["error"] = exc
 
     worker = Thread(target=work, daemon=True)
     worker.start()
     fraction, message = 0.0, "正在准备旁白与视频任务"
-    yield session, None, _progress_text(fraction, message)
+    yield session, previous_video, _progress_text(fraction, message), reset_confirmation
     while worker.is_alive():
         try:
             fraction, message = queue.get(timeout=0.5)
         except Empty:
             pass
-        yield session, None, _progress_text(fraction, message)
+        yield session, previous_video, _progress_text(fraction, message), reset_confirmation
     worker.join()
     while not queue.empty():
         fraction, message = queue.get_nowait()
     if "error" in result:
-        yield session, None, f"生成失败：{result['error']}"
+        yield session, previous_video, f"生成失败：{result['error']}", reset_confirmation
         return
     manifest = result.get("manifest")
-    if manifest is None or manifest.status != "succeeded":
-        yield session, None, f"生成失败：{getattr(manifest, 'error', '没有生成manifest')}"
+    if manifest is None:
+        yield session, previous_video, "生成失败：没有生成 manifest", reset_confirmation
         return
-    yield session, manifest.final_video_path, _progress_text(1.0, "成片已保存到本地")
+    if manifest.status == "pending":
+        yield (
+            session,
+            previous_video,
+            f"视频任务仍在处理中：{manifest.error}",
+            reset_confirmation,
+        )
+        return
+    if manifest.status == "submission_uncertain":
+        yield (
+            session,
+            previous_video,
+            f"视频提交结果无法确认：{manifest.error}",
+            reset_confirmation,
+        )
+        return
+    if manifest.status not in {"succeeded", "succeeded_with_warnings"}:
+        yield (
+            session,
+            previous_video,
+            f"生成失败：{manifest.error}｜{_render_evidence_summary(manifest)}",
+            reset_confirmation,
+        )
+        return
+    if manifest.status == "succeeded_with_warnings":
+        message = f"成片已保存，但存在警告：{manifest.error}"
+    else:
+        message = "成片已保存到本地"
+    message = f"{message}｜{_render_evidence_summary(manifest)}"
+    yield (
+        session,
+        manifest.final_video_path,
+        _progress_text(1.0, message),
+        reset_confirmation,
+    )
 
 
 def _idea_card_grid_class(gr):
@@ -480,14 +811,46 @@ def build_app(agent_factory: Callable[[], StoryAgent] | None = None):
     script_and_open.__name__ = "generate_script_view"
 
     def storyboard_and_open(session):
-        return (*build_storyboard_view(session), _gr_update(selected="storyboard"))
+        result = build_storyboard_view(session)
+        plan = result[0].storyboard if result[0] is not None else None
+        return (
+            *result,
+            _visual_inputs_markdown(plan),
+            _visual_binding_choices_update(plan),
+            _visual_reference_choices_update(plan),
+            _gr_update(value=False),
+            _gr_update(selected="storyboard"),
+        )
 
     storyboard_and_open.__name__ = "build_storyboard_view"
 
     def confirm_storyboard_and_open(session):
-        return (*confirm_storyboard_view(session), _gr_update(selected="video"))
+        active, message = confirm_storyboard_view(session)
+        plan = active.storyboard if active is not None else None
+        return (
+            active,
+            _storyboard_markdown(plan),
+            _visual_inputs_markdown(plan),
+            _visual_reference_choices_update(plan),
+            message,
+            _gr_update(value=False),
+            _gr_update(selected="video"),
+        )
 
     confirm_storyboard_and_open.__name__ = "confirm_storyboard_view"
+
+    def retake_and_reset(session, shot_id, feedback):
+        result = retake_shot_view(session, shot_id, feedback)
+        plan = result[0].storyboard if result[0] is not None else None
+        return (
+            *result,
+            _visual_inputs_markdown(plan),
+            _visual_binding_choices_update(plan),
+            _visual_reference_choices_update(plan),
+            _gr_update(value=False),
+        )
+
+    retake_and_reset.__name__ = "retake_shot_view"
 
     def back_and_open(session):
         return (*back_to_ideas_view(session), _gr_update(selected="ideas"))
@@ -865,9 +1228,7 @@ footer{display:none!important}
                                 placeholder="例如：减少旁白，加强可见动作",
                                 lines=5,
                             )
-                            rewrite_script = gr.Button(
-                                "改写剧本", elem_classes=["quiet-action"]
-                            )
+                            rewrite_script = gr.Button("改写剧本", elem_classes=["quiet-action"])
                             make_storyboard = gr.Button(
                                 "接受剧本并生成分镜  →",
                                 variant="primary",
@@ -885,16 +1246,16 @@ footer{display:none!important}
                         """
                     )
                     with gr.Row(equal_height=False):
-                        with gr.Column(
-                            scale=7, elem_classes=["paper-panel", "storyboard-paper"]
-                        ):
+                        with gr.Column(scale=7, elem_classes=["paper-panel", "storyboard-paper"]):
                             storyboard = gr.Markdown(
                                 "*确认剧本后，镜头时间线会出现在这里。*",
                                 elem_classes=["storyboard-copy", "empty-state"],
                             )
-                        with gr.Column(
-                            scale=3, elem_classes=["side-panel", "storyboard-controls"]
-                        ):
+                            visual_inputs = gr.Markdown(
+                                "*生成分镜后，可在这里上传并绑定参考图。*",
+                                elem_classes=["visual-input-summary"],
+                            )
+                        with gr.Column(scale=3, elem_classes=["side-panel", "storyboard-controls"]):
                             gr.HTML(
                                 """
                                 <div class="panel-label">镜头修改</div>
@@ -909,9 +1270,44 @@ footer{display:none!important}
                                 placeholder="例如：改成近景，动作更克制",
                                 lines=4,
                             )
-                            retake = gr.Button(
-                                "重做这个镜头方案", elem_classes=["quiet-action"]
-                            )
+                            retake = gr.Button("重做这个镜头方案", elem_classes=["quiet-action"])
+                            with gr.Accordion("参考图管理", open=True):
+                                visual_upload = gr.Image(
+                                    label="上传参考图",
+                                    type="filepath",
+                                    sources=["upload"],
+                                    height=180,
+                                )
+                                visual_usage = gr.Dropdown(
+                                    label="图片用途",
+                                    choices=VISUAL_USAGE_CHOICES,
+                                    value="identity_reference",
+                                )
+                                visual_binding = gr.Dropdown(
+                                    label="绑定到镜头或资产",
+                                    choices=[],
+                                )
+                                visual_summary = gr.Textbox(
+                                    label="内容说明（可选）",
+                                    placeholder="例如：林夏正面定妆照，黑色短发、灰色风衣",
+                                    lines=2,
+                                )
+                                add_visual = gr.Button(
+                                    "上传并绑定",
+                                    elem_classes=["quiet-action"],
+                                )
+                                visual_delete = gr.Dropdown(
+                                    label="删除已绑定参考图",
+                                    choices=[],
+                                )
+                                remove_visual = gr.Button(
+                                    "删除这条绑定",
+                                    elem_classes=["quiet-action"],
+                                )
+                                confirm_visual = gr.Button(
+                                    "确认这些参考图",
+                                    elem_classes=["quiet-action"],
+                                )
                             confirm_storyboard = gr.Button(
                                 "确认整套分镜  →",
                                 variant="primary",
@@ -928,9 +1324,7 @@ footer{display:none!important}
                         """
                     )
                     with gr.Row(equal_height=False):
-                        with gr.Column(
-                            scale=7, elem_classes=["paper-panel", "video-paper"]
-                        ):
+                        with gr.Column(scale=7, elem_classes=["paper-panel", "video-paper"]):
                             gr.HTML('<div class="panel-label">最终成片</div>')
                             video = gr.Video(
                                 show_label=False,
@@ -945,9 +1339,7 @@ footer{display:none!important}
                                 </div>
                                 """
                             )
-                        with gr.Column(
-                            scale=3, elem_classes=["side-panel", "video-controls"]
-                        ):
+                        with gr.Column(scale=3, elem_classes=["side-panel", "video-controls"]):
                             gr.HTML(
                                 """
                                 <div class="panel-label">生成设置</div>
@@ -956,9 +1348,7 @@ footer{display:none!important}
                                 全部完成后自动合成为一条成片。</div>
                                 """
                             )
-                            cost_confirmed = gr.Checkbox(
-                                label="我确认下一步会调用付费视频 API"
-                            )
+                            cost_confirmed = gr.Checkbox(label="我确认下一步会调用付费视频 API")
                             render = gr.Button(
                                 "生成真实视频",
                                 variant="primary",
@@ -1072,25 +1462,102 @@ footer{display:none!important}
         make_storyboard.click(
             storyboard_and_open,
             [session_state],
-            [session_state, storyboard, shot_choice, status, workflow],
+            [
+                session_state,
+                storyboard,
+                shot_choice,
+                status,
+                visual_inputs,
+                visual_binding,
+                visual_delete,
+                cost_confirmed,
+                workflow,
+            ],
             api_name="build_storyboard",
         )
         retake.click(
-            retake_shot_view,
+            retake_and_reset,
             [session_state, shot_choice, retake_feedback],
-            [session_state, storyboard, retake_feedback, status],
+            [
+                session_state,
+                storyboard,
+                retake_feedback,
+                status,
+                visual_inputs,
+                visual_binding,
+                visual_delete,
+                cost_confirmed,
+            ],
             api_name="retake_shot",
+        )
+        add_visual.click(
+            add_visual_reference_view,
+            [
+                session_state,
+                visual_upload,
+                visual_usage,
+                visual_binding,
+                visual_summary,
+            ],
+            [
+                session_state,
+                storyboard,
+                visual_inputs,
+                visual_binding,
+                visual_delete,
+                visual_upload,
+                visual_summary,
+                status,
+                cost_confirmed,
+            ],
+            api_name="add_visual_reference",
+        )
+        remove_visual.click(
+            remove_visual_reference_view,
+            [session_state, visual_delete],
+            [
+                session_state,
+                storyboard,
+                visual_inputs,
+                visual_binding,
+                visual_delete,
+                status,
+                cost_confirmed,
+            ],
+            api_name="remove_visual_reference",
+        )
+        confirm_visual.click(
+            confirm_visual_inputs_view,
+            [session_state],
+            [
+                session_state,
+                storyboard,
+                visual_inputs,
+                visual_binding,
+                visual_delete,
+                status,
+                cost_confirmed,
+            ],
+            api_name="confirm_visual_inputs",
         )
         confirm_storyboard.click(
             confirm_storyboard_and_open,
             [session_state],
-            [session_state, status, workflow],
+            [
+                session_state,
+                storyboard,
+                visual_inputs,
+                visual_delete,
+                status,
+                cost_confirmed,
+                workflow,
+            ],
             api_name="confirm_storyboard",
         )
         render.click(
             render_video_with_progress,
             [session_state, cost_confirmed],
-            [session_state, video, status],
+            [session_state, video, status, cost_confirmed],
             show_progress="hidden",
             api_name="render_video",
         )
@@ -1138,10 +1605,7 @@ def _text_status(session: GuidedStorySession, success_message: str) -> str:
             f"{success_message}原因：{reason}。请检查当前项目的 .env 后重试。"
         )
     if isinstance(session.agent, OpenAIStoryAgent):
-        return (
-            f"✓ {success_message}本次使用真实文本模型"
-            f"（{_provider_label(session.agent)}）。"
-        )
+        return f"✓ {success_message}本次使用真实文本模型（{_provider_label(session.agent)}）。"
     return f"离线演示模式：{success_message}"
 
 
@@ -1151,6 +1615,152 @@ def _element_update(palette: ElementPalette, kind: str):
         choices=[(f"{item.title}｜{item.content}", item.option_id) for item in options],
         value=None,
     )
+
+
+def _shot_choices_update(plan):
+    choices = (
+        [(f"镜头 {shot.shot_id}｜{shot.shot_purpose}", str(shot.shot_id)) for shot in plan.shots]
+        if plan
+        else []
+    )
+    return _gr_update(
+        choices=choices,
+        value=choices[0][1] if choices else None,
+    )
+
+
+def _visual_binding_choices_update(plan):
+    choices: list[tuple[str, str]] = []
+    if plan is not None:
+        choices.extend(
+            (
+                f"资产｜{asset.name}（{asset.kind}）",
+                f"asset|{asset.asset_id}",
+            )
+            for asset in plan.visual_bible.assets
+        )
+        choices.extend(
+            (
+                f"镜头 {shot.shot_id}｜{shot.shot_purpose}",
+                f"shot|{shot.shot_id}",
+            )
+            for shot in plan.shots
+        )
+    return _gr_update(
+        choices=choices,
+        value=choices[0][1] if choices else None,
+    )
+
+
+def _visual_reference_choices_update(plan):
+    choices: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if plan is not None:
+        for label, reference in _bound_visual_references(plan):
+            if reference.reference_id in seen:
+                continue
+            seen.add(reference.reference_id)
+            status = "已确认" if reference.confirmed else "待确认"
+            choices.append(
+                (
+                    f"{label}｜{reference.usage}｜{status}｜{Path(reference.path).name}",
+                    reference.reference_id,
+                )
+            )
+    return _gr_update(
+        choices=choices,
+        value=choices[0][1] if choices else None,
+    )
+
+
+def _visual_inputs_markdown(plan) -> str:
+    if plan is None:
+        return "*生成分镜后，可在这里上传并绑定参考图。*"
+    rows = []
+    for label, reference in _bound_visual_references(plan):
+        status = "✓ 已确认" if reference.confirmed else "○ 待确认"
+        rows.append(
+            f"| {reference.reference_id} | {label} | {reference.usage} | "
+            f"{status} | {Path(reference.path).name} |"
+        )
+    if not rows:
+        return (
+            "#### 参考图绑定\n\n"
+            "尚未上传参考图。人物定妆图、地点图和道具图不会自动变成视频首帧；"
+            "`start_frame` 必须明确绑定到具体镜头。"
+        )
+    return "\n".join(
+        [
+            "#### 参考图绑定",
+            "",
+            "| ID | 绑定对象 | 用途 | 状态 | 文件 |",
+            "|---|---|---|---|---|",
+            *rows,
+        ]
+    )
+
+
+def _bound_visual_references(plan):
+    for asset in plan.visual_bible.assets:
+        for reference in asset.references:
+            yield f"资产 {asset.asset_id}", reference
+    for shot in plan.shots:
+        for reference in shot.confirmed_visual_inputs:
+            if reference.binding_kind == "asset":
+                continue
+            yield f"镜头 {shot.shot_id}", reference
+
+
+def _uploaded_image_path(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, Path)):
+        return str(value)
+    if isinstance(value, dict):
+        return str(value.get("path") or value.get("name") or "")
+    return str(getattr(value, "path", "") or getattr(value, "name", "") or "")
+
+
+def _parse_visual_binding(value: str | None) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    if "|" not in raw:
+        raise ValueError("请明确选择要绑定的镜头或视觉资产。")
+    kind, binding_id = raw.split("|", 1)
+    if kind not in {"asset", "shot"} or not binding_id:
+        raise ValueError("参考图绑定目标无效。")
+    return kind, binding_id
+
+
+def _persist_visual_upload(source_path: str | Path) -> Path:
+    source = Path(source_path).expanduser().resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise ValueError("上传的参考图不存在或为空。")
+    suffix = source.suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise ValueError(f"不支持的图片类型：{suffix or '无扩展名'}")
+    digest = sha256()
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    root = (
+        Path(os.getenv("VISUAL_INPUT_DIR", "outputs/visual_inputs"))
+        .expanduser()
+        .resolve()
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    target = (root / f"{digest.hexdigest()[:24]}{suffix}").resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("视觉输入目录配置无效。") from exc
+    if not target.is_file():
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return target
 
 
 def _gr_update(**kwargs):
@@ -1163,12 +1773,8 @@ def _gr_update(**kwargs):
 
 
 def _story_markdown(story) -> str:
-    characters = "；".join(
-        f"**{item.name}**：{item.description}" for item in story.characters
-    )
-    locations = "；".join(
-        f"**{item.name}**：{item.description}" for item in story.locations
-    )
+    characters = "；".join(f"**{item.name}**：{item.description}" for item in story.characters)
+    locations = "；".join(f"**{item.name}**：{item.description}" for item in story.locations)
     return (
         f"### 《{story.title}》 · 故事第{story.version}版\n\n"
         f"*{story.logline}*\n\n"
@@ -1214,7 +1820,8 @@ def _storyboard_markdown(plan) -> str:
         return ""
     bible = plan.visual_bible
     assets = "；".join(
-        f"`{item.asset_id}` {item.name}（{item.kind}）"
+        f"`{item.asset_id}` {item.name}（{item.kind}，"
+        f"{len(item.reference_images) + len(item.references)} 张固定参考图）"
         for item in bible.assets
     )
     sections = [
@@ -1230,12 +1837,69 @@ def _storyboard_markdown(plan) -> str:
         sections.append(
             f"#### 镜头 {shot.shot_id}｜{shot.duration}秒｜{shot.shot_kind}｜{shot.camera}\n"
             f"**存在理由：** {shot.shot_purpose}  \n"
+            f"**时长分配：** 最终 {shot.duration} 秒；估算 "
+            f"{shot.estimated_duration:.1f} 秒；权重 {shot.duration_weight:.2f}  \n"
+            f"**时长理由：** {shot.duration_reason or '旧会话未记录'}  \n"
+            f"**Seed：** {shot.seed if shot.seed is not None else '旧会话未分配'}  \n"
             f"**首帧：** {shot.first_frame_prompt}  \n"
             f"**动作：** {shot.motion_prompt}  \n"
             f"**结束帧：** {shot.end_frame_prompt}  \n"
-            f"**引用资产：** {'、'.join(shot.reference_asset_ids) or '暂无'}"
+            f"**连续性模式：** {shot.continuity_mode}  \n"
+            f"**引用资产：** {'、'.join(shot.reference_asset_ids) or '暂无'}  \n"
+            f"**已解析固定图：** "
+            f"{'、'.join(shot.reference_image_paths) or '渲染时从视觉圣经解析'}  \n"
+            f"**参考图用途：** {_visual_input_summary(shot)}  \n"
+            f"**起始参考：** {_shot_start_reference(shot)}"
         )
     return "\n\n".join(sections)
+
+
+def _shot_start_reference(shot) -> str:
+    explicit = next(
+        (
+            item
+            for item in shot.confirmed_visual_inputs
+            if item.confirmed and item.usage == "start_frame"
+        ),
+        None,
+    )
+    if explicit is not None:
+        return f"已确认 start_frame：{explicit.reference_id}"
+    if shot.initial_frame_path:
+        return shot.initial_frame_path
+    if shot.continuity_mode == "same_scene_chain" and shot.previous_shot_id is not None:
+        return f"镜头 {shot.previous_shot_id} 的生成末帧"
+    if shot.continuity_mode == "new_scene_reference":
+        return "本场景已确认固定参考图；若缺失会明确提示或标记无参考回退"
+    return "独立镜头，不继承上一镜头"
+
+
+def _visual_input_summary(shot) -> str:
+    if not shot.confirmed_visual_inputs:
+        return "暂无已确认视觉输入"
+    return "；".join(
+        f"{item.reference_id}={item.usage}"
+        for item in shot.confirmed_visual_inputs
+    )
+
+
+def _render_evidence_summary(manifest) -> str:
+    parts = [
+        f"重新生成 {len(manifest.generated_shots)}",
+        f"复用 {len(manifest.reused_shots)}",
+        f"依赖失败 {len(manifest.dependency_failed_shots)}",
+        f"无参考回退 {len(manifest.unreferenced_fallback_shots)}",
+    ]
+    if manifest.final_video_path:
+        parts.append("成片 1")
+    diagnostics = []
+    for artifact in manifest.artifacts:
+        for message in artifact.continuity_diagnostics:
+            if message not in diagnostics:
+                diagnostics.append(message)
+    if diagnostics:
+        parts.append("连续性提示：" + "；".join(diagnostics[:3]))
+    return "；".join(parts)
 
 
 def _progress_text(fraction: float, message: str) -> str:

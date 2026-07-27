@@ -316,6 +316,20 @@ class StoryScript:
 
 
 @dataclass(slots=True)
+class VisualReference:
+    """One confirmed image and its explicit, provider-independent purpose."""
+
+    reference_id: str
+    path: str
+    usage: str
+    content_digest: str = ""
+    content_summary: str = ""
+    confirmed: bool = False
+    binding_kind: str = ""
+    binding_id: str = ""
+
+
+@dataclass(slots=True)
 class VisualAsset:
     """A planned identity anchor that can later receive one or more reference images."""
 
@@ -324,6 +338,7 @@ class VisualAsset:
     name: str
     description: str
     reference_images: list[str] = field(default_factory=list)
+    references: list[VisualReference] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -336,6 +351,35 @@ class VisualBible:
     camera_language: str = "镜头服务于动作和情绪，不为变化而变化"
     assets: list[VisualAsset] = field(default_factory=list)
     continuity_rules: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ContinuityState:
+    """Structured visual and narrative state at one side of a shot boundary."""
+
+    character_appearance: dict[str, str] = field(default_factory=dict)
+    character_clothing: dict[str, str] = field(default_factory=dict)
+    character_positions: dict[str, str] = field(default_factory=dict)
+    character_emotions: dict[str, str] = field(default_factory=dict)
+    character_knowledge: dict[str, list[str]] = field(default_factory=dict)
+    character_injuries: dict[str, str] = field(default_factory=dict)
+    character_held_props: dict[str, list[str]] = field(default_factory=dict)
+    prop_positions: dict[str, str] = field(default_factory=dict)
+    location: str = ""
+    time_of_day: str = ""
+    weather: str = ""
+    key_light_direction: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """Visual-input features that a concrete provider adapter can actually use."""
+
+    supports_text_to_video: bool = True
+    supports_image_to_video: bool = False
+    supports_reference_images: bool = False
+    supports_seed: bool = False
+    requires_public_image_url: bool = False
 
 
 @dataclass(slots=True)
@@ -362,10 +406,27 @@ class StoryboardShot:
     end_frame: str = ""
     visual_anchors: list[str] = field(default_factory=list)
     shot_kind: str = "action"
+    duration_reason: str = ""
+    duration_weight: float = 0.0
+    estimated_duration: float = 0.0
     first_frame_prompt: str = ""
     motion_prompt: str = ""
     end_frame_prompt: str = ""
     reference_asset_ids: list[str] = field(default_factory=list)
+    confirmed_visual_inputs: list[VisualReference] = field(default_factory=list)
+    reference_image_paths: list[str] = field(default_factory=list)
+    initial_frame_source_path: str = ""
+    initial_frame_path: str = ""
+    initial_frame_url: str = ""
+    previous_shot_id: int | None = None
+    continuity_mode: str = "independent"
+    continuity_state: dict[str, Any] = field(default_factory=dict)
+    continuity_start_state: ContinuityState = field(default_factory=ContinuityState)
+    continuity_end_state: ContinuityState = field(default_factory=ContinuityState)
+    continuity_diagnostics: list[str] = field(default_factory=list)
+    seed: int | None = None
+    generated_first_frame_path: str = ""
+    generated_last_frame_path: str = ""
 
 
 @dataclass(slots=True)
@@ -383,6 +444,21 @@ class VideoArtifact:
     request_id: str | None = None
     attempt: int = 1
     error_message: str = ""
+    reference_image_paths: list[str] = field(default_factory=list)
+    confirmed_visual_inputs: list[VisualReference] = field(default_factory=list)
+    initial_frame_source_path: str = ""
+    initial_frame_path: str = ""
+    initial_frame_url: str = ""
+    previous_shot_id: int | None = None
+    continuity_mode: str = "independent"
+    input_fingerprint: str = ""
+    seed: int | None = None
+    generated_first_frame_path: str = ""
+    generated_last_frame_path: str = ""
+    published_last_frame_path: str = ""
+    published_last_frame_url: str = ""
+    continuity_diagnostics: list[str] = field(default_factory=list)
+    used_unreferenced_fallback: bool = False
 
 
 @dataclass(slots=True)
@@ -392,6 +468,7 @@ class StoryboardPlan:
     shots: list[StoryboardShot]
     narration_text: str
     visual_bible: VisualBible = field(default_factory=VisualBible)
+    base_seed: int = 0
     confirmed: bool = False
     audio_path: str = ""
     subtitle_path: str = ""
@@ -406,9 +483,12 @@ class StoryboardPlan:
 class RenderManifest:
     status: str
     output_dir: str
+    render_run_id: str = ""
     generated_shots: list[int] = field(default_factory=list)
     reused_shots: list[int] = field(default_factory=list)
     failed_shots: list[int] = field(default_factory=list)
+    dependency_failed_shots: list[int] = field(default_factory=list)
+    unreferenced_fallback_shots: list[int] = field(default_factory=list)
     artifacts: list[VideoArtifact] = field(default_factory=list)
     final_video_path: str = ""
     audio_path: str = ""

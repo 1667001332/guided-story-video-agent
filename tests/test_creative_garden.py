@@ -248,6 +248,17 @@ class CreativeGardenIntegrationTests(unittest.TestCase):
                     require_live_text=True,
                 )
 
+    def test_offline_selfplay_is_labeled_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_selfplay(
+                agent=RuleBasedStoryAgent(),
+                target_seconds=30,
+                output_dir=temp_dir,
+            )
+
+        self.assertEqual("offline", result["bench"]["text_api_mode"])
+        self.assertEqual("RuleBasedStoryAgent", result["bench"]["text_provider"])
+
     def test_unconfigured_openai_agent_falls_back_without_recursion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             result = run_selfplay(
