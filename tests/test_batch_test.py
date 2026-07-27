@@ -566,7 +566,7 @@ class BatchTestTests(unittest.TestCase):
             with patch(
                 "guided_story_agent.batch_test._pipeline_fingerprint",
                 return_value={
-                    "package_version": "0.5.1",
+                    "package_version": "0.6.0",
                     "content_sha256": "old",
                 },
             ):
@@ -580,7 +580,7 @@ class BatchTestTests(unittest.TestCase):
             with patch(
                 "guided_story_agent.batch_test._pipeline_fingerprint",
                 return_value={
-                    "package_version": "0.5.1",
+                    "package_version": "0.6.0",
                     "content_sha256": "new",
                 },
             ):
