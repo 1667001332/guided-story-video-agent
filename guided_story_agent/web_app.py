@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import warnings
 from collections.abc import Callable, Iterator
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from queue import Empty, Queue
@@ -24,6 +26,103 @@ VISUAL_USAGE_CHOICES = [
     ("场景气氛参考", "scene_reference"),
     ("视频首帧", "start_frame"),
 ]
+
+
+def _web_session_path(path: str | Path | None = None) -> Path:
+    return (
+        Path(path or os.getenv("WEB_SESSION_PATH", "outputs/web/latest_session.json"))
+        .expanduser()
+        .resolve()
+    )
+
+
+def _autosave_web_session(
+    session: GuidedStorySession | None,
+    path: str | Path | None = None,
+) -> None:
+    if session is None or session.render_in_progress:
+        return
+    try:
+        session.save(_web_session_path(path))
+    except Exception as exc:
+        warnings.warn(f"网页会话自动保存失败：{exc}", RuntimeWarning, stacklevel=2)
+
+
+def _autosaving_view(callback):
+    @wraps(callback)
+    def wrapped(*args, **kwargs):
+        result = callback(*args, **kwargs)
+        if isinstance(result, tuple) and result:
+            _autosave_web_session(result[0])
+        return result
+
+    return wrapped
+
+
+def _autosaving_progress(callback):
+    @wraps(callback)
+    def wrapped(*args, **kwargs):
+        for result in callback(*args, **kwargs):
+            if isinstance(result, tuple) and result:
+                _autosave_web_session(result[0])
+            yield result
+
+    return wrapped
+
+
+def restore_saved_session_view(
+    *,
+    agent: StoryAgent | None = None,
+    path: str | Path | None = None,
+) -> tuple[Any, ...]:
+    source = _web_session_path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"还没有可恢复的网页会话：{source}")
+    session = GuidedStorySession.load(source, agent=agent or RuleBasedStoryAgent())
+    plan = session.storyboard
+    palette_updates = [
+        _restored_element_update(session, kind)
+        for kind in ("character", "conflict", "turning_point", "ending")
+    ]
+    final_video = (
+        session.render_manifest.final_video_path
+        if session.render_manifest
+        and session.render_manifest.final_video_path
+        and Path(session.render_manifest.final_video_path).is_file()
+        else None
+    )
+    target_seconds = (
+        session.brief.target_seconds
+        or session.brief.resolved_target_seconds
+        or session.effective_target_seconds
+    )
+    return (
+        session,
+        session.direction,
+        session.brief.duration_mode,
+        _gr_update(
+            value=target_seconds,
+            visible=session.brief.duration_mode == "custom",
+        ),
+        _card_grid_update(session),
+        _selection_text(session),
+        list(session.chat_history),
+        *palette_updates,
+        _story_markdown(session.story) if session.story else "",
+        _ai_fill_markdown(session.story) if session.story else "",
+        _script_markdown(session.script) if session.script else "",
+        _storyboard_markdown(plan),
+        _shot_choices_update(plan),
+        _visual_inputs_markdown(plan),
+        _visual_binding_choices_update(plan),
+        _visual_reference_choices_update(plan),
+        final_video,
+        f"已从 {source} 恢复到“{_stage_tab(session.stage)}”阶段。",
+        _gr_update(value=False),
+        _gr_update(selected=_stage_tab(session.stage)),
+        _uncertain_shot_choices_update(plan),
+        "",
+    )
 
 
 def card_grid_payload(session: GuidedStorySession | None) -> dict[str, Any]:
@@ -647,6 +746,43 @@ def confirm_storyboard_view(
         return session, str(exc)
 
 
+def resolve_submission_uncertainty_view(
+    session: GuidedStorySession | None,
+    shot_id: str | int | None,
+    provider_request_id: str,
+    *,
+    accepted_by_provider: bool,
+) -> tuple[GuidedStorySession | None, Any, str, str]:
+    if session is None or shot_id in (None, ""):
+        return session, _uncertain_shot_choices_update(None), provider_request_id, (
+            "请先选择一条提交结果不确定的镜头记录。"
+        )
+    try:
+        artifact = session.resolve_submission_uncertainty(
+            int(shot_id),
+            accepted_by_provider=accepted_by_provider,
+            provider_request_id=provider_request_id,
+        )
+        if accepted_by_provider:
+            message = (
+                f"镜头 {artifact.shot_id} 已登记 Provider 任务 ID "
+                f"{artifact.request_id}；再次生成时只会继续查询。"
+            )
+        else:
+            message = (
+                f"镜头 {artifact.shot_id} 已确认为 Provider 未受理；"
+                "再次生成时允许重新提交。"
+            )
+        return session, _uncertain_shot_choices_update(session.storyboard), "", message
+    except Exception as exc:
+        return (
+            session,
+            _uncertain_shot_choices_update(session.storyboard),
+            provider_request_id,
+            str(exc),
+        )
+
+
 def render_video_with_progress(
     session: GuidedStorySession | None,
     cost_confirmed: bool = False,
@@ -797,6 +933,13 @@ def build_app(agent_factory: Callable[[], StoryAgent] | None = None):
 
     start.__name__ = "start_garden_view"
 
+    def restore():
+        return restore_saved_session_view(
+            agent=(agent_factory() if agent_factory else RuleBasedStoryAgent()),
+        )
+
+    restore.__name__ = "restore_saved_session_view"
+
     def toggle_custom_duration(duration_mode):
         return _gr_update(visible=duration_mode == "custom")
 
@@ -856,6 +999,51 @@ def build_app(agent_factory: Callable[[], StoryAgent] | None = None):
         return (*back_to_ideas_view(session), _gr_update(selected="ideas"))
 
     back_and_open.__name__ = "back_to_ideas_view"
+
+    def accept_uncertain(session, shot_id, request_id):
+        return resolve_submission_uncertainty_view(
+            session,
+            shot_id,
+            request_id,
+            accepted_by_provider=True,
+        )
+
+    def reject_uncertain(session, shot_id, request_id):
+        return resolve_submission_uncertainty_view(
+            session,
+            shot_id,
+            request_id,
+            accepted_by_provider=False,
+        )
+
+    def uncertain_choices(session):
+        return _uncertain_shot_choices_update(
+            session.storyboard if session is not None else None
+        )
+
+    start_saved = _autosaving_view(start)
+    select_cards_saved = _autosaving_view(select_cards_view)
+    refresh_saved = _autosaving_view(refresh_ideas_view)
+    more_like_saved = _autosaving_view(more_like_view)
+    mix_saved = _autosaving_view(mix_selected_view)
+    auto_saved = _autosaving_view(auto_choose_view)
+    chat_saved = _autosaving_view(chat_ideation_view)
+    expand_saved = _autosaving_view(expand_elements_view)
+    choose_elements_saved = _autosaving_view(choose_elements_view)
+    story_saved = _autosaving_view(story_and_open)
+    revise_story_saved = _autosaving_view(revise_story_view)
+    back_saved = _autosaving_view(back_and_open)
+    script_saved = _autosaving_view(script_and_open)
+    revise_script_saved = _autosaving_view(revise_script_view)
+    storyboard_saved = _autosaving_view(storyboard_and_open)
+    retake_saved = _autosaving_view(retake_and_reset)
+    add_visual_saved = _autosaving_view(add_visual_reference_view)
+    remove_visual_saved = _autosaving_view(remove_visual_reference_view)
+    confirm_visual_saved = _autosaving_view(confirm_visual_inputs_view)
+    confirm_storyboard_saved = _autosaving_view(confirm_storyboard_and_open)
+    accept_uncertain_saved = _autosaving_view(accept_uncertain)
+    reject_uncertain_saved = _autosaving_view(reject_uncertain)
+    render_saved = _autosaving_progress(render_video_with_progress)
 
     studio_css = """
 :root{
@@ -1101,6 +1289,11 @@ footer{display:none!important}
                                         scale=2,
                                         elem_classes=["primary-action"],
                                     )
+                                restore_session = gr.Button(
+                                    "恢复上次自动保存的会话",
+                                    size="sm",
+                                    elem_classes=["quiet-action"],
+                                )
                             gr.HTML('<div class="panel-label">灵感画廊 · 最多保留 3 个</div>')
                             card_grid = IdeaCardGrid(show_label=False)
                             selection = gr.Markdown(
@@ -1354,113 +1547,167 @@ footer{display:none!important}
                                 variant="primary",
                                 elem_classes=["primary-action"],
                             )
+                            with gr.Accordion("处理提交结果不确定的任务", open=False):
+                                gr.Markdown(
+                                    "只在 Provider 后台核对后操作。"
+                                    "确认已受理必须填写后台真实任务 ID；"
+                                    "确认未受理后，系统才允许重新提交。"
+                                )
+                                uncertain_shot = gr.Dropdown(
+                                    label="待核对镜头",
+                                    choices=[],
+                                )
+                                provider_request_id = gr.Textbox(
+                                    label="Provider 后台任务 ID",
+                                    placeholder="确认已受理时必填",
+                                )
+                                accepted_uncertain = gr.Button(
+                                    "后台确认已受理",
+                                    elem_classes=["quiet-action"],
+                                )
+                                rejected_uncertain = gr.Button(
+                                    "后台确认未受理",
+                                    elem_classes=["quiet-action"],
+                                )
             status = gr.Markdown(
                 "写下一句话，我们从寻找故事开始。",
                 elem_id="studio-status",
             )
 
         base_outputs = [session_state, card_grid, selection, chat, status]
+        restore_outputs = [
+            session_state,
+            direction,
+            duration_mode,
+            target_seconds,
+            card_grid,
+            selection,
+            chat,
+            character,
+            conflict,
+            turning,
+            ending,
+            story,
+            ai_fill,
+            script,
+            storyboard,
+            shot_choice,
+            visual_inputs,
+            visual_binding,
+            visual_delete,
+            video,
+            status,
+            cost_confirmed,
+            workflow,
+            uncertain_shot,
+            provider_request_id,
+        ]
         duration_mode.change(
             toggle_custom_duration,
             [duration_mode],
             [target_seconds],
         )
+        restore_session.click(
+            restore,
+            outputs=restore_outputs,
+            api_name="restore_session",
+        )
         begin.click(
-            start,
+            start_saved,
             [direction, duration_mode, target_seconds],
             base_outputs,
             api_name="start_ideation",
         )
         direction.submit(
-            start,
+            start_saved,
             [direction, duration_mode, target_seconds],
             base_outputs,
         )
         card_grid.input(
-            select_cards_view,
+            select_cards_saved,
             [session_state, card_grid],
             [session_state, card_grid, selection, status],
             api_name="select_ideas",
         )
         refresh.click(
-            refresh_ideas_view,
+            refresh_saved,
             [session_state],
             [session_state, card_grid, selection, status],
             api_name="refresh_ideas",
         )
         more_like.click(
-            more_like_view,
+            more_like_saved,
             [session_state],
             [session_state, card_grid, selection, status],
             api_name="more_like",
         )
         mix.click(
-            mix_selected_view,
+            mix_saved,
             [session_state],
             [session_state, card_grid, selection, status],
             api_name="mix_selected",
         )
         auto.click(
-            auto_choose_view,
+            auto_saved,
             [session_state],
             [session_state, card_grid, selection, status],
             api_name="auto_choose",
         )
         chat_send.click(
-            chat_ideation_view,
+            chat_saved,
             [session_state, chat_input, chat],
             [session_state, card_grid, chat, chat_input, status],
             api_name="chat_ideation",
         )
         chat_input.submit(
-            chat_ideation_view,
+            chat_saved,
             [session_state, chat_input, chat],
             [session_state, card_grid, chat, chat_input, status],
         )
         expand.click(
-            expand_elements_view,
+            expand_saved,
             [session_state],
             [session_state, character, conflict, turning, ending, status],
             api_name="expand_selected",
         )
         keep_elements.click(
-            choose_elements_view,
+            choose_elements_saved,
             [session_state, character, conflict, turning, ending],
             [session_state, selection, status],
             api_name="choose_elements",
         )
         make_story.click(
-            story_and_open,
+            story_saved,
             [session_state],
             [session_state, story, ai_fill, status, workflow],
             api_name="generate_story",
         )
         rewrite_story.click(
-            revise_story_view,
+            revise_story_saved,
             [session_state, story_feedback],
             [session_state, story, ai_fill, story_feedback, status],
             api_name="revise_story",
         )
         back.click(
-            back_and_open,
+            back_saved,
             [session_state],
             [session_state, card_grid, status, workflow],
             api_name="back_to_ideas",
         )
         make_script.click(
-            script_and_open,
+            script_saved,
             [session_state],
             [session_state, script, status, workflow],
             api_name="generate_script",
         )
         rewrite_script.click(
-            revise_script_view,
+            revise_script_saved,
             [session_state, script_feedback],
             [session_state, script, script_feedback, status],
             api_name="revise_script",
         )
         make_storyboard.click(
-            storyboard_and_open,
+            storyboard_saved,
             [session_state],
             [
                 session_state,
@@ -1476,7 +1723,7 @@ footer{display:none!important}
             api_name="build_storyboard",
         )
         retake.click(
-            retake_and_reset,
+            retake_saved,
             [session_state, shot_choice, retake_feedback],
             [
                 session_state,
@@ -1491,7 +1738,7 @@ footer{display:none!important}
             api_name="retake_shot",
         )
         add_visual.click(
-            add_visual_reference_view,
+            add_visual_saved,
             [
                 session_state,
                 visual_upload,
@@ -1513,7 +1760,7 @@ footer{display:none!important}
             api_name="add_visual_reference",
         )
         remove_visual.click(
-            remove_visual_reference_view,
+            remove_visual_saved,
             [session_state, visual_delete],
             [
                 session_state,
@@ -1527,7 +1774,7 @@ footer{display:none!important}
             api_name="remove_visual_reference",
         )
         confirm_visual.click(
-            confirm_visual_inputs_view,
+            confirm_visual_saved,
             [session_state],
             [
                 session_state,
@@ -1541,7 +1788,7 @@ footer{display:none!important}
             api_name="confirm_visual_inputs",
         )
         confirm_storyboard.click(
-            confirm_storyboard_and_open,
+            confirm_storyboard_saved,
             [session_state],
             [
                 session_state,
@@ -1554,12 +1801,29 @@ footer{display:none!important}
             ],
             api_name="confirm_storyboard",
         )
-        render.click(
-            render_video_with_progress,
+        render_event = render.click(
+            render_saved,
             [session_state, cost_confirmed],
             [session_state, video, status, cost_confirmed],
             show_progress="hidden",
             api_name="render_video",
+        )
+        render_event.then(
+            uncertain_choices,
+            [session_state],
+            [uncertain_shot],
+        )
+        accepted_uncertain.click(
+            accept_uncertain_saved,
+            [session_state, uncertain_shot, provider_request_id],
+            [session_state, uncertain_shot, provider_request_id, status],
+            api_name="accept_uncertain_submission",
+        )
+        rejected_uncertain.click(
+            reject_uncertain_saved,
+            [session_state, uncertain_shot, provider_request_id],
+            [session_state, uncertain_shot, provider_request_id, status],
+            api_name="reject_uncertain_submission",
         )
     return app
 
@@ -1617,12 +1881,55 @@ def _element_update(palette: ElementPalette, kind: str):
     )
 
 
+def _restored_element_update(session: GuidedStorySession, kind: str):
+    palette = session.element_palette
+    if palette is None:
+        return _gr_update(choices=[], value=None)
+    options = palette.options.get(kind, [])
+    selected = session.selected_elements.get(kind)
+    return _gr_update(
+        choices=[(f"{item.title}｜{item.content}", item.option_id) for item in options],
+        value=selected if any(item.option_id == selected for item in options) else None,
+    )
+
+
+def _stage_tab(stage: Stage) -> str:
+    if stage == Stage.STORY_REVIEW:
+        return "story"
+    if stage == Stage.SCRIPT_REVIEW:
+        return "script"
+    if stage == Stage.STORYBOARD_REVIEW:
+        return "storyboard"
+    if stage in {Stage.RENDER_READY, Stage.COMPLETED}:
+        return "video"
+    return "ideas"
+
+
 def _shot_choices_update(plan):
     choices = (
         [(f"镜头 {shot.shot_id}｜{shot.shot_purpose}", str(shot.shot_id)) for shot in plan.shots]
         if plan
         else []
     )
+    return _gr_update(
+        choices=choices,
+        value=choices[0][1] if choices else None,
+    )
+
+
+def _uncertain_shot_choices_update(plan):
+    latest: dict[int, Any] = {}
+    if plan is not None:
+        for artifact in plan.artifacts:
+            if artifact.status == "submission_uncertain":
+                latest[artifact.shot_id] = artifact
+    choices = [
+        (
+            f"镜头 {shot_id}｜本地操作 ID：{artifact.request_id or '未知'}",
+            str(shot_id),
+        )
+        for shot_id, artifact in sorted(latest.items())
+    ]
     return _gr_update(
         choices=choices,
         value=choices[0][1] if choices else None,

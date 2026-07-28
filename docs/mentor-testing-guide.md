@@ -63,9 +63,12 @@ VIDEO_PROVIDER=agnes
 VIDEO_API_KEY=测试者自己的Key
 VIDEO_API_ROOT=https://apihub.agnes-ai.com
 VIDEO_MODEL=agnes-video-v2.0
+VIDEO_NETWORK_RETRIES=2
+VIDEO_RETRY_BACKOFF=1
 ```
 
 使用其他视频平台时不要直接填写其 Key；应先实现对应视频 Provider。
+网络重试只用于状态查询和视频下载，提交视频的 POST 永远只发送一次。
 
 Agnes 官方图生视频参数接收公网图片 URL，不接收本地文件路径。若测试者已经用
 自己的静态服务器或 CDN 公开托管某个本地目录，可同时填写
@@ -122,6 +125,8 @@ python scripts/run_batch_test.py `
 - `--retries 1 --delay-seconds 2`：失败后重试一次，并控制请求频率。
 - `--offline`：完全不请求文本 API，仅用于快速检查脚本和输出目录。
 - `--allow-fallback`：仍会优先请求真实 API，但允许失败后离线兜底，不用于严格验收。
+- `--llm-judge`：额外调用当前真实文本模型评价完整故事、剧本和分镜；不能与
+  `--offline` 同时使用。
 
 建议先做无网络、无付费的离线冒烟：
 
@@ -146,6 +151,8 @@ python scripts/run_batch_test.py `
 - `render_manifest.json` 会记录每个镜头的固定参考图、首帧、上游镜头、
   连续性模式、输入指纹、seed、生成末帧、状态和错误；汇总可区分重新生成、
   复用、依赖失败和无参考文本回退。
+- `quality_report.json` 保存确定性语义/分镜指标和可选 LLM 评审；
+  `human_review.json` 是测试者填写的 1–5 分人工评分表。
 - Resume 身份包含代码、Prompt 和本地规则内容指纹；实现发生变化后不会把旧成功
   误当成本轮结果。
 
@@ -159,4 +166,4 @@ python scripts/run_batch_test.py `
   --confirm-paid-video RENDER
 ```
 
-首次付费测试务必保持 `--max-cases 1`。`succeeded_with_warnings` 会计入成功但在汇总中单独列出警告；`pending` 不计成功，会保留已有请求信息供续试。如果提交响应超时且无法取得远端任务 ID，状态会变为 `submission_uncertain`，系统不会自动重提；应先到 Provider 后台核对，避免重复计费。不要把离线或未渲染结果目录通过 `--resume` 冒充为严格文本或视频验收结果。
+首次付费测试务必保持 `--max-cases 1`。`succeeded_with_warnings` 会计入成功但在汇总中单独列出警告；`pending` 不计成功，会保留已有请求信息供续试。如果提交响应超时或进程在取得远端任务 ID 前中断，状态会变为 `submission_uncertain`，系统不会自动重提；应先到 Provider 后台核对，再在网页中登记后台任务 ID 或确认未受理。不要把离线或未渲染结果目录通过 `--resume` 冒充为严格文本或视频验收结果。

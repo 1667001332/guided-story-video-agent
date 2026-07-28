@@ -164,6 +164,34 @@ class ProviderConfigTests(unittest.TestCase):
                 self.assertFalse(config.configured)
                 self.assertIn(name, config.error)
 
+    def test_video_network_retry_settings_are_validated(self) -> None:
+        settings = (
+            ("VIDEO_NETWORK_RETRIES", "not-an-integer"),
+            ("VIDEO_NETWORK_RETRIES", "11"),
+            ("VIDEO_RETRY_BACKOFF", "-1"),
+            ("VIDEO_RETRY_BACKOFF", "nan"),
+        )
+        for name, value in settings:
+            with (
+                self.subTest(name=name, value=value),
+                patch.dict(
+                    os.environ,
+                    {
+                        "VIDEO_API_KEY": "test-key",
+                        "VIDEO_MODEL": "test-model",
+                        name: value,
+                    },
+                    clear=True,
+                ),
+                patch("guided_story_agent.provider_config.load_dotenv"),
+            ):
+                config = VideoProviderConfig.from_env(
+                    default_api_root="https://default.example",
+                    default_model="default-video-model",
+                )
+                self.assertFalse(config.configured)
+                self.assertIn(name, config.error)
+
     def test_video_reference_mapping_requires_root_and_base_url_together(self) -> None:
         with (
             patch.dict(

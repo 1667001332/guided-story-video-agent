@@ -245,6 +245,8 @@ class AgnesVideoProvider:
         timeout: float = 120,
         poll_interval: float = 5,
         max_poll_seconds: float = 900,
+        network_retries: int = 2,
+        retry_backoff: float = 1,
         submit_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         status_fn: Callable[[str], dict[str, Any]] | None = None,
         download_fn: Callable[[str, Path], None] | None = None,
@@ -262,6 +264,8 @@ class AgnesVideoProvider:
         self.timeout = max(1.0, float(timeout))
         self.poll_interval = max(0.0, float(poll_interval))
         self.max_poll_seconds = max(1.0, float(max_poll_seconds))
+        self.network_retries = max(0, min(10, int(network_retries)))
+        self.retry_backoff = max(0.0, float(retry_backoff))
         self.config_source = config_source
         self.configuration_error = configuration_error
         self._submit_fn = submit_fn
@@ -306,6 +310,8 @@ class AgnesVideoProvider:
             timeout=config.timeout,
             poll_interval=config.poll_interval,
             max_poll_seconds=config.max_poll_seconds,
+            network_retries=config.network_retries,
+            retry_backoff=config.retry_backoff,
             image_publisher=image_publisher,
             config_source=config.source,
             configuration_error=config.error,
@@ -559,19 +565,40 @@ class AgnesVideoProvider:
                 "User-Agent": "guided-story-video-agent/0.1",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            if exc.code == 401:
-                raise VideoProviderNotConfigured("Agnes 鉴权失败，请检查 API Key。") from exc
-            raise VideoGenerationError(f"Agnes HTTP {exc.code}: {detail}") from exc
-        except (OSError, TimeoutError, json.JSONDecodeError) as exc:
-            raise VideoGenerationError(f"Agnes 请求失败：{type(exc).__name__}: {exc}") from exc
+        safe_retry = method.upper() != "POST"
+        attempts = self.network_retries + 1 if safe_retry else 1
+        result: Any = None
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                if exc.code == 401:
+                    raise VideoProviderNotConfigured(
+                        "Agnes 鉴权失败，请检查 API Key。"
+                    ) from exc
+                retryable = exc.code in {408, 425, 429, 500, 502, 503, 504}
+                if safe_retry and retryable and attempt + 1 < attempts:
+                    self._retry_wait(attempt)
+                    continue
+                raise VideoGenerationError(f"Agnes HTTP {exc.code}: {detail}") from exc
+            except (OSError, TimeoutError, json.JSONDecodeError) as exc:
+                if safe_retry and attempt + 1 < attempts:
+                    self._retry_wait(attempt)
+                    continue
+                raise VideoGenerationError(
+                    f"Agnes 请求失败：{type(exc).__name__}: {exc}"
+                ) from exc
         if not isinstance(result, dict):
             raise VideoGenerationError("Agnes 返回了无法识别的 JSON。")
         return result
+
+    def _retry_wait(self, attempt: int) -> None:
+        delay = self.retry_backoff * (2**attempt)
+        if delay:
+            self._sleep_fn(delay)
 
     @staticmethod
     def _notify(
@@ -610,17 +637,22 @@ class AgnesVideoProvider:
     def _dimensions(ratio: str) -> tuple[int, int]:
         return {"16:9": (1152, 648), "9:16": (648, 1152), "1:1": (768, 768)}.get(ratio, (1152, 648))
 
-    @staticmethod
-    def _download_file(url: str, target: Path) -> None:
+    def _download_file(self, url: str, target: Path) -> None:
         temporary = target.with_suffix(".mp4.part")
         request = urllib.request.Request(
             url, headers={"User-Agent": "guided-story-video-agent/0.1"}
         )
-        try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                with temporary.open("wb") as handle:
-                    shutil.copyfileobj(response, handle)
-            temporary.replace(target)
-        except Exception as exc:
-            temporary.unlink(missing_ok=True)
-            raise VideoGenerationError(f"MP4 下载失败：{exc}") from exc
+        attempts = self.network_retries + 1
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    with temporary.open("wb") as handle:
+                        shutil.copyfileobj(response, handle)
+                temporary.replace(target)
+                return
+            except Exception as exc:
+                temporary.unlink(missing_ok=True)
+                if attempt + 1 < attempts:
+                    self._retry_wait(attempt)
+                    continue
+                raise VideoGenerationError(f"MP4 下载失败：{exc}") from exc

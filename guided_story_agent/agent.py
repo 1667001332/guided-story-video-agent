@@ -25,7 +25,6 @@ from .models import (
     to_plain_data,
 )
 from .provider_config import TextProviderConfig
-from .storyboard import fit_scenes_to_duration
 from .timing import allocate_durations
 
 
@@ -34,6 +33,10 @@ ELEMENT_KINDS = ("character", "conflict", "turning_point", "ending")
 MAX_PREVIOUS_CARDS = 64
 MAX_LLM_PAYLOAD_CHARS = 250_000
 MAX_LLM_RESPONSE_CHARS = 1_000_000
+
+
+def _natural_join(values: list[str], separator: str) -> str:
+    return separator.join(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
 class StoryAgent(Protocol):
@@ -64,6 +67,19 @@ class StoryAgent(Protocol):
     def revise_script(
         self, story: StoryDraft, script: StoryScript, feedback: str
     ) -> StoryScript: ...
+
+    def plan_storyboard(
+        self,
+        script: StoryScript,
+        facts: StoryFacts,
+    ) -> list[dict[str, Any]] | None: ...
+
+    def evaluate_artifacts(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        storyboard: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     def generate_draft(
         self,
@@ -330,25 +346,51 @@ class RuleBasedStoryAgent:
         selected_cards: list[IdeaCard],
         selected_elements: dict[str, ElementOption],
     ) -> StoryDraft:
-        card = (
-            selected_cards[0]
+        cards = (
+            list(selected_cards)
             if selected_cards
-            else self.generate_ideas(direction, round_number=1).cards[0]
+            else [self.generate_ideas(direction, round_number=1).cards[0]]
         )
+        card = cards[0]
         chosen = {kind: item.content for kind, item in selected_elements.items()}
         protagonist = chosen.get("character", card.protagonist)
-        conflict = chosen.get("conflict", card.central_conflict)
-        turning = chosen.get("turning_point", f"真正的线索藏在“{card.hook}”背后")
-        ending = chosen.get("ending", card.ending_direction)
+        card_protagonists = list(
+            dict.fromkeys(
+                [protagonist, *(item.protagonist for item in cards[1:])]
+            )
+        )
+        conflict = chosen.get(
+            "conflict",
+            _natural_join([item.central_conflict for item in cards], "，同时必须面对"),
+        )
+        turning = chosen.get(
+            "turning_point",
+            "此前分散的异常终于连成一条线索："
+            + _natural_join([item.hook for item in cards], "；"),
+        )
+        ending = chosen.get(
+            "ending",
+            _natural_join([item.ending_direction for item in cards], "，并由此"),
+        )
+        supporting_arrival = ""
+        if len(card_protagonists) > 1:
+            supporting_arrival = (
+                f"{_natural_join(card_protagonists[1:], '、')}因各自掌握的异常线索进入事件，"
+                f"与{protagonist}形成目标一致但方法冲突的临时同盟。"
+            )
         story_text = (
             f"{direction}。{protagonist}原本只想维持平静，却在最普通的一刻发现"
-            f"{card.hook}。这个异常不是偶然，它迫使主角立即作出选择。\n\n"
-            f"主角沿着异常留下的痕迹行动，逐渐确认{conflict}。每一次接近答案，"
+            f"{card.hook}。这个异常不是偶然，它迫使{protagonist}立即作出选择。"
+            f"{supporting_arrival}\n\n"
+            f"{_natural_join(card_protagonists, '与')}沿着异常留下的痕迹行动，逐渐确认"
+            f"{conflict}。每一次接近答案，"
             "现实中的代价都会变得更具体，身边的人与原先相信的规则也开始动摇。\n\n"
-            f"当主角以为已经找到解决办法时，事情发生变化：{turning}。此前看似无关的"
-            "人物、地点和物件因此连成一条完整线索，主角也终于明白真正需要面对的并不是"
+            f"当{protagonist}以为已经找到解决办法时，事情发生变化：{turning}。"
+            "此前看似无关的人物、地点和物件因此连成一条完整线索，众人也终于明白真正"
+            "需要面对的并不是"
             "表面的危险，而是自己一直回避的选择。\n\n"
-            f"主角承担选择带来的后果，并让故事走向{ending}。开场出现过的关键意象再次出现，"
+            f"{protagonist}承担选择带来的后果，并让故事走向{ending}。"
+            "开场出现过的关键意象再次出现，"
             "但它的含义已经改变，故事在行动完成后的余波中结束。"
         )
         source_ids = [item.idea_id for item in selected_cards]
@@ -383,15 +425,16 @@ class RuleBasedStoryAgent:
             )
             ai_filled_fields.append(field)
         return StoryDraft(
-            title=card.title,
-            logline=card.logline,
+            title=" × ".join(item.title for item in cards),
+            logline=_natural_join([item.logline for item in cards], "；"),
             story_text=story_text,
             characters=[
                 StoryCharacter(
-                    name=protagonist,
-                    description=f"{protagonist}必须在压力下完成一次不可回避的选择。",
+                    name=name,
+                    description=f"{name}必须在压力下完成一次不可回避的选择。",
                     visual_identity="保持统一的脸部、发型、服装与标志性随身物件",
                 )
+                for name in card_protagonists
             ],
             locations=[
                 StoryLocation(
@@ -433,8 +476,20 @@ class RuleBasedStoryAgent:
         ]
         character_names = [item.name for item in story.characters] or ["主角"]
         scenes: list[StoryScene] = []
+        conflict_scene_index = max(2, (scene_count + 1) // 2)
         for index, duration in enumerate(durations, 1):
-            event = events[min(len(events) - 1, (index - 1) * len(events) // scene_count)]
+            event_index = (
+                0
+                if scene_count == 1
+                else round((index - 1) * (len(events) - 1) / (scene_count - 1))
+            )
+            event = events[event_index]
+            if index == conflict_scene_index and story.core_conflict.strip():
+                event = (
+                    f"{event} 人物必须面对这一核心冲突：{story.core_conflict.strip()}。"
+                )
+            if index == scene_count and story.ending.strip():
+                event = f"{event} 最终，{story.ending.strip()}。"
             location = locations[
                 min(len(locations) - 1, (index - 1) * len(locations) // scene_count)
             ]
@@ -470,6 +525,23 @@ class RuleBasedStoryAgent:
             scene.action = scene.visible_action
         revised.confirmed = False
         return revised
+
+    def plan_storyboard(
+        self,
+        script: StoryScript,
+        facts: StoryFacts,
+    ) -> list[dict[str, Any]] | None:
+        del script, facts
+        return None
+
+    def evaluate_artifacts(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        storyboard: dict[str, Any],
+    ) -> dict[str, Any]:
+        del story, script, storyboard
+        return {}
 
     def generate_draft(
         self,
@@ -757,7 +829,12 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         except Exception as exc:
             self._mark_fallback("generate_story", exc)
             return fallback
-        return self._review_story_continuity(story, operation="generate_story_review")
+        return self._review_story_continuity(
+            story,
+            operation="generate_story_review",
+            selected_cards=selected_cards,
+            selected_elements=selected_elements,
+        )
 
     def revise_story(self, story: StoryDraft, feedback: str) -> StoryDraft:
         self._reset_fallback_status()
@@ -791,7 +868,11 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         try:
             data = self._json_completion(
                 "script_writer.md",
-                {"confirmed_story": to_plain_data(story), "target_seconds": target_seconds},
+                {
+                    "confirmed_story": to_plain_data(story),
+                    "target_seconds": target_seconds,
+                    "maximum_scenes": max(1, target_seconds // 3),
+                },
             )
             script = self._script_from_model(data, fallback, target_seconds)
         except Exception as exc:
@@ -827,6 +908,124 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             revised,
             operation="revise_script_review",
         )
+
+    def plan_storyboard(
+        self,
+        script: StoryScript,
+        facts: StoryFacts,
+    ) -> list[dict[str, Any]] | None:
+        self._reset_fallback_status()
+        if self.client is None:
+            self._mark_fallback("plan_storyboard", self._unavailable_reason)
+            return None
+        try:
+            data = self._json_completion(
+                "storyboard_director.md",
+                {
+                    "confirmed_script": to_plain_data(script),
+                    "story_facts": to_plain_data(facts),
+                    "minimum_shots": max(1, (script.target_seconds + 14) // 15),
+                    "maximum_shots": max(1, script.target_seconds // 3),
+                },
+            )
+            shots = data.get("shots")
+            if not isinstance(shots, list) or not all(isinstance(item, dict) for item in shots):
+                raise ValueError("storyboard director must return a shots array")
+            result = [dict(item) for item in shots]
+            self._validate_director_plan(script, result)
+            return result
+        except Exception as exc:
+            self._mark_fallback("plan_storyboard", exc)
+            return None
+
+    def evaluate_artifacts(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        storyboard: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._reset_fallback_status()
+        if self.client is None:
+            self._mark_fallback("quality_judge", self._unavailable_reason)
+            return {}
+        try:
+            data = self._json_completion(
+                "quality_judge.md",
+                {
+                    "story": to_plain_data(story),
+                    "script": to_plain_data(script),
+                    "storyboard": storyboard,
+                },
+            )
+            scores = data.get("scores")
+            issues = data.get("issues", [])
+            if not isinstance(scores, dict) or not isinstance(issues, list):
+                raise ValueError("quality judge must return scores and issues")
+            normalized_scores: dict[str, float] = {}
+            for key, value in scores.items():
+                score = float(value)
+                if not 0 <= score <= 1:
+                    raise ValueError("quality judge scores must be between 0 and 1")
+                normalized_scores[str(key)] = round(score, 3)
+            return {
+                "scores": normalized_scores,
+                "issues": [str(item) for item in issues if str(item).strip()],
+                "summary": str(data.get("summary", "")).strip(),
+            }
+        except Exception as exc:
+            self._mark_fallback("quality_judge", exc)
+            return {}
+
+    @staticmethod
+    def _validate_director_plan(
+        script: StoryScript,
+        shots: list[dict[str, Any]],
+    ) -> None:
+        minimum = max(1, (script.target_seconds + 14) // 15)
+        maximum = max(1, script.target_seconds // 3)
+        if not minimum <= len(shots) <= maximum:
+            raise ValueError(f"director shot count must be between {minimum} and {maximum}")
+        scene_ids = [scene.scene_id for scene in script.scenes]
+        planned_ids: list[int] = []
+        allowed_kinds = {
+            "establish",
+            "action",
+            "detail",
+            "dialogue",
+            "reaction",
+            "transition",
+        }
+        allowed_transitions = {
+            "opening",
+            "scene_change",
+            "same_scene_cut",
+            "continuous_action",
+            "insert_shot",
+            "reverse_shot",
+            "reaction_cut",
+        }
+        for index, shot in enumerate(shots):
+            scene_id = int(shot.get("scene_id", 0))
+            planned_ids.append(scene_id)
+            if scene_id not in scene_ids:
+                raise ValueError("director plan references an unknown scene")
+            if str(shot.get("kind", "")) not in allowed_kinds:
+                raise ValueError("director plan contains an unsupported shot kind")
+            if not str(shot.get("action", "")).strip():
+                raise ValueError("director plan contains an empty action")
+            transition = str(shot.get("transition_type", ""))
+            if transition not in allowed_transitions:
+                raise ValueError("director plan contains an unsupported transition")
+            inherit = shot.get("inherit_previous_frame", False)
+            if not isinstance(inherit, bool):
+                raise ValueError("inherit_previous_frame must be boolean")
+            if inherit and (index == 0 or transition != "continuous_action"):
+                raise ValueError("only a non-opening continuous action may inherit a frame")
+        order = {scene_id: index for index, scene_id in enumerate(scene_ids)}
+        if planned_ids != sorted(planned_ids, key=order.__getitem__):
+            raise ValueError("director plan changes script scene order")
+        if set(scene_ids) - set(planned_ids):
+            raise ValueError("director plan omits a script scene")
 
     def generate_draft(
         self,
@@ -1029,15 +1228,8 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     duration=1,
                 )
             )
-        scenes = fit_scenes_to_duration(scenes, target_seconds, minimum=3)
-        durations = allocate_durations(
-            target_seconds,
-            len(scenes),
-            minimum=3,
-            maximum=target_seconds,
-        )
-        for scene, duration in zip(scenes, durations):
-            scene.duration = duration
+        if len(scenes) <= max(1, target_seconds // 3):
+            OpenAIStoryAgent._normalize_script_durations(scenes, target_seconds)
         return StoryScript(
             title=str(raw.get("title", fallback.title)).strip() or fallback.title,
             target_seconds=target_seconds,
@@ -1049,11 +1241,17 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         story: StoryDraft,
         *,
         operation: str,
+        selected_cards: list[IdeaCard] | None = None,
+        selected_elements: dict[str, ElementOption] | None = None,
     ) -> StoryDraft:
         try:
             data = self._json_completion(
                 "story_continuity_reviewer.md",
-                {"story": to_plain_data(story)},
+                {
+                    "story": to_plain_data(story),
+                    "immutable_selected_cards": to_plain_data(selected_cards or []),
+                    "immutable_selected_elements": to_plain_data(selected_elements or {}),
+                },
             )
             reviewed = self._story_from(data, story)
             reviewed.field_sources = deepcopy(story.field_sources)
@@ -1070,6 +1268,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         *,
         operation: str,
     ) -> StoryScript:
+        reviewed = script
         try:
             data = self._json_completion(
                 "script_continuity_reviewer.md",
@@ -1077,12 +1276,68 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "confirmed_story": to_plain_data(story),
                     "script": to_plain_data(script),
                     "target_seconds": script.target_seconds,
+                    "maximum_scenes": max(1, script.target_seconds // 3),
                 },
             )
-            return self._script_from_model(data, script, script.target_seconds)
+            reviewed = self._script_from_model(data, script, script.target_seconds)
         except Exception as exc:
-            self._mark_fallback(operation, exc)
+            self._mark_fallback(operation, exc, fallback_kind="partial")
+        return self._repair_script_budget(story, reviewed, operation=operation)
+
+    def _repair_script_budget(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        *,
+        operation: str,
+    ) -> StoryScript:
+        maximum = max(1, script.target_seconds // 3)
+        if len(script.scenes) <= maximum:
+            self._normalize_script_durations(script.scenes, script.target_seconds)
             return script
+        try:
+            data = self._json_completion(
+                "script_compressor.md",
+                {
+                    "confirmed_story": to_plain_data(story),
+                    "script": to_plain_data(script),
+                    "target_seconds": script.target_seconds,
+                    "maximum_scenes": maximum,
+                },
+            )
+            compressed = self._script_from_model(
+                data,
+                script,
+                script.target_seconds,
+            )
+            if len(compressed.scenes) > maximum:
+                raise ValueError("compressed script still exceeds maximum_scenes")
+            self._normalize_script_durations(
+                compressed.scenes,
+                compressed.target_seconds,
+            )
+            return compressed
+        except Exception as exc:
+            self._mark_fallback(
+                f"{operation}_scene_budget",
+                exc,
+                fallback_kind="whole",
+            )
+            return RuleBasedStoryAgent().generate_script(story, script.target_seconds)
+
+    @staticmethod
+    def _normalize_script_durations(
+        scenes: list[StoryScene],
+        target_seconds: int,
+    ) -> None:
+        durations = allocate_durations(
+            target_seconds,
+            len(scenes),
+            minimum=3,
+            maximum=target_seconds,
+        )
+        for scene, duration in zip(scenes, durations):
+            scene.duration = duration
 
     @property
     def provider_label(self) -> str:
@@ -1093,7 +1348,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         return self.configuration_error or "文本 API 未配置。"
 
     def _json_completion(self, prompt_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if prompt_name.startswith("story_"):
+        if prompt_name.startswith("story_") or prompt_name.startswith("storyboard_"):
             max_tokens = 8000
         elif prompt_name.startswith("script_"):
             max_tokens = 6000

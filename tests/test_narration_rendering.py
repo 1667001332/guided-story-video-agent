@@ -14,7 +14,9 @@ from guided_story_agent.models import StoryboardPlan, StoryboardShot, VideoArtif
 from guided_story_agent.narration import (
     EdgeNarrationSynthesizer,
     NarrationArtifact,
+    NarrationCue,
     NarrationUnavailable,
+    assemble_timed_narration,
     build_srt,
     narration_text_from_timeline,
     normalize_narration_timeline,
@@ -89,6 +91,7 @@ class NarrationRenderingTests(unittest.TestCase):
         normalize_narration_timeline(plan)
 
         captured: list[str] = []
+        assembled_cues = []
 
         class Communicate:
             def __init__(self, text, voice, *, rate):
@@ -98,14 +101,23 @@ class NarrationRenderingTests(unittest.TestCase):
             def save_sync(self, target):
                 Path(target).write_bytes(b"audio")
 
+        def assemble(segments, target, total_duration):
+            assembled_cues.extend(cue for cue, _ in segments)
+            self.assertEqual(18, total_duration)
+            Path(target).write_bytes(b"assembled-audio")
+            return str(target)
+
         with (
             tempfile.TemporaryDirectory() as temp,
             patch.dict(sys.modules, {"edge_tts": SimpleNamespace(Communicate=Communicate)}),
         ):
-            artifact = EdgeNarrationSynthesizer().synthesize(plan, temp)
+            artifact = EdgeNarrationSynthesizer(
+                timeline_assembler=assemble,
+            ).synthesize(plan, temp)
             subtitle = Path(artifact.subtitle_path).read_text(encoding="utf-8")
 
         self.assertEqual(["这句旁白只能出现一次。"], captured)
+        self.assertEqual([1], [cue.shot_id for cue in assembled_cues])
         self.assertEqual("这句旁白只能出现一次。", plan.narration_text)
         self.assertEqual(plan.narration_text, narration_text_from_timeline(plan))
         self.assertEqual(1, subtitle.count("这句旁白只能出现一次。"))
@@ -137,6 +149,39 @@ class NarrationRenderingTests(unittest.TestCase):
                 if shot.scene_id == scene_id and shot.narration
             ]
             self.assertEqual(len(values), len(set(values)))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "需要 FFmpeg")
+    def test_timed_narration_assembler_places_cues_on_exact_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first.wav"
+            second = root / "second.wav"
+            for frequency, target in ((440, first), (660, second)):
+                subprocess.run(
+                    [
+                        shutil.which("ffmpeg"),
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"sine=frequency={frequency}:duration=1",
+                        str(target),
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+            output = root / "timeline.m4a"
+            assemble_timed_narration(
+                [
+                    (NarrationCue(1, 0, 2, "第一句"), first),
+                    (NarrationCue(2, 4, 6, "第二句"), second),
+                ],
+                output,
+                6,
+            )
+            duration = probe_media_duration(output)
+
+        self.assertAlmostEqual(6.0, duration, delta=0.15)
 
     def test_missing_api_key_fails_before_submit(self) -> None:
         called = []
@@ -416,6 +461,81 @@ class NarrationRenderingTests(unittest.TestCase):
         self.assertEqual("submission_uncertain", plan.artifacts[0].status)
         self.assertTrue(plan.artifacts[0].request_id.startswith("local-submit-"))
         self.assertEqual(1, submissions)
+
+    def test_get_requests_retry_but_post_submission_does_not(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"status":"running"}'
+
+        sleeps: list[float] = []
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            network_retries=2,
+            retry_backoff=0.25,
+            sleep_fn=sleeps.append,
+        )
+        with patch(
+            "guided_story_agent.video_provider.urllib.request.urlopen",
+            side_effect=[OSError("temporary EOF"), Response()],
+        ) as opener:
+            result = provider._request_json("GET", "https://video.example/status")
+        self.assertEqual("running", result["status"])
+        self.assertEqual(2, opener.call_count)
+        self.assertEqual([0.25], sleeps)
+
+        with patch(
+            "guided_story_agent.video_provider.urllib.request.urlopen",
+            side_effect=OSError("submit response lost"),
+        ) as opener:
+            with self.assertRaisesRegex(Exception, "Agnes 请求失败"):
+                provider._request_json(
+                    "POST",
+                    "https://video.example/submit",
+                    {"prompt": "test"},
+                )
+        self.assertEqual(1, opener.call_count)
+
+    def test_submission_intent_survives_process_style_interruption(self) -> None:
+        calls = 0
+
+        class Narration:
+            def synthesize(self, plan, output_dir):
+                return NarrationArtifact("", "")
+
+        class InterruptedProvider:
+            endpoint = "interrupt-model"
+            provider_name = "interrupt-provider"
+
+            def generate_shot(self, shot, output_dir, **kwargs):
+                nonlocal calls
+                calls += 1
+                raise KeyboardInterrupt("simulated process interruption")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_plan = make_single_shot_plan()
+            renderer = StoryRenderer(InterruptedProvider(), narration=Narration())
+            with self.assertRaises(KeyboardInterrupt):
+                renderer.render(first_plan, temp_dir)
+            journal = Path(temp_dir) / "render_manifest.json"
+            self.assertTrue(journal.is_file())
+            self.assertEqual("submission_uncertain", first_plan.artifacts[-1].status)
+            self.assertTrue(
+                first_plan.artifacts[-1].request_id.startswith("submit-intent-")
+            )
+
+            fresh_plan = make_single_shot_plan()
+            recovered = renderer.render(fresh_plan, temp_dir)
+
+        self.assertEqual("submission_uncertain", recovered.status)
+        self.assertEqual(1, calls)
+        self.assertEqual("submission_uncertain", fresh_plan.artifacts[-1].status)
 
     def test_terminal_remote_failure_allows_a_new_submission(self) -> None:
         submissions: list[str] = []

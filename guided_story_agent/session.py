@@ -52,6 +52,7 @@ from .models import (
     to_plain_data,
 )
 from .narration import normalize_narration_timeline
+from .quality import review_script_against_story, semantic_coverage
 from .storyboard import (
     apply_transition_prompt_context,
     build_storyboard,
@@ -553,7 +554,18 @@ class GuidedStorySession:
     def build_storyboard(self) -> StoryboardPlan:
         if self.script is None or not self.script.confirmed or self.stage != Stage.SCRIPT_REVIEW:
             raise RuntimeError("请先确认剧本。")
-        storyboard = build_storyboard(self.script, self._story_facts())
+        facts = self._story_facts()
+        planner = getattr(self.agent, "plan_storyboard", None)
+        director_plan = (
+            planner(deepcopy(self.script), deepcopy(facts))
+            if callable(planner)
+            else None
+        )
+        storyboard = build_storyboard(
+            self.script,
+            facts,
+            director_plan=director_plan,
+        )
         self._validate_storyboard_plan(storyboard)
         self.storyboard = storyboard
         self.stage = Stage.STORYBOARD_REVIEW
@@ -847,6 +859,59 @@ class GuidedStorySession:
         self.stage = Stage.RENDER_READY
         self._snapshot("storyboard", to_plain_data(self.storyboard), confirmed=True)
 
+    def resolve_submission_uncertainty(
+        self,
+        shot_id: int,
+        *,
+        accepted_by_provider: bool,
+        provider_request_id: str = "",
+    ) -> VideoArtifact:
+        """Resolve one write-ahead submission intent after checking the provider console."""
+        with self._state_lock:
+            self._require_not_rendering()
+            if self.storyboard is None:
+                raise RuntimeError("当前没有可核对的视频任务。")
+            candidates = [
+                artifact
+                for artifact in self.storyboard.artifacts
+                if artifact.shot_id == shot_id
+                and artifact.status == "submission_uncertain"
+            ]
+            if not candidates:
+                raise RuntimeError(f"镜头 {shot_id} 没有等待人工核对的提交记录。")
+            artifact = candidates[-1]
+            cleaned_request_id = " ".join(provider_request_id.split())
+            if accepted_by_provider:
+                if not cleaned_request_id:
+                    raise ValueError("Provider 已受理时，必须填写后台显示的真实任务 ID。")
+                if cleaned_request_id.startswith("submit-intent-"):
+                    raise ValueError("请填写 Provider 后台任务 ID，不能使用本地提交意图 ID。")
+                artifact.status = "pending"
+                artifact.request_id = cleaned_request_id
+                artifact.error_message = (
+                    "已由用户在 Provider 后台确认受理；下次生成只会查询该任务，"
+                    "不会重新提交。"
+                )
+            else:
+                artifact.status = "failed"
+                artifact.request_id = None
+                artifact.error_message = (
+                    "已由用户在 Provider 后台确认未受理；允许下次生成重新提交该镜头。"
+                )
+            if self.render_manifest is not None:
+                for index, manifest_artifact in enumerate(self.render_manifest.artifacts):
+                    if manifest_artifact.artifact_id == artifact.artifact_id:
+                        self.render_manifest.artifacts[index] = deepcopy(artifact)
+                if accepted_by_provider:
+                    self.render_manifest.status = "pending"
+                    self.render_manifest.error = artifact.error_message
+                else:
+                    self.render_manifest.status = "failed"
+                    if shot_id not in self.render_manifest.failed_shots:
+                        self.render_manifest.failed_shots.append(shot_id)
+                    self.render_manifest.error = artifact.error_message
+            return deepcopy(artifact)
+
     def render_confirmed_plan(self, renderer, output_dir: str | Path) -> RenderManifest:
         with self._state_lock:
             if self._render_in_progress:
@@ -977,6 +1042,15 @@ class GuidedStorySession:
                 not (scene.visible_action or scene.action).strip() for scene in self.script.scenes
             ):
                 review.hard_errors.append("存在无法拍摄的空动作场景")
+            if self.story is not None:
+                semantic = review_script_against_story(
+                    self.story,
+                    self.script,
+                    required_character_names=self._required_story_characters(),
+                )
+                review.hard_errors.extend(semantic.hard_errors)
+                review.warnings.extend(semantic.warnings)
+                review.scores.update(semantic.scores)
             review.scores["filmability"] = 1.0 if not review.hard_errors else 0.5
         elif kind == "storyboard" and self.storyboard:
             target_seconds = self.effective_target_seconds
@@ -1435,11 +1509,32 @@ class GuidedStorySession:
         target = int(target_seconds if target_seconds is not None else script.target_seconds)
         if not 15 <= target <= 300:
             raise ValueError("剧本目标时长必须在 15 到 300 秒之间。")
-        for scene in script.scenes:
+        previous_end_state = ""
+        for index, scene in enumerate(script.scenes):
             self._validate_scene_fields(scene)
             if not (scene.visible_action or scene.action).strip():
                 scene.action = scene.narration or "主角完成一个清晰可见的动作"
                 scene.visible_action = scene.action
+            visible_action = (scene.visible_action or scene.action).strip()
+            if not scene.start_state.strip():
+                if previous_end_state:
+                    scene.start_state = f"承接上一场结果：{previous_end_state}"
+                elif self.story is not None:
+                    scene.start_state = (
+                        f"已确认的核心冲突是“{self.story.core_conflict}”；"
+                        f"人物位于{scene.location or '故事核心场景'}，准备开始行动"
+                    )
+                else:
+                    scene.start_state = (
+                        f"人物位于{scene.location or '故事核心场景'}，准备开始行动"
+                    )
+            if not scene.end_state.strip():
+                scene.end_state = visible_action
+                if index == len(script.scenes) - 1 and self.story is not None:
+                    scene.end_state = (
+                        f"{visible_action}；动作结果让故事走向“{self.story.ending}”"
+                    )
+            previous_end_state = scene.end_state
         script.scenes = fit_scenes_to_duration(script.scenes, target, minimum=3)
         durations = allocate_durations(
             target,
@@ -1480,32 +1575,10 @@ class GuidedStorySession:
         story: StoryDraft,
         selected_options: dict[str, ElementOption],
     ) -> None:
-        """Apply choices after model output so an LLM cannot silently rewrite them."""
+        """Record immutable provenance without rewriting a reviewed story after the model call."""
         cards = self.selected_cards
         source_ids = [card.idea_id for card in cards]
         if cards:
-            conflicts = "；".join(card.central_conflict for card in cards)
-            endings = "；".join(card.ending_direction for card in cards)
-            tones = " × ".join(card.tone for card in cards)
-            titles = " × ".join(card.title for card in cards)
-            story.title = titles
-            story.tone = tones
-            story.core_conflict = conflicts
-            story.ending = endings
-            known_names = {item.name for item in story.characters}
-            for card in cards:
-                if card.protagonist not in known_names:
-                    story.characters.append(
-                        StoryCharacter(
-                            name=card.protagonist,
-                            description=card.logline,
-                            visual_identity="保持统一外观与服装",
-                        )
-                    )
-                if card.protagonist not in story.story_text:
-                    story.story_text = (
-                        f"{story.story_text}\n\n{card.protagonist}始终是推动核心行动的角色。"
-                    )
             story.field_sources["selected_ideas"] = SourceAttribution(
                 field="selected_ideas",
                 source_type="selected_card",
@@ -1520,19 +1593,6 @@ class GuidedStorySession:
         }
         for kind, option in selected_options.items():
             field = mapping[kind]
-            if kind == "character":
-                if story.characters:
-                    story.characters[0].description = option.content
-                else:
-                    story.characters = [StoryCharacter("主角", option.content)]
-                if option.content not in story.story_text:
-                    story.story_text = f"{story.story_text}\n\n主角设定保持为：{option.content}。"
-            elif kind == "turning_point":
-                marker = f"确定发生的关键变化：{option.content}"
-                if option.content not in story.story_text:
-                    story.story_text = f"{story.story_text}\n\n{marker}。"
-            else:
-                setattr(story, field, option.content)
             story.field_sources[field] = SourceAttribution(
                 field=field,
                 source_type="selected_element",
@@ -1561,16 +1621,29 @@ class GuidedStorySession:
         for card in self.selected_cards:
             if card.protagonist not in character_text or card.protagonist not in story.story_text:
                 raise ValueError("所选创意卡的主角没有落实到故事结构中。")
+            source = f"{card.central_conflict} {card.ending_direction}"
+            target = f"{story.core_conflict} {story.ending} {story.story_text}"
+            if semantic_coverage(source, target) < 0.18:
+                raise ValueError("所选创意卡的冲突或结局没有被完整融合进故事。")
         for kind, option in selected_options.items():
             if kind == "character":
                 material = f"{character_text}\n{story.story_text}"
-                if option.content not in material:
+                if semantic_coverage(option.content, material) < 0.45:
                     raise ValueError("所选角色设定没有落实到故事结构中。")
-            elif kind == "turning_point" and option.content not in story.story_text:
+            elif kind == "turning_point" and semantic_coverage(
+                option.content,
+                story.story_text,
+            ) < 0.45:
                 raise ValueError("所选转折没有落实到故事正文中。")
-            elif kind == "conflict" and story.core_conflict != option.content:
+            elif kind == "conflict" and semantic_coverage(
+                option.content,
+                f"{story.core_conflict} {story.story_text}",
+            ) < 0.45:
                 raise ValueError("所选冲突没有保留。")
-            elif kind == "ending" and story.ending != option.content:
+            elif kind == "ending" and semantic_coverage(
+                option.content,
+                f"{story.ending} {story.story_text}",
+            ) < 0.45:
                 raise ValueError("所选结局没有保留。")
 
     @staticmethod
@@ -1703,22 +1776,29 @@ class GuidedStorySession:
     def _validate_script_story_boundary(self, script: StoryScript) -> None:
         if self.story is None:
             return
-        known_characters = {
-            item.name.strip() for item in self.story.characters if item.name.strip()
-        }
-        if not known_characters:
-            return
-        script_text = "\n".join(
-            [
-                *(" ".join(scene.characters) for scene in script.scenes),
-                *(
-                    f"{scene.visible_action or scene.action} {scene.dialogue} {scene.narration}"
-                    for scene in script.scenes
-                ),
-            ]
+        review = review_script_against_story(
+            self.story,
+            script,
+            required_character_names=self._required_story_characters(),
         )
-        if not any(name in script_text for name in known_characters):
-            raise ValueError("剧本没有保留已确认故事中的任何角色。")
+        if review.hard_errors:
+            raise ValueError("；".join(review.hard_errors))
+
+    def _required_story_characters(self) -> list[str]:
+        selected = [
+            card.protagonist.strip()
+            for card in self.selected_cards
+            if card.protagonist.strip()
+        ]
+        if selected:
+            return list(dict.fromkeys(selected))
+        if self.story is None:
+            return []
+        return [
+            character.name.strip()
+            for character in self.story.characters[:1]
+            if character.name.strip()
+        ]
 
     @staticmethod
     def _validate_storyboard_plan(plan: StoryboardPlan) -> None:

@@ -9,6 +9,8 @@ REQUIRED_PROMPTS = (
     "idea_divergence.md",
     "idea_mixer.md",
     "idea_similarity.md",
+    "quality_judge.md",
+    "script_compressor.md",
     "script_continuity_reviewer.md",
     "script_rewriter.md",
     "script_writer.md",
@@ -16,6 +18,7 @@ REQUIRED_PROMPTS = (
     "story_continuity_reviewer.md",
     "story_rewriter.md",
     "story_writer.md",
+    "storyboard_director.md",
 )
 
 

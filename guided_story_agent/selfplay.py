@@ -7,6 +7,11 @@ from pathlib import Path
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .models import CreativeBrief, to_plain_data
+from .quality import (
+    build_human_review_template,
+    evaluate_storyboard_quality,
+    review_script_against_story,
+)
 from .rendering import StoryRenderer
 from .session import GuidedStorySession
 from .video_provider import AgnesVideoProvider
@@ -39,6 +44,7 @@ def run_selfplay(
     render: bool = False,
     renderer=None,
     require_live_text: bool = False,
+    llm_judge: bool = False,
 ) -> dict[str, object]:
     """Exercise the one-sentence path. ``max_turns`` remains CLI-compatible only."""
     del max_turns
@@ -64,6 +70,24 @@ def run_selfplay(
     storyboard = session.build_storyboard()
     session.confirm_storyboard()
 
+    semantic_review = review_script_against_story(story, script)
+    deterministic_quality = {
+        **semantic_review.scores,
+        **evaluate_storyboard_quality(storyboard),
+        "quality_hard_error_count": len(semantic_review.hard_errors),
+        "quality_warning_count": len(semantic_review.warnings),
+    }
+    judge_result: dict[str, object] = {}
+    evaluator = getattr(agent, "evaluate_artifacts", None)
+    if llm_judge and callable(evaluator):
+        judge_result = dict(
+            evaluator(
+                story,
+                script,
+                to_plain_data(storyboard),
+            )
+            or {}
+        )
     fallback_after = int(getattr(agent, "fallback_count", 0))
     if require_live_text and fallback_after > fallback_before:
         reason = str(getattr(agent, "last_fallback_reason", "未知原因"))
@@ -107,6 +131,14 @@ def run_selfplay(
         "text_fallback_count": fallback_after - fallback_before,
         "text_provider": str(getattr(agent, "provider_name", type(agent).__name__)),
         "text_model": str(getattr(agent, "model", "rule-based")),
+        **deterministic_quality,
+        "llm_judge_enabled": bool(llm_judge),
+        "llm_judge_scores": dict(judge_result.get("scores", {}))
+        if isinstance(judge_result.get("scores"), dict)
+        else {},
+        "llm_judge_issue_count": len(judge_result.get("issues", []))
+        if isinstance(judge_result.get("issues"), list)
+        else 0,
     }
 
     target = Path(output_dir).expanduser().resolve()
@@ -138,6 +170,18 @@ def run_selfplay(
             ],
         },
         "bench.json": bench,
+        "quality_report.json": {
+            "schema_version": 1,
+            "deterministic": deterministic_quality,
+            "hard_errors": semantic_review.hard_errors,
+            "warnings": semantic_review.warnings,
+            "llm_judge": judge_result,
+        },
+        "human_review.json": build_human_review_template(
+            story,
+            script,
+            storyboard,
+        ),
     }
     for name, data in artifacts.items():
         (target / name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -194,6 +238,11 @@ def main() -> None:
         action="store_true",
         help="强制使用本地规则，不读取或请求真实文本 API",
     )
+    parser.add_argument(
+        "--llm-judge",
+        action="store_true",
+        help="额外调用一次文本模型评价故事、剧本和分镜质量",
+    )
     args = parser.parse_args()
     if args.render and args.confirm_paid_video != "RENDER":
         parser.error("--render 会调用付费视频 API，必须同时填写 --confirm-paid-video RENDER")
@@ -201,6 +250,8 @@ def main() -> None:
         parser.error("--confirm-paid-video 只能与 --render 同时使用。")
     if args.offline and args.require_live_text:
         parser.error("--offline 与 --require-live-text 不能同时使用。")
+    if args.offline and args.llm_judge:
+        parser.error("--offline 不能启用 --llm-judge。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or f"outputs/selfplay/{stamp}"
     result = run_selfplay(
@@ -211,6 +262,7 @@ def main() -> None:
         output_dir=output,
         render=args.render,
         require_live_text=args.require_live_text,
+        llm_judge=args.llm_judge,
     )
     print(
         json.dumps(

@@ -47,6 +47,15 @@ def _number(value: str, default: float) -> float:
         return default
 
 
+def _integer(value: str, default: int) -> int:
+    if not str(value).strip():
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 @dataclass(frozen=True, slots=True)
 class TextProviderConfig:
     provider: str
@@ -182,6 +191,8 @@ class VideoProviderConfig:
     source: str
     reference_root: str = ""
     reference_base_url: str = ""
+    network_retries: int = 2
+    retry_backoff: float = 1.0
     error: str = ""
 
     @property
@@ -219,6 +230,8 @@ class VideoProviderConfig:
                 source="VIDEO_*",
                 reference_root=_value("VIDEO_REFERENCE_ROOT"),
                 reference_base_url=_value("VIDEO_REFERENCE_BASE_URL"),
+                network_retries=_integer(_value("VIDEO_NETWORK_RETRIES", "2"), 2),
+                retry_backoff=_number(_value("VIDEO_RETRY_BACKOFF", "1"), 1),
             )
             return config._validated(provider_raw)
 
@@ -235,6 +248,8 @@ class VideoProviderConfig:
                 source="AGNES_* (legacy)",
                 reference_root=_value("VIDEO_REFERENCE_ROOT"),
                 reference_base_url=_value("VIDEO_REFERENCE_BASE_URL"),
+                network_retries=_integer(_value("VIDEO_NETWORK_RETRIES", "2"), 2),
+                retry_backoff=_number(_value("VIDEO_RETRY_BACKOFF", "1"), 1),
             )
             return config._validated("agnes")
 
@@ -249,6 +264,8 @@ class VideoProviderConfig:
             source="VIDEO_*" if explicit_mode else "none",
             reference_root=_value("VIDEO_REFERENCE_ROOT"),
             reference_base_url=_value("VIDEO_REFERENCE_BASE_URL"),
+            network_retries=_integer(_value("VIDEO_NETWORK_RETRIES", "2"), 2),
+            retry_backoff=_number(_value("VIDEO_RETRY_BACKOFF", "1"), 1),
         )
         return config._validated("agnes")
 
@@ -269,6 +286,14 @@ class VideoProviderConfig:
             return self._with_error("VIDEO_POLL_INTERVAL 必须是大于等于 0 的有限数字。")
         if not math.isfinite(self.max_poll_seconds) or self.max_poll_seconds <= 0:
             return self._with_error("VIDEO_MAX_POLL_SECONDS 必须是大于 0 的有限数字。")
+        if (
+            isinstance(self.network_retries, bool)
+            or not isinstance(self.network_retries, int)
+            or not 0 <= self.network_retries <= 10
+        ):
+            return self._with_error("VIDEO_NETWORK_RETRIES 必须是 0 到 10 之间的整数。")
+        if not math.isfinite(self.retry_backoff) or self.retry_backoff < 0:
+            return self._with_error("VIDEO_RETRY_BACKOFF 必须是大于等于 0 的有限数字。")
         if bool(self.reference_root) != bool(self.reference_base_url):
             return self._with_error(
                 "VIDEO_REFERENCE_ROOT 与 VIDEO_REFERENCE_BASE_URL 必须同时填写或同时留空。"
@@ -293,5 +318,7 @@ class VideoProviderConfig:
             source=self.source,
             reference_root=self.reference_root,
             reference_base_url=self.reference_base_url,
+            network_retries=self.network_retries,
+            retry_backoff=self.retry_backoff,
             error=error,
         )

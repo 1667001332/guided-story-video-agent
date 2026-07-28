@@ -9,6 +9,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from .continuity import (
     CONTINUITY_MODES,
@@ -24,6 +25,7 @@ from .models import (
     StoryboardPlan,
     StoryboardShot,
     VideoArtifact,
+    VisualReference,
     to_plain_data,
 )
 from .narration import EdgeNarrationSynthesizer, NarrationUnavailable
@@ -31,6 +33,7 @@ from .video_provider import (
     PublishedImage,
     VideoSubmissionUncertainError,
     VideoTaskTerminalError,
+    sanitize_remote_url,
     validate_mp4_file,
 )
 
@@ -81,6 +84,7 @@ class StoryRenderer:
             output_dir=str(target),
             render_run_id=run_id,
         )
+        self._recover_submission_journal(plan, target, run_id)
         visual_errors = verify_confirmed_visual_inputs(plan)
         if visual_errors:
             raise RuntimeError(
@@ -224,6 +228,24 @@ class StoryRenderer:
                 if pending
                 else 1 + sum(item.shot_id == shot.shot_id for item in plan.artifacts)
             )
+            submission_intent: VideoArtifact | None = None
+            if pending is None:
+                submission_intent = self._submission_intent_artifact(
+                    shot,
+                    attempt,
+                )
+                self._attach_evidence(
+                    submission_intent,
+                    shot,
+                    fingerprint,
+                    diagnostics,
+                    used_fallback=used_fallback,
+                )
+                plan.artifacts.append(submission_intent)
+                manifest.artifacts.append(submission_intent)
+                manifest.status = "submission_uncertain"
+                manifest.error = submission_intent.error_message
+                self._write_manifest(manifest, target)
             try:
                 provider_kwargs = {
                     "attempt": attempt,
@@ -269,8 +291,14 @@ class StoryRenderer:
                 diagnostics,
                 used_fallback=used_fallback,
             )
-            self._store_artifact(plan, pending, artifact)
-            manifest.artifacts.append(artifact)
+            previous_artifact = pending or submission_intent
+            self._store_artifact(plan, previous_artifact, artifact)
+            if submission_intent is not None:
+                manifest.artifacts[manifest.artifacts.index(submission_intent)] = artifact
+            else:
+                manifest.artifacts.append(artifact)
+            manifest.status = "running"
+            manifest.error = ""
             if artifact.status == "pending":
                 manifest.status = "pending"
                 manifest.error = (
@@ -805,13 +833,116 @@ class StoryRenderer:
     @staticmethod
     def _store_artifact(
         plan: StoryboardPlan,
-        pending: VideoArtifact | None,
+        previous: VideoArtifact | None,
         artifact: VideoArtifact,
     ) -> None:
-        if pending is None:
+        if previous is None:
             plan.artifacts.append(artifact)
             return
-        plan.artifacts[plan.artifacts.index(pending)] = artifact
+        plan.artifacts[plan.artifacts.index(previous)] = artifact
+
+    def _recover_submission_journal(
+        self,
+        plan: StoryboardPlan,
+        target: Path,
+        run_id: str,
+    ) -> None:
+        """Recover durable per-shot evidence written before a provider submission."""
+        path = target / "render_manifest.json"
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or str(data.get("render_run_id", "")) != run_id:
+                return
+            raw_artifacts = data.get("artifacts", [])
+            if not isinstance(raw_artifacts, list):
+                return
+            known = {artifact.artifact_id for artifact in plan.artifacts}
+            for raw in raw_artifacts:
+                artifact = self._artifact_from_journal(raw)
+                if artifact is None or artifact.artifact_id in known:
+                    continue
+                plan.artifacts.append(artifact)
+                known.add(artifact.artifact_id)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return
+
+    @staticmethod
+    def _artifact_from_journal(raw: object) -> VideoArtifact | None:
+        if not isinstance(raw, dict):
+            return None
+        required = {
+            "artifact_id",
+            "shot_id",
+            "provider",
+            "model",
+            "status",
+            "local_path",
+            "remote_url",
+            "duration",
+            "prompt",
+            "created_at",
+        }
+        if required - set(raw):
+            return None
+        payload = {
+            key: value
+            for key, value in raw.items()
+            if key in VideoArtifact.__dataclass_fields__
+        }
+        payload["remote_url"] = sanitize_remote_url(str(payload.get("remote_url", "")))
+        references: list[VisualReference] = []
+        for item in payload.get("confirmed_visual_inputs", []) or []:
+            if not isinstance(item, dict):
+                continue
+            reference_payload = {
+                key: value
+                for key, value in item.items()
+                if key in VisualReference.__dataclass_fields__
+            }
+            try:
+                references.append(VisualReference(**reference_payload))
+            except TypeError:
+                continue
+        payload["confirmed_visual_inputs"] = references
+        try:
+            artifact = VideoArtifact(**payload)
+        except (TypeError, ValueError):
+            return None
+        if artifact.status not in {
+            "succeeded",
+            "pending",
+            "submission_uncertain",
+            "failed",
+        }:
+            return None
+        return artifact
+
+    def _submission_intent_artifact(
+        self,
+        shot: StoryboardShot,
+        attempt: int,
+    ) -> VideoArtifact:
+        operation_id = f"submit-intent-{uuid4().hex}"
+        return VideoArtifact(
+            artifact_id=f"intent_shot_{shot.shot_id}_{attempt}_{uuid4().hex[:12]}",
+            shot_id=shot.shot_id,
+            provider=str(getattr(self.provider, "provider_name", "unknown")),
+            model=str(getattr(self.provider, "endpoint", type(self.provider).__name__)),
+            status="submission_uncertain",
+            local_path="",
+            remote_url="",
+            duration=shot.duration,
+            prompt=shot.video_prompt,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            request_id=operation_id,
+            attempt=attempt,
+            error_message=(
+                "视频提交已经开始，但尚未取得可持久化的 Provider 任务 ID。"
+                "如果进程此时中断，系统会阻止自动重提，请先到 Provider 后台核对。"
+            ),
+        )
 
     def _failed_artifact(
         self,
@@ -956,8 +1087,11 @@ def concatenate_mp4_clips(paths: list[str], output_path: str | Path) -> str:
                 "0",
                 "-i",
                 str(concat_file),
-                "-c",
+                "-map",
+                "0:v:0",
+                "-c:v",
                 "copy",
+                "-an",
                 str(target),
             ],
             capture_output=True,

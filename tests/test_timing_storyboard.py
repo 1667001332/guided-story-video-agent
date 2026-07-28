@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from guided_story_agent.models import StoryFacts, StoryScene, StoryScript, to_plain_data
-from guided_story_agent.storyboard import build_storyboard
+from guided_story_agent.storyboard import build_storyboard, fit_scenes_to_duration
 from guided_story_agent.timing import (
     allocate_durations,
     allocate_weighted_durations,
@@ -12,6 +12,129 @@ from guided_story_agent.timing import (
 
 
 class TimingTests(unittest.TestCase):
+    def test_scene_budget_never_merges_different_locations(self) -> None:
+        scenes = [
+            StoryScene(
+                index,
+                f"场景{index}",
+                f"地点{index}",
+                "夜",
+                ["主角"],
+                f"主角完成动作{index}",
+                "",
+                3,
+            )
+            for index in range(1, 7)
+        ]
+        with self.assertRaisesRegex(ValueError, "跨地点"):
+            fit_scenes_to_duration(scenes, 15)
+
+    def test_director_plan_only_inherits_frame_for_explicit_continuous_action(self) -> None:
+        script = StoryScript(
+            "递信",
+            15,
+            [
+                StoryScene(
+                    1,
+                    "递信",
+                    "雨夜站台",
+                    "夜",
+                    ["邮差"],
+                    "邮差举起信封，随后把它递进窗口",
+                    "",
+                    15,
+                    visible_action="邮差举起信封，随后把它递进窗口",
+                )
+            ],
+            confirmed=True,
+        )
+        director_plan = [
+            {
+                "scene_id": 1,
+                "kind": "action",
+                "action": "邮差举起信封",
+                "purpose": "建立动作起点",
+                "transition_type": "same_scene_cut",
+                "transition_reason": "换到近景看清信封",
+                "inherit_previous_frame": False,
+            },
+            {
+                "scene_id": 1,
+                "kind": "action",
+                "action": "随后把信封递进窗口",
+                "purpose": "完成同一个递交动作",
+                "transition_type": "continuous_action",
+                "transition_reason": "同一物理动作的直接下一阶段",
+                "inherit_previous_frame": True,
+            },
+        ]
+        plan = build_storyboard(
+            script,
+            StoryFacts(),
+            director_plan=director_plan,
+        )
+        self.assertFalse(plan.shots[0].inherit_previous_frame)
+        self.assertTrue(plan.shots[1].inherit_previous_frame)
+        self.assertEqual("same_scene_chain", plan.shots[1].continuity_mode)
+
+        director_plan[0]["inherit_previous_frame"] = True
+        with self.assertRaisesRegex(ValueError, "连续动作镜头"):
+            build_storyboard(script, StoryFacts(), director_plan=director_plan)
+
+        cut_script = StoryScript(
+            "同地跳时",
+            15,
+            [
+                StoryScene(
+                    1,
+                    "第一次等待",
+                    "同一站台",
+                    "夜",
+                    ["邮差"],
+                    "邮差等候列车",
+                    "",
+                    7,
+                ),
+                StoryScene(
+                    2,
+                    "数小时后",
+                    "同一站台",
+                    "夜",
+                    ["邮差"],
+                    "邮差从长椅上醒来",
+                    "",
+                    8,
+                ),
+            ],
+            confirmed=True,
+        )
+        cut_plan = build_storyboard(
+            cut_script,
+            StoryFacts(),
+            director_plan=[
+                {
+                    "scene_id": 1,
+                    "kind": "action",
+                    "action": "邮差等候列车",
+                    "purpose": "交代第一次等待",
+                    "transition_type": "same_scene_cut",
+                    "transition_reason": "普通换机位",
+                    "inherit_previous_frame": False,
+                },
+                {
+                    "scene_id": 2,
+                    "kind": "action",
+                    "action": "数小时后邮差从长椅上醒来",
+                    "purpose": "明确同地时间跳跃",
+                    "transition_type": "scene_change",
+                    "transition_reason": "地点相同但叙事时间已经跳跃",
+                    "inherit_previous_frame": False,
+                },
+            ],
+        )
+        self.assertEqual("scene_change", cut_plan.shots[1].transition_type)
+        self.assertIsNone(cut_plan.shots[1].previous_shot_id)
+
     def test_story_duration_estimate_scales_and_stays_within_bounds(self) -> None:
         short = estimate_story_duration("女孩发现一封没有署名的信。她把信交给老师。")
         long = estimate_story_duration(

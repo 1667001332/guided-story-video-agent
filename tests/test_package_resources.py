@@ -15,6 +15,8 @@ class PackageResourceTests(unittest.TestCase):
             "idea_divergence.md",
             "idea_mixer.md",
             "idea_similarity.md",
+            "quality_judge.md",
+            "script_compressor.md",
             "script_continuity_reviewer.md",
             "script_rewriter.md",
             "story_writer.md",
@@ -22,6 +24,7 @@ class PackageResourceTests(unittest.TestCase):
             "selfplay_creator.md",
             "story_continuity_reviewer.md",
             "story_rewriter.md",
+            "storyboard_director.md",
         )
         for name in required:
             with self.subTest(name=name):

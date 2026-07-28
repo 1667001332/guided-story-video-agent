@@ -152,6 +152,7 @@ def run_batch(
     render: bool = False,
     renderer_factory: RendererFactory | None = None,
     require_live_text: bool = True,
+    llm_judge: bool = False,
     resume: bool = False,
     retries: int = 0,
     delay_seconds: float = 0.0,
@@ -212,6 +213,7 @@ def run_batch(
                 target_seconds=selected_seconds,
                 render=render,
                 require_live_text=require_live_text,
+                llm_judge=llm_judge,
                 agent=prepared_agent,
                 renderer=prepared_renderer,
                 preparation_error=preparation_error,
@@ -318,6 +320,7 @@ def run_batch(
                             render=False,
                             renderer=None,
                             require_live_text=require_live_text,
+                            llm_judge=llm_judge,
                         )
                         active_session = output["session"]
                         active_bench = dict(output["bench"])
@@ -476,6 +479,7 @@ def _build_run_identity(
     target_seconds: int | None,
     render: bool,
     require_live_text: bool,
+    llm_judge: bool,
     agent: StoryAgent | None,
     renderer: Any | None,
     preparation_error: Exception | None,
@@ -514,6 +518,7 @@ def _build_run_identity(
             "json_mode": str(getattr(agent, "json_mode", "")) if agent is not None else "",
             "live_client_available": text_client is not None,
             "require_live_text": require_live_text,
+            "llm_judge": llm_judge,
         },
         "video": {
             "enabled": render,
@@ -804,6 +809,20 @@ def _build_summary(
             "ai_fill_transparency": average_metric("ai_fill_transparency"),
             "visual_anchor_coverage": average_metric("visual_anchor_coverage"),
             "shot_diversity": average_metric("shot_diversity"),
+            "story_conflict_coverage": average_metric("story_conflict_coverage"),
+            "story_ending_coverage": average_metric("story_ending_coverage"),
+            "scene_state_bridge_coverage": average_metric(
+                "scene_state_bridge_coverage"
+            ),
+            "storyboard_action_uniqueness": average_metric(
+                "storyboard_action_uniqueness"
+            ),
+            "storyboard_transition_explicitness": average_metric(
+                "storyboard_transition_explicitness"
+            ),
+            "storyboard_atomic_action_rate": average_metric(
+                "storyboard_atomic_action_rate"
+            ),
         },
         "duration_tolerance_pass_rate": round(
             sum(bool(bench.get("duration_within_tolerance")) for bench in benches)
@@ -1010,6 +1029,11 @@ def main() -> None:
         action="store_true",
         help="完全使用本地规则，不读取或请求真实文本 API",
     )
+    parser.add_argument(
+        "--llm-judge",
+        action="store_true",
+        help="每次额外调用文本模型评价故事、剧本和分镜质量",
+    )
     parser.add_argument("--render", action="store_true", help="允许批量调用付费视频 API")
     parser.add_argument(
         "--confirm-paid-video",
@@ -1034,6 +1058,8 @@ def main() -> None:
         parser.error("--target-seconds 必须在 15–300 之间。")
     if args.offline and args.allow_fallback:
         parser.error("--offline 与 --allow-fallback 不能同时使用。")
+    if args.offline and args.llm_judge:
+        parser.error("--offline 不能启用 --llm-judge。")
 
     try:
         cases = load_cases(args.input or default_cases_source())
@@ -1069,6 +1095,7 @@ def main() -> None:
                 lambda: StoryRenderer(AgnesVideoProvider.from_env()) if args.render else None
             ),
             require_live_text=require_live_text,
+            llm_judge=args.llm_judge,
             resume=args.resume,
             retries=args.retries,
             delay_seconds=args.delay_seconds,

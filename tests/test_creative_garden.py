@@ -255,9 +255,18 @@ class CreativeGardenIntegrationTests(unittest.TestCase):
                 target_seconds=30,
                 output_dir=temp_dir,
             )
+            quality = json.loads(
+                (Path(temp_dir) / "quality_report.json").read_text(encoding="utf-8")
+            )
+            human_review = json.loads(
+                (Path(temp_dir) / "human_review.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual("offline", result["bench"]["text_api_mode"])
         self.assertEqual("RuleBasedStoryAgent", result["bench"]["text_provider"])
+        self.assertEqual([], quality["hard_errors"])
+        self.assertIn("storyboard_action_uniqueness", quality["deterministic"])
+        self.assertIn("overall_watchability", human_review["scores"])
 
     def test_unconfigured_openai_agent_falls_back_without_recursion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

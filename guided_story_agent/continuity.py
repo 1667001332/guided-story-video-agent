@@ -219,6 +219,11 @@ def assign_continuity_modes(shots: list[StoryboardShot]) -> None:
     """Keep normal camera cuts independent; chain frames only when explicitly requested."""
     previous: StoryboardShot | None = None
     for shot in shots:
+        same_physical_scene = (
+            previous is not None
+            and same_scene(previous, shot)
+            and shot.transition_type != "scene_change"
+        )
         if previous is None:
             shot.previous_shot_id = None
             shot.inherit_previous_frame = False
@@ -227,7 +232,7 @@ def assign_continuity_modes(shots: list[StoryboardShot]) -> None:
             shot.continuity_mode = (
                 "new_scene_reference" if shot.reference_asset_ids else "independent"
             )
-        elif same_scene(previous, shot) and shot.inherit_previous_frame:
+        elif same_physical_scene and shot.inherit_previous_frame:
             shot.previous_shot_id = previous.shot_id
             shot.continuity_mode = "same_scene_chain"
             shot.transition_type = "continuous_action"
@@ -235,7 +240,7 @@ def assign_continuity_modes(shots: list[StoryboardShot]) -> None:
                 shot.transition_reason
                 or "动作被拆成连续过程，使用上一镜头真实末帧作为当前首帧"
             )
-        elif same_scene(previous, shot):
+        elif same_physical_scene:
             shot.previous_shot_id = previous.shot_id
             shot.inherit_previous_frame = False
             shot.continuity_mode = "same_scene_reference"
@@ -268,8 +273,7 @@ def same_scene(previous: StoryboardShot, current: StoryboardShot) -> bool:
     current_time = current_state.time_of_day.strip()
     time_matches = not previous_time or not current_time or previous_time == current_time
     return (
-        previous.scene_id == current.scene_id
-        and previous.location.strip() == current.location.strip()
+        previous.location.strip() == current.location.strip()
         and time_matches
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -14,12 +15,14 @@ from guided_story_agent.agent import OpenAIStoryAgent
 from guided_story_agent.models import RenderManifest, VideoArtifact
 from guided_story_agent.selfplay import run_selfplay
 from guided_story_agent.web_app import (
+    _autosaving_view,
     add_visual_reference_view,
     build_app,
     card_grid_payload,
     confirm_visual_inputs_view,
     generate_story_view,
     remove_visual_reference_view,
+    restore_saved_session_view,
     retake_shot_view,
     render_video_with_progress,
     refresh_ideas_view,
@@ -41,6 +44,81 @@ def make_render_ready_session():
 
 
 class CreativeGardenWebTests(unittest.TestCase):
+    def test_web_actions_autosave_and_restore_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            save_path = Path(temp) / "web" / "latest.json"
+            saved_start = _autosaving_view(
+                lambda: start_garden_view("雨夜车站", 30, RuleBasedStoryAgent())
+            )
+            with patch.dict(os.environ, {"WEB_SESSION_PATH": str(save_path)}):
+                original, *_ = saved_start()
+                self.assertTrue(save_path.is_file())
+                restored = restore_saved_session_view(
+                    agent=RuleBasedStoryAgent(),
+                    path=save_path,
+                )
+
+        active = restored[0]
+        self.assertTrue(save_path.parent.name == "web")
+        self.assertEqual(original.direction, active.direction)
+        self.assertEqual(Stage.IDEATING, active.stage)
+        self.assertEqual(8, len(active.current_batch.cards))
+        self.assertIn("已从", restored[20])
+
+    def test_manual_resolution_of_uncertain_submission_is_explicit(self) -> None:
+        def attach_uncertain(session):
+            artifact = VideoArtifact(
+                artifact_id="intent-1",
+                shot_id=session.storyboard.shots[0].shot_id,
+                provider="agnes",
+                model="agnes-video-v2.0",
+                status="submission_uncertain",
+                local_path="",
+                remote_url="",
+                duration=session.storyboard.shots[0].duration,
+                prompt=session.storyboard.shots[0].video_prompt,
+                created_at="now",
+                request_id="submit-intent-local",
+                error_message="submission started",
+            )
+            session.storyboard.artifacts.append(artifact)
+            session.render_manifest = RenderManifest(
+                status="submission_uncertain",
+                output_dir="outputs/test",
+                artifacts=[artifact],
+            )
+            return artifact
+
+        accepted_session = make_render_ready_session()
+        accepted = attach_uncertain(accepted_session)
+        accepted_session.resolve_submission_uncertainty(
+            accepted.shot_id,
+            accepted_by_provider=True,
+            provider_request_id="provider-job-123",
+        )
+        self.assertEqual("pending", accepted.status)
+        self.assertEqual("provider-job-123", accepted.request_id)
+        self.assertEqual("pending", accepted_session.render_manifest.status)
+
+        rejected_session = make_render_ready_session()
+        rejected = attach_uncertain(rejected_session)
+        rejected_session.resolve_submission_uncertainty(
+            rejected.shot_id,
+            accepted_by_provider=False,
+        )
+        self.assertEqual("failed", rejected.status)
+        self.assertIsNone(rejected.request_id)
+        self.assertEqual("failed", rejected_session.render_manifest.status)
+
+        invalid_session = make_render_ready_session()
+        invalid = attach_uncertain(invalid_session)
+        with self.assertRaisesRegex(ValueError, "Provider 后台任务 ID"):
+            invalid_session.resolve_submission_uncertainty(
+                invalid.shot_id,
+                accepted_by_provider=True,
+                provider_request_id="submit-intent-local",
+            )
+
     def test_start_handler_returns_eight_cards(self) -> None:
         session, update, selection, chat, status = start_garden_view(
             "校园悬疑", 30, RuleBasedStoryAgent()

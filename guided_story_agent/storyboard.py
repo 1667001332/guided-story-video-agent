@@ -35,7 +35,11 @@ class _ShotUnit:
     priority: int
     required: bool = False
     transition_type: str = "same_scene_cut"
+    transition_reason: str = ""
     inherit_previous_frame: bool = False
+    camera: str = ""
+    camera_movement: str = ""
+    composition: str = ""
 
 
 CAMERA_BY_KIND = {
@@ -116,6 +120,7 @@ def build_storyboard(
     script: StoryScript,
     facts: StoryFacts,
     visual_bible: VisualBible | None = None,
+    director_plan: list[dict[str, object]] | None = None,
 ) -> StoryboardPlan:
     if not script.confirmed:
         raise RuntimeError("请先确认剧本，再生成分镜。")
@@ -137,7 +142,11 @@ def build_storyboard(
     for scene, duration in zip(normalized.scenes, normalized_durations):
         scene.duration = duration
     bible = visual_bible or build_visual_bible(normalized, facts)
-    units = _plan_shot_units(normalized)
+    units = (
+        _units_from_director_plan(normalized, director_plan)
+        if director_plan
+        else _plan_shot_units(normalized)
+    )
     scene_shot_counts = {
         scene_id: sum(unit.scene.scene_id == scene_id for unit in units)
         for scene_id in {unit.scene.scene_id for unit in units}
@@ -213,11 +222,7 @@ def fit_scenes_to_duration(
     *,
     minimum: int = 3,
 ) -> list[StoryScene]:
-    """Merge consecutive scenes until every scene can receive ``minimum`` seconds.
-
-    The merge is deterministic and carries every causal/action text field into
-    the resulting scene instead of sampling scenes away later in storyboarding.
-    """
+    """Fit scenes without pretending that different places or times are one scene."""
 
     if not scenes:
         raise ValueError("剧本至少需要一个可拍摄场景。")
@@ -231,19 +236,39 @@ def fit_scenes_to_duration(
             scene.scene_id = index
         return result
 
-    group_count = maximum_count
-    result: list[StoryScene] = []
-    for group_index in range(group_count):
-        start = group_index * len(scenes) // group_count
-        end = (group_index + 1) * len(scenes) // group_count
-        group = scenes[start:end]
-        result.append(_merge_scene_group(group_index + 1, group))
+    result = deepcopy(scenes)
+    while len(result) > maximum_count:
+        compatible = next(
+            (
+                index
+                for index in range(len(result) - 1)
+                if _scenes_share_physical_context(result[index], result[index + 1])
+            ),
+            None,
+        )
+        if compatible is None:
+            raise ValueError(
+                "剧本场景超过目标时长容量，且剩余场景跨地点或跨时段；"
+                "禁止机械合并，请让文本模型压缩或重写剧本。"
+            )
+        merged = _merge_scene_group(
+            compatible + 1,
+            result[compatible : compatible + 2],
+        )
+        result[compatible : compatible + 2] = [merged]
+    for index, scene in enumerate(result, start=1):
+        scene.scene_id = index
     return result
 
 
 def _merge_scene_group(scene_id: int, group: list[StoryScene]) -> StoryScene:
     if not group:
         raise ValueError("不能合并空场景组。")
+    if any(
+        not _scenes_share_physical_context(group[0], item)
+        for item in group[1:]
+    ):
+        raise ValueError("不同地点或不同时段的场景不能机械合并。")
 
     def joined(values, separator: str = "；随后，") -> str:
         return separator.join(str(value).strip() for value in values if str(value).strip())
@@ -251,8 +276,8 @@ def _merge_scene_group(scene_id: int, group: list[StoryScene]) -> StoryScene:
     return StoryScene(
         scene_id=scene_id,
         title=joined((scene.title for scene in group), " / "),
-        location=joined((scene.location for scene in group), " → "),
-        time_of_day=joined(_unique(scene.time_of_day for scene in group), " → "),
+        location=group[0].location,
+        time_of_day=group[0].time_of_day,
         characters=_unique(character for scene in group for character in scene.characters),
         action=joined((scene.visible_action or scene.action for scene in group)),
         visible_action=joined((scene.visible_action or scene.action for scene in group)),
@@ -266,45 +291,120 @@ def _merge_scene_group(scene_id: int, group: list[StoryScene]) -> StoryScene:
     )
 
 
-def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
-    """Derive shots from filmable events instead of a fixed camera sequence."""
+def _scenes_share_physical_context(left: StoryScene, right: StoryScene) -> bool:
+    return (
+        left.location.strip() == right.location.strip()
+        and left.time_of_day.strip() == right.time_of_day.strip()
+    )
+
+
+def _units_from_director_plan(
+    script: StoryScript,
+    director_plan: list[dict[str, object]],
+) -> list[_ShotUnit]:
+    scenes = {scene.scene_id: scene for scene in script.scenes}
     units: list[_ShotUnit] = []
-    previous_location = ""
+    for index, item in enumerate(director_plan):
+        scene_id = int(item.get("scene_id", 0))
+        scene = scenes.get(scene_id)
+        if scene is None:
+            raise ValueError(f"导演分镜引用了不存在的场景：{scene_id}")
+        kind = str(item.get("kind", "action")).strip()
+        if kind not in CAMERA_BY_KIND:
+            raise ValueError(f"导演分镜使用了不支持的镜头类型：{kind}")
+        action = str(item.get("action", "")).strip()
+        purpose = str(item.get("purpose", "")).strip()
+        if not action or not purpose:
+            raise ValueError("导演分镜的 action 和 purpose 不能为空。")
+        transition_type = str(item.get("transition_type", "same_scene_cut")).strip()
+        inherit = item.get("inherit_previous_frame", False)
+        if not isinstance(inherit, bool):
+            raise ValueError("inherit_previous_frame 必须是布尔值。")
+        if inherit:
+            if index == 0 or transition_type != "continuous_action":
+                raise ValueError("只有非开场的连续动作镜头可以继承上一镜头末帧。")
+            previous_scene = units[-1].scene
+            if not _scenes_share_physical_context(previous_scene, scene):
+                raise ValueError("跨地点或跨时段镜头不能继承上一镜头末帧。")
+        units.append(
+            _ShotUnit(
+                scene=scene,
+                kind=kind,
+                action=action,
+                purpose=purpose,
+                priority=6 if kind == "action" else 4,
+                required=True,
+                transition_type=transition_type,
+                transition_reason=str(item.get("transition_reason", "")).strip(),
+                inherit_previous_frame=inherit,
+                camera=str(item.get("camera", "")).strip(),
+                camera_movement=str(item.get("camera_movement", "")).strip(),
+                composition=str(item.get("composition", "")).strip(),
+            )
+        )
+    minimum = max(1, math.ceil(script.target_seconds / 15))
+    maximum = max(1, script.target_seconds // 3)
+    if not minimum <= len(units) <= maximum:
+        raise ValueError(f"导演分镜数量必须在 {minimum} 到 {maximum} 之间。")
+    if {unit.scene.scene_id for unit in units} != set(scenes):
+        raise ValueError("导演分镜必须覆盖每个剧本场景。")
+    return units
+
+
+def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
+    """Derive non-repeating, atomic fallback shots when no model director is available."""
+    units: list[_ShotUnit] = []
+    previous_context: tuple[str, str] | None = None
     for scene in script.scenes:
         action = (scene.visible_action or scene.action).strip()
         if not action:
             action = "人物完成一个清晰可见的动作"
-        if not previous_location or scene.location != previous_location:
+        context = (scene.location.strip(), scene.time_of_day.strip())
+        if previous_context is None or context != previous_context:
             units.append(
                 _ShotUnit(
                     scene,
                     "establish",
-                    f"建立{scene.location}的空间关系，并让动作开始：{action}",
+                    scene.start_state.strip()
+                    or f"人物位于{scene.location}，动作即将开始",
                     f"交代《{scene.title}》的空间、人物位置和行动起点",
-                    priority=4 if not previous_location else 2,
+                    priority=4 if previous_context is None else 2,
                     transition_type="scene_change",
+                    transition_reason="地点或时段变化，需要重新建立空间关系",
                 )
             )
-        units.append(
-            _ShotUnit(
-                scene,
-                "action",
-                action,
-                f"完整呈现《{scene.title}》中推动故事的可见行动",
-                priority=6,
-                required=True,
-                transition_type="same_scene_cut",
+        beats = _split_action_beats(action)
+        for beat_index, beat in enumerate(beats):
+            continuous = beat_index > 0 and _is_direct_action_continuation(beat)
+            units.append(
+                _ShotUnit(
+                    scene,
+                    "action",
+                    beat,
+                    f"呈现《{scene.title}》中第{beat_index + 1}个不可省略的动作阶段",
+                    priority=6,
+                    required=True,
+                    transition_type=(
+                        "continuous_action" if continuous else "same_scene_cut"
+                    ),
+                    transition_reason=(
+                        "同一物理动作的直接下一阶段"
+                        if continuous
+                        else "动作阶段变化，正常切换机位重新构图"
+                    ),
+                    inherit_previous_frame=continuous,
+                )
             )
-        )
         if scene.props:
             units.append(
                 _ShotUnit(
                     scene,
                     "detail",
-                    f"突出{_join(scene.props)}与人物动作之间的关系",
+                    f"呈现{_join(scene.props)}当前状态、所在位置及其与人物动作的关系",
                     f"让关键道具成为《{scene.title}》的叙事证据",
                     priority=4,
                     transition_type="insert_shot",
+                    transition_reason="插入道具细节，不继承上一镜头机位",
                 )
             )
         if scene.dialogue.strip():
@@ -316,6 +416,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     "通过视线、停顿和身体反应呈现对话关系",
                     priority=3,
                     transition_type="reverse_shot",
+                    transition_reason="对白关系需要独立的正反打或过肩构图",
                 )
             )
         if scene.emotional_change.strip():
@@ -327,6 +428,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     f"让《{scene.title}》的情绪变化可以被看见",
                     priority=4,
                     transition_type="reaction_cut",
+                    transition_reason="切到人物反应以呈现新的情绪信息",
                 )
             )
         if scene.end_state.strip() and scene.end_state.strip() != scene.start_state.strip():
@@ -338,45 +440,60 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     f"明确《{scene.title}》结束时已经发生的状态变化",
                     priority=5,
                     transition_type="same_scene_cut",
+                    transition_reason="动作结果需要独立构图确认，不强制沿用上一机位",
                 )
             )
-        previous_location = scene.location
+        previous_context = context
 
     maximum = max(1, script.target_seconds // 3)
     minimum = max(
         math.ceil(script.target_seconds / 15),
         min(len(script.scenes), maximum),
-        min(math.ceil(script.target_seconds / 12), maximum),
     )
     units = _trim_units(units, maximum)
-    while len(units) < minimum:
-        source = max(
-            (item for item in units if item.kind == "action"),
-            key=lambda item: item.scene.duration,
-            default=units[-1],
-        )
-        insertion = units.index(source) + 1
-        units.insert(
-            insertion,
-            _ShotUnit(
-                source.scene,
-                "action",
-                f"{source.action}过程中出现的关键变化，动作方向与前后镜头连续",
-                f"补足《{source.scene.title}》中不能被一个镜头省略的行动过程",
-                priority=5,
-                required=True,
-                transition_type="continuous_action",
-                inherit_previous_frame=True,
-            ),
+    if len(units) < minimum:
+        raise ValueError(
+            f"剧本只有 {len(units)} 个有信息增量的镜头单元，"
+            f"不足以支撑 {script.target_seconds} 秒（至少需要 {minimum} 个）；"
+            "请扩充剧本的可见动作，而不是用重复镜头填时长。"
         )
     return units
+
+
+def _split_action_beats(action: str) -> list[str]:
+    pieces = [
+        piece.strip(" ，,；;")
+        for piece in re.split(
+            r"(?<=[。！？；;])|(?=随后|接着|紧接着|然后|同时|随即|继而)",
+            action,
+        )
+        if piece.strip(" ，,；;")
+    ]
+    return pieces or [action.strip()]
+
+
+def _is_direct_action_continuation(action: str) -> bool:
+    value = action.strip()
+    return value.startswith(
+        (
+            "随后",
+            "接着",
+            "紧接着",
+            "然后",
+            "随即",
+            "继而",
+            "继续",
+        )
+    )
 
 
 def _trim_units(units: list[_ShotUnit], maximum: int) -> list[_ShotUnit]:
     if len(units) <= maximum:
         return units
     required_indexes = [index for index, unit in enumerate(units) if unit.required]
-    if len(required_indexes) >= maximum:
+    if len(required_indexes) > maximum:
+        return _collapse_required_units(units, required_indexes, maximum)
+    if len(required_indexes) == maximum:
         chosen = set(_evenly_spaced(required_indexes, maximum))
     else:
         slots = maximum - len(required_indexes)
@@ -386,6 +503,72 @@ def _trim_units(units: list[_ShotUnit], maximum: int) -> list[_ShotUnit]:
         )
         chosen = set(required_indexes + extras[:slots])
     return [unit for index, unit in enumerate(units) if index in chosen]
+
+
+def _collapse_required_units(
+    units: list[_ShotUnit],
+    required_indexes: list[int],
+    maximum: int,
+) -> list[_ShotUnit]:
+    """Keep every required action by grouping adjacent beats inside each script scene."""
+    by_scene: dict[int, list[int]] = {}
+    scene_order: list[int] = []
+    for index in required_indexes:
+        scene_id = units[index].scene.scene_id
+        if scene_id not in by_scene:
+            by_scene[scene_id] = []
+            scene_order.append(scene_id)
+        by_scene[scene_id].append(index)
+    if len(scene_order) > maximum:
+        raise ValueError("剧本场景数超过可用镜头数，无法在不丢失动作的前提下生成分镜。")
+    capacities = {scene_id: 1 for scene_id in scene_order}
+    remaining = maximum - len(scene_order)
+    while remaining:
+        expandable = [
+            scene_id
+            for scene_id in scene_order
+            if capacities[scene_id] < len(by_scene[scene_id])
+        ]
+        if not expandable:
+            break
+        scene_id = max(
+            expandable,
+            key=lambda item: len(by_scene[item]) - capacities[item],
+        )
+        capacities[scene_id] += 1
+        remaining -= 1
+
+    collapsed: list[tuple[int, _ShotUnit]] = []
+    for scene_id in scene_order:
+        indexes = by_scene[scene_id]
+        capacity = capacities[scene_id]
+        for group_number in range(capacity):
+            start = group_number * len(indexes) // capacity
+            end = (group_number + 1) * len(indexes) // capacity
+            group = indexes[start:end]
+            first = units[group[0]]
+            actions = [units[index].action.rstrip("。") for index in group]
+            purposes = [units[index].purpose for index in group]
+            collapsed.append(
+                (
+                    group[0],
+                    _ShotUnit(
+                        scene=first.scene,
+                        kind="action",
+                        action="；随后，".join(actions),
+                        purpose="；".join(purposes),
+                        priority=max(units[index].priority for index in group),
+                        required=True,
+                        transition_type="same_scene_cut",
+                        transition_reason=(
+                            "目标时长不足以拆成更多镜头，同一场景内的相邻动作阶段"
+                            "合并在一个镜头中完整呈现"
+                        ),
+                        inherit_previous_frame=False,
+                    ),
+                )
+            )
+    return [unit for _, unit in sorted(collapsed, key=lambda item: item[0])]
 
 
 def _build_shot(
@@ -404,13 +587,10 @@ def _build_shot(
     seed: int,
 ) -> StoryboardShot:
     scene = unit.scene
-    camera, movement, composition = CAMERA_BY_KIND[unit.kind]
-    if shot_id == total_shots:
-        camera, movement, composition = (
-            "wide closing shot",
-            "slow pull-back",
-            "保留动作结果、人物关系和情绪余韵",
-        )
+    default_camera, default_movement, default_composition = CAMERA_BY_KIND[unit.kind]
+    camera = unit.camera or default_camera
+    movement = unit.camera_movement or default_movement
+    composition = unit.composition or default_composition
     character = scene.characters[0] if scene.characters else "主角"
     start_frame = _state_frame_summary(
         start_state,
@@ -481,6 +661,7 @@ def _build_shot(
         end_frame_prompt=end_frame_prompt,
         reference_asset_ids=reference_ids,
         transition_type=unit.transition_type,
+        transition_reason=unit.transition_reason,
         inherit_previous_frame=unit.inherit_previous_frame,
         continuity_state={
             "start": continuity_state_to_dict(start_state),
@@ -608,16 +789,25 @@ def _derive_continuity_states(
     """Advance formal state shot by shot while preserving cross-scene identity."""
     result: list[tuple[ContinuityState, ContinuityState]] = []
     current: ContinuityState | None = None
-    previous_scene_id: int | None = None
+    previous_scene: StoryScene | None = None
     for unit in units:
-        if current is None or unit.scene.scene_id != previous_scene_id:
+        if current is None:
             start = _new_scene_state(current, unit.scene, bible)
-        else:
+        elif unit.transition_type == "scene_change":
+            start = _new_scene_state(current, unit.scene, bible)
+        elif previous_scene is not None and unit.scene.scene_id == previous_scene.scene_id:
             start = deepcopy(current)
+        elif previous_scene is not None and _scenes_share_physical_context(
+            previous_scene,
+            unit.scene,
+        ):
+            start = _continue_physical_scene_state(current, unit.scene, bible)
+        else:
+            start = _new_scene_state(current, unit.scene, bible)
         end = _apply_shot_transition(start, unit)
         result.append((start, end))
         current = deepcopy(end)
-        previous_scene_id = unit.scene.scene_id
+        previous_scene = unit.scene
     return result
 
 
@@ -664,6 +854,40 @@ def _new_scene_state(
             if prop not in held:
                 held.append(prop)
     _update_injuries(state, scene.characters, start_description)
+    return state
+
+
+def _continue_physical_scene_state(
+    previous: ContinuityState,
+    scene: StoryScene,
+    bible: VisualBible,
+) -> ContinuityState:
+    state = deepcopy(previous)
+    descriptions = {
+        asset.name: asset.description
+        for asset in bible.assets
+        if asset.kind == "character"
+    }
+    for name in scene.characters:
+        anchor = descriptions.get(name, f"{name}外观沿用已确认人物设定")
+        state.character_appearance.setdefault(name, anchor)
+        state.character_clothing.setdefault(name, anchor)
+        state.character_positions.setdefault(
+            name,
+            scene.start_state.strip() or f"{name}仍位于{scene.location}",
+        )
+    state.location = scene.location
+    state.time_of_day = scene.time_of_day or state.time_of_day
+    weather = _weather_from_scene(scene)
+    if weather != "天气未说明":
+        state.weather = weather
+    state.key_light_direction = _light_from_scene(scene, bible) or state.key_light_direction
+    for prop in scene.props:
+        state.prop_positions.setdefault(
+            prop,
+            scene.start_state.strip() or f"{prop}仍位于上一镜头记录的位置",
+        )
+    _update_injuries(state, scene.characters, scene.start_state)
     return state
 
 
