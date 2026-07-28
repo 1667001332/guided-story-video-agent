@@ -16,7 +16,23 @@ from .models import (
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-CONTINUITY_MODES = {"independent", "same_scene_chain", "new_scene_reference"}
+CONTINUITY_MODES = {
+    "independent",
+    "same_scene_chain",
+    "same_scene_reference",
+    "new_scene_reference",
+}
+TRANSITION_TYPES = {
+    "opening",
+    "continuous_action",
+    "same_scene_cut",
+    "reverse_shot",
+    "insert_shot",
+    "reaction_cut",
+    "scene_change",
+    "montage",
+    "independent",
+}
 VISUAL_REFERENCE_USAGES = {
     "identity_reference",
     "location_reference",
@@ -200,19 +216,45 @@ def confirmed_start_frame(shot: StoryboardShot) -> VisualReference | None:
 
 
 def assign_continuity_modes(shots: list[StoryboardShot]) -> None:
-    """Assign deterministic dependency modes to a newly built storyboard."""
+    """Keep normal camera cuts independent; chain frames only when explicitly requested."""
     previous: StoryboardShot | None = None
     for shot in shots:
         if previous is None:
             shot.previous_shot_id = None
+            shot.inherit_previous_frame = False
+            shot.transition_type = "opening"
+            shot.transition_reason = "开场镜头，独立建立机位和构图"
             shot.continuity_mode = (
                 "new_scene_reference" if shot.reference_asset_ids else "independent"
             )
-        elif same_scene(previous, shot):
+        elif same_scene(previous, shot) and shot.inherit_previous_frame:
             shot.previous_shot_id = previous.shot_id
             shot.continuity_mode = "same_scene_chain"
+            shot.transition_type = "continuous_action"
+            shot.transition_reason = (
+                shot.transition_reason
+                or "动作被拆成连续过程，使用上一镜头真实末帧作为当前首帧"
+            )
+        elif same_scene(previous, shot):
+            shot.previous_shot_id = previous.shot_id
+            shot.inherit_previous_frame = False
+            shot.continuity_mode = "same_scene_reference"
+            if shot.transition_type not in TRANSITION_TYPES or shot.transition_type in {
+                "opening",
+                "scene_change",
+                "continuous_action",
+                "independent",
+            }:
+                shot.transition_type = "same_scene_cut"
+            shot.transition_reason = (
+                shot.transition_reason
+                or "同一场景正常切换机位；继承人物和场景状态，但不继承上一镜头构图"
+            )
         else:
             shot.previous_shot_id = None
+            shot.inherit_previous_frame = False
+            shot.transition_type = "scene_change"
+            shot.transition_reason = "地点、场景或时段变化，使用新场景自己的构图和参考输入"
             shot.continuity_mode = (
                 "new_scene_reference" if shot.reference_asset_ids else "independent"
             )
@@ -237,7 +279,7 @@ def validate_continuity_boundary(
     current: StoryboardShot,
 ) -> ContinuityCheck:
     """Compare the previous end state with the current start state."""
-    if current.continuity_mode != "same_scene_chain":
+    if current.continuity_mode not in {"same_scene_chain", "same_scene_reference"}:
         return ContinuityCheck([], [])
 
     before = previous.continuity_end_state
@@ -310,6 +352,9 @@ def build_input_fingerprint(
         "prompt": shot.video_prompt,
         "negative_prompt": shot.negative_prompt,
         "continuity_mode": shot.continuity_mode,
+        "transition_type": shot.transition_type,
+        "transition_reason": shot.transition_reason,
+        "inherit_previous_frame": shot.inherit_previous_frame,
         "previous_shot_id": shot.previous_shot_id,
         "seed": shot.seed,
         "initial_frame_url": shot.initial_frame_url,

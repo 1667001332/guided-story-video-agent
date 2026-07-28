@@ -193,6 +193,46 @@ class TimingTests(unittest.TestCase):
         self.assertTrue(all(shot.end_frame_prompt for shot in plan.shots))
         self.assertTrue(all("FIRST FRAME:" in shot.video_prompt for shot in plan.shots))
 
+    def test_same_scene_normally_cuts_camera_without_inheriting_last_frame(self) -> None:
+        script = StoryScript(
+            "审讯室切镜",
+            30,
+            [
+                StoryScene(
+                    1,
+                    "证据出现",
+                    "审讯室",
+                    "深夜",
+                    ["警探", "证人"],
+                    "证人把怀表推向警探，警探观察表盖上的血迹",
+                    "",
+                    30,
+                    dialogue="这块表不是我的。",
+                    props=["铜怀表"],
+                    visible_action="证人把怀表推向警探，警探观察表盖上的血迹",
+                    start_state="两人隔桌对坐，怀表在证人手中",
+                    end_state="怀表停在警探面前",
+                    emotional_change="警探从怀疑转为警觉",
+                )
+            ],
+            confirmed=True,
+        )
+        plan = build_storyboard(script, StoryFacts())
+        normal_cuts = [
+            shot
+            for shot in plan.shots
+            if shot.continuity_mode == "same_scene_reference"
+        ]
+
+        self.assertTrue(normal_cuts)
+        self.assertTrue(all(not shot.inherit_previous_frame for shot in normal_cuts))
+        self.assertTrue(
+            all("正常切镜" in shot.video_prompt for shot in normal_cuts)
+        )
+        self.assertTrue(
+            any(shot.transition_type == "insert_shot" for shot in normal_cuts)
+        )
+
     def test_story_content_drives_shot_count(self) -> None:
         simple = StoryScript(
             "简单动作",

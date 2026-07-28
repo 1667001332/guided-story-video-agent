@@ -34,6 +34,8 @@ class _ShotUnit:
     purpose: str
     priority: int
     required: bool = False
+    transition_type: str = "same_scene_cut"
+    inherit_previous_frame: bool = False
 
 
 CAMERA_BY_KIND = {
@@ -191,6 +193,7 @@ def build_storyboard(
     ]
     _assign_narration_timeline(shots, normalized.scenes)
     assign_continuity_modes(shots)
+    apply_transition_prompt_context(shots)
     plan = StoryboardPlan(
         title=normalized.title,
         target_seconds=normalized.target_seconds,
@@ -279,6 +282,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     f"建立{scene.location}的空间关系，并让动作开始：{action}",
                     f"交代《{scene.title}》的空间、人物位置和行动起点",
                     priority=4 if not previous_location else 2,
+                    transition_type="scene_change",
                 )
             )
         units.append(
@@ -289,6 +293,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                 f"完整呈现《{scene.title}》中推动故事的可见行动",
                 priority=6,
                 required=True,
+                transition_type="same_scene_cut",
             )
         )
         if scene.props:
@@ -299,6 +304,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     f"突出{_join(scene.props)}与人物动作之间的关系",
                     f"让关键道具成为《{scene.title}》的叙事证据",
                     priority=4,
+                    transition_type="insert_shot",
                 )
             )
         if scene.dialogue.strip():
@@ -309,6 +315,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     f"人物说出对白时仍有可见反应和动作：{scene.dialogue}",
                     "通过视线、停顿和身体反应呈现对话关系",
                     priority=3,
+                    transition_type="reverse_shot",
                 )
             )
         if scene.emotional_change.strip():
@@ -319,6 +326,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     f"呈现情绪变化：{scene.emotional_change}",
                     f"让《{scene.title}》的情绪变化可以被看见",
                     priority=4,
+                    transition_type="reaction_cut",
                 )
             )
         if scene.end_state.strip() and scene.end_state.strip() != scene.start_state.strip():
@@ -329,6 +337,7 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                     scene.end_state.strip(),
                     f"明确《{scene.title}》结束时已经发生的状态变化",
                     priority=5,
+                    transition_type="same_scene_cut",
                 )
             )
         previous_location = scene.location
@@ -356,6 +365,8 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
                 f"补足《{source.scene.title}》中不能被一个镜头省略的行动过程",
                 priority=5,
                 required=True,
+                transition_type="continuous_action",
+                inherit_previous_frame=True,
             ),
         )
     return units
@@ -469,6 +480,8 @@ def _build_shot(
         motion_prompt=motion_prompt,
         end_frame_prompt=end_frame_prompt,
         reference_asset_ids=reference_ids,
+        transition_type=unit.transition_type,
+        inherit_previous_frame=unit.inherit_previous_frame,
         continuity_state={
             "start": continuity_state_to_dict(start_state),
             "end": continuity_state_to_dict(end_state),
@@ -477,6 +490,42 @@ def _build_shot(
         continuity_end_state=end_state,
         seed=seed,
     )
+
+
+def apply_transition_prompt_context(shots: list[StoryboardShot]) -> None:
+    """Idempotently describe the edit relationship in each one-shot prompt."""
+    for shot in shots:
+        if shot.continuity_mode == "same_scene_chain":
+            instruction = (
+                f"转场关系：连续动作，承接镜头 {shot.previous_shot_id} 的真实结束画面；"
+                "保持机位运动和动作方向连续，不重新建立构图。"
+            )
+        elif shot.continuity_mode == "same_scene_reference":
+            instruction = (
+                f"转场关系：{shot.transition_type}。这是同一场景内的正常切镜；"
+                "重新建立本镜头的景别、角度和构图，不沿用上一镜头画面，"
+                "但保持人物身份、服装、伤势、道具位置、地点、时段和主光方向一致。"
+            )
+        elif shot.continuity_mode == "new_scene_reference":
+            instruction = (
+                "转场关系：场景切换。使用新地点和本镜头自己的机位构图，"
+                "不继承上一镜头画面；只保留跨场景仍成立的人物身份和剧情状态。"
+            )
+        else:
+            instruction = "转场关系：独立镜头。按照本镜头描述重新建立机位和构图。"
+        marker = f"[TRANSITION]{instruction}[/TRANSITION] "
+        first_frame = re.sub(
+            r"^\[TRANSITION\].*?\[/TRANSITION\]\s*",
+            "",
+            shot.first_frame_prompt,
+        )
+        video_prompt = re.sub(
+            r"^\[TRANSITION\].*?\[/TRANSITION\]\s*",
+            "",
+            shot.video_prompt,
+        )
+        shot.first_frame_prompt = f"{marker}{first_frame}"
+        shot.video_prompt = f"{marker}{video_prompt}"
 
 
 def _assign_narration_timeline(

@@ -534,8 +534,10 @@ class StoryRenderer:
                     False,
                     diagnostics,
                 )
-        elif shot.continuity_mode == "new_scene_reference":
-            provider_shot.previous_shot_id = None
+        elif shot.continuity_mode in {
+            "same_scene_reference",
+            "new_scene_reference",
+        }:
             shot.initial_frame_source_path = fixed_start_path
             shot.initial_frame_path = fixed_start_path
             shot.initial_frame_url = ""
@@ -543,11 +545,17 @@ class StoryRenderer:
             provider_shot.initial_frame_path = shot.initial_frame_path
             provider_shot.initial_frame_url = ""
             if not provider_shot.initial_frame_path:
-                used_fallback = True
-                diagnostics.append(
-                    "新场景没有已确认 start_frame，已显式标记为无参考文本回退；"
-                    "人物/地点/道具参考图不会冒充视频首帧"
-                )
+                if provider_shot.reference_image_paths:
+                    diagnostics.append(
+                        "本镜头正常切换机位，不继承上一镜头末帧；"
+                        "将使用已确认人物/地点/道具参考图重新构图"
+                    )
+                else:
+                    used_fallback = True
+                    diagnostics.append(
+                        "本镜头没有已确认 start_frame 或固定参考图，"
+                        "已显式标记为无参考文本回退；不会继承上一镜头构图"
+                    )
         else:
             provider_shot.previous_shot_id = None
             shot.initial_frame_source_path = fixed_start_path
@@ -614,6 +622,9 @@ class StoryRenderer:
                 pass
             else:
                 provider_shot.reference_image_paths = []
+                used_fallback = used_fallback or not bool(
+                    provider_shot.initial_frame_path
+                )
                 diagnostics.append(
                     "Provider 不支持通用身份/地点/道具参考图；这些图片仅保留为审计输入，"
                     "不会转换成 Agnes image"
@@ -758,6 +769,9 @@ class StoryRenderer:
         artifact.initial_frame_url = shot.initial_frame_url
         artifact.previous_shot_id = shot.previous_shot_id
         artifact.continuity_mode = shot.continuity_mode
+        artifact.transition_type = shot.transition_type
+        artifact.transition_reason = shot.transition_reason
+        artifact.inherit_previous_frame = shot.inherit_previous_frame
         artifact.input_fingerprint = fingerprint
         artifact.seed = shot.seed
         if artifact.generated_first_frame_path:

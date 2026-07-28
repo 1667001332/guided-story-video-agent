@@ -420,6 +420,9 @@ class StoryboardShot:
     initial_frame_url: str = ""
     previous_shot_id: int | None = None
     continuity_mode: str = "independent"
+    transition_type: str = "independent"
+    transition_reason: str = ""
+    inherit_previous_frame: bool = False
     continuity_state: dict[str, Any] = field(default_factory=dict)
     continuity_start_state: ContinuityState = field(default_factory=ContinuityState)
     continuity_end_state: ContinuityState = field(default_factory=ContinuityState)
@@ -451,6 +454,9 @@ class VideoArtifact:
     initial_frame_url: str = ""
     previous_shot_id: int | None = None
     continuity_mode: str = "independent"
+    transition_type: str = "independent"
+    transition_reason: str = ""
+    inherit_previous_frame: bool = False
     input_fingerprint: str = ""
     seed: int | None = None
     generated_first_frame_path: str = ""

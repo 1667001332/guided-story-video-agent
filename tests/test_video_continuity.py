@@ -71,6 +71,14 @@ def make_shot(
         negative_prompt="bad",
         continuity_mode=mode,
         previous_shot_id=previous_shot_id,
+        transition_type=(
+            "continuous_action"
+            if mode == "same_scene_chain"
+            else "same_scene_cut"
+            if mode == "same_scene_reference"
+            else "independent"
+        ),
+        inherit_previous_frame=mode == "same_scene_chain",
         continuity_start_state=deepcopy(state),
         continuity_end_state=deepcopy(state),
     )
@@ -310,6 +318,38 @@ class VideoContinuityTests(unittest.TestCase):
         self.assertEqual("succeeded", manifest.status)
         self.assertEqual("", provider.calls[0].initial_frame_path)
         self.assertTrue(provider.calls[1].initial_frame_path.endswith("shot_001_last.png"))
+
+    def test_same_scene_camera_cut_does_not_inherit_previous_frame(self) -> None:
+        provider = FakeVisualProvider()
+        plan = StoryboardPlan(
+            "normal cut",
+            6,
+            [
+                make_shot(1),
+                make_shot(
+                    2,
+                    mode="same_scene_reference",
+                    previous_shot_id=1,
+                ),
+            ],
+            "",
+            confirmed=True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch("guided_story_agent.rendering.validate_mp4_file", return_value=True),
+        ):
+            manifest = StoryRenderer(
+                provider,
+                narration=EmptyNarration(),
+                assembler=fake_assemble,
+                frame_extractor=fake_extract,
+            ).render(plan, temp)
+
+        self.assertEqual("succeeded_with_warnings", manifest.status)
+        self.assertFalse(provider.calls[1].inherit_previous_frame)
+        self.assertEqual("", provider.calls[1].initial_frame_path)
+        self.assertEqual("same_scene_reference", provider.calls[1].continuity_mode)
 
     def test_new_location_never_inherits_previous_last_frame(self) -> None:
         provider = FakeVisualProvider()
@@ -1037,8 +1077,22 @@ class VideoContinuityTests(unittest.TestCase):
         session.generate_script()
         session.confirm_script()
         plan = session.build_storyboard()
+        chained_shot = next(
+            shot
+            for shot in plan.shots
+            if shot.continuity_mode == "same_scene_reference"
+        )
+        plan = session.update_storyboard_shot(
+            chained_shot.shot_id,
+            {
+                "continuity_mode": "same_scene_chain",
+                "transition_type": "continuous_action",
+                "transition_reason": "测试显式连续动作末帧继承",
+                "inherit_previous_frame": True,
+            },
+        )
         session.confirm_storyboard()
-        self.assertTrue(any(shot.previous_shot_id for shot in plan.shots))
+        self.assertTrue(any(shot.inherit_previous_frame for shot in plan.shots))
 
         with (
             tempfile.TemporaryDirectory() as temp,
@@ -1062,7 +1116,7 @@ class VideoContinuityTests(unittest.TestCase):
         chained_index = next(
             index
             for index, shot in enumerate(plan.shots)
-            if shot.previous_shot_id is not None
+            if shot.inherit_previous_frame
         )
         payload = provider.payloads[chained_index]
         call = provider.calls[chained_index]

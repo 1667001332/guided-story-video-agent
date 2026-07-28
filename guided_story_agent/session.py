@@ -53,6 +53,7 @@ from .models import (
 )
 from .narration import normalize_narration_timeline
 from .storyboard import (
+    apply_transition_prompt_context,
     build_storyboard,
     derive_retake_seed,
     fit_scenes_to_duration,
@@ -806,6 +807,14 @@ class GuidedStorySession:
                 candidate.video_prompt,
                 candidate.duration,
             )
+        if {
+            "continuity_mode",
+            "transition_type",
+            "transition_reason",
+            "inherit_previous_frame",
+            "previous_shot_id",
+        }.intersection(patch):
+            apply_transition_prompt_context([candidate])
         candidate.initial_frame_source_path = ""
         candidate.initial_frame_path = ""
         candidate.initial_frame_url = ""
@@ -1780,6 +1789,8 @@ class GuidedStorySession:
             "initial_frame_path",
             "initial_frame_url",
             "continuity_mode",
+            "transition_type",
+            "transition_reason",
             "generated_first_frame_path",
             "generated_last_frame_path",
         )
@@ -1837,6 +1848,7 @@ class GuidedStorySession:
             if shot.continuity_mode not in {
                 "independent",
                 "same_scene_chain",
+                "same_scene_reference",
                 "new_scene_reference",
             }:
                 raise ValueError("镜头 continuity_mode 无法识别。")
@@ -1845,15 +1857,26 @@ class GuidedStorySession:
                 or not isinstance(shot.previous_shot_id, int)
             ):
                 raise ValueError("镜头 previous_shot_id 必须是整数或 null。")
-            if shot.continuity_mode == "same_scene_chain":
+            if shot.continuity_mode in {
+                "same_scene_chain",
+                "same_scene_reference",
+            }:
                 if (
                     shot.previous_shot_id is None
                     or shot.previous_shot_id == shot.shot_id
                     or shot.previous_shot_id not in seen_ids
                 ):
-                    raise ValueError("同场景连续镜头必须引用前面已存在的镜头。")
+                    raise ValueError("同场景镜头必须引用前面已存在的镜头。")
             elif shot.previous_shot_id is not None:
                 raise ValueError("独立或新场景镜头不能继承上一镜头。")
+            if not isinstance(shot.inherit_previous_frame, bool):
+                raise ValueError("镜头 inherit_previous_frame 必须是布尔值。")
+            if (
+                shot.continuity_mode == "same_scene_chain"
+            ) != shot.inherit_previous_frame:
+                raise ValueError(
+                    "只有 same_scene_chain 可以继承上一镜头末帧。"
+                )
             if shot.seed is not None and (
                 isinstance(shot.seed, bool) or not isinstance(shot.seed, int)
             ):
@@ -1944,6 +1967,8 @@ class GuidedStorySession:
             "initial_frame_path",
             "initial_frame_url",
             "continuity_mode",
+            "transition_type",
+            "transition_reason",
             "input_fingerprint",
             "generated_first_frame_path",
             "generated_last_frame_path",
@@ -2000,6 +2025,8 @@ class GuidedStorySession:
                 raise TypeError("视频产物 previous_shot_id 必须是整数或 null。")
             if artifact.seed is not None and not isinstance(artifact.seed, int):
                 raise TypeError("视频产物 seed 必须是整数或 null。")
+            if not isinstance(artifact.inherit_previous_frame, bool):
+                raise TypeError("视频产物继承末帧标志必须是布尔值。")
             if not isinstance(artifact.used_unreferenced_fallback, bool):
                 raise TypeError("视频产物无参考回退标志必须是布尔值。")
 
@@ -2536,6 +2563,22 @@ class GuidedStorySession:
         payload["continuity_diagnostics"] = [
             str(item) for item in payload.get("continuity_diagnostics", [])
         ]
+        mode = str(payload.get("continuity_mode", "independent"))
+        payload["inherit_previous_frame"] = GuidedStorySession._strict_bool(
+            payload.get("inherit_previous_frame", mode == "same_scene_chain"),
+            "video_artifact.inherit_previous_frame",
+        )
+        payload["transition_type"] = str(
+            payload.get("transition_type")
+            or (
+                "continuous_action"
+                if mode == "same_scene_chain"
+                else "scene_change"
+                if mode == "new_scene_reference"
+                else "independent"
+            )
+        )
+        payload["transition_reason"] = str(payload.get("transition_reason", ""))
         return VideoArtifact(**payload)
 
     @staticmethod
@@ -2577,6 +2620,22 @@ class GuidedStorySession:
         payload["continuity_end_state"] = GuidedStorySession._continuity_state_from(
             payload.get("continuity_end_state")
         )
+        mode = str(payload.get("continuity_mode", "independent"))
+        payload["inherit_previous_frame"] = GuidedStorySession._strict_bool(
+            payload.get("inherit_previous_frame", mode == "same_scene_chain"),
+            "storyboard_shot.inherit_previous_frame",
+        )
+        payload["transition_type"] = str(
+            payload.get("transition_type")
+            or (
+                "continuous_action"
+                if mode == "same_scene_chain"
+                else "scene_change"
+                if mode == "new_scene_reference"
+                else "independent"
+            )
+        )
+        payload["transition_reason"] = str(payload.get("transition_reason", ""))
         return StoryboardShot(**payload)
 
     @staticmethod

@@ -1845,6 +1845,10 @@ def _storyboard_markdown(plan) -> str:
             f"**动作：** {shot.motion_prompt}  \n"
             f"**结束帧：** {shot.end_frame_prompt}  \n"
             f"**连续性模式：** {shot.continuity_mode}  \n"
+            f"**切镜方式：** {shot.transition_type}  \n"
+            f"**切镜理由：** {shot.transition_reason or '旧会话未记录'}  \n"
+            f"**继承上一镜头末帧：** "
+            f"{'是，仅用于连续动作' if shot.inherit_previous_frame else '否，重新建立机位和构图'}  \n"
             f"**引用资产：** {'、'.join(shot.reference_asset_ids) or '暂无'}  \n"
             f"**已解析固定图：** "
             f"{'、'.join(shot.reference_image_paths) or '渲染时从视觉圣经解析'}  \n"
@@ -1869,6 +1873,8 @@ def _shot_start_reference(shot) -> str:
         return shot.initial_frame_path
     if shot.continuity_mode == "same_scene_chain" and shot.previous_shot_id is not None:
         return f"镜头 {shot.previous_shot_id} 的生成末帧"
+    if shot.continuity_mode == "same_scene_reference":
+        return "同场景切换机位；不继承上一镜头画面，仅共享连续性状态与固定参考图"
     if shot.continuity_mode == "new_scene_reference":
         return "本场景已确认固定参考图；若缺失会明确提示或标记无参考回退"
     return "独立镜头，不继承上一镜头"
