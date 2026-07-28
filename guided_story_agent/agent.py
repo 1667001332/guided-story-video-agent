@@ -424,6 +424,30 @@ class RuleBasedStoryAgent:
                 value="由故事生成阶段补全",
             )
             ai_filled_fields.append(field)
+        story_corpus = f"{direction} {card.title} {card.logline} {card.hook}"
+        if "玫瑰" in story_corpus and ("花店" in story_corpus or "订单" in story_corpus):
+            locations = [
+                StoryLocation(
+                    name="夜班花店",
+                    description="收银台、花束操作台与临街橱窗构成主要行动空间",
+                    visual_identity="冷白顶灯、红玫瑰、午夜电子钟",
+                ),
+                StoryLocation(
+                    name="花店配送台",
+                    description="堆放订单标签和包装材料的狭窄后场",
+                    visual_identity="手机屏幕、撕裂标签、低照度侧光",
+                ),
+            ]
+            visual_anchors = ["死者订单手机", "红玫瑰花束", "午夜倒计时"]
+        else:
+            locations = [
+                StoryLocation(
+                    name=f"{self._short_seed(direction)}主要行动地",
+                    description=f"承载“{direction}”主要行动的连续空间",
+                    visual_identity="保持统一的空间结构、主色和光线方向",
+                )
+            ]
+            visual_anchors = ["主角固定服装", "贯穿故事的关键物件", "统一场景主色"]
         return StoryDraft(
             title=" × ".join(item.title for item in cards),
             logline=_natural_join([item.logline for item in cards], "；"),
@@ -436,18 +460,12 @@ class RuleBasedStoryAgent:
                 )
                 for name in card_protagonists
             ],
-            locations=[
-                StoryLocation(
-                    name="故事核心场景",
-                    description=f"承载“{direction}”主要行动的连续空间",
-                    visual_identity="保持统一的空间结构、主色和光线方向",
-                )
-            ],
+            locations=locations,
             tone=card.tone,
             theme="人在代价面前如何作出真正属于自己的选择",
             core_conflict=conflict,
             ending=ending,
-            visual_anchors=["主角固定服装", "贯穿故事的关键物件", "统一场景主色"],
+            visual_anchors=visual_anchors,
             field_sources=field_sources,
             ai_filled_fields=ai_filled_fields,
         )
@@ -466,52 +484,175 @@ class RuleBasedStoryAgent:
     def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
         scene_count = max(3, round(int(target_seconds) / 9))
         durations = allocate_durations(target_seconds, scene_count, minimum=3, maximum=15)
-        events = [
-            item.strip() for item in re.split(r"(?<=[。！？])", story.story_text) if item.strip()
-        ]
-        if not events:
-            events = [story.logline]
-        locations = story.locations or [
-            StoryLocation("故事核心场景", "连续的故事空间", "统一空间与光线")
-        ]
         character_names = [item.name for item in story.characters] or ["主角"]
+        protagonist = character_names[0]
+        locations, props, beats = self._offline_script_material(story, protagonist)
         scenes: list[StoryScene] = []
-        conflict_scene_index = max(2, (scene_count + 1) // 2)
         for index, duration in enumerate(durations, 1):
-            event_index = (
-                0
-                if scene_count == 1
-                else round((index - 1) * (len(events) - 1) / (scene_count - 1))
-            )
-            event = events[event_index]
-            if index == conflict_scene_index and story.core_conflict.strip():
-                event = (
-                    f"{event} 人物必须面对这一核心冲突：{story.core_conflict.strip()}。"
-                )
-            if index == scene_count and story.ending.strip():
-                event = f"{event} 最终，{story.ending.strip()}。"
-            location = locations[
-                min(len(locations) - 1, (index - 1) * len(locations) // scene_count)
-            ]
+            beat_index = round((index - 1) * (len(beats) - 1) / max(1, scene_count - 1))
+            title, location_index, action, dialogue, narration, end_state = beats[beat_index]
+            location = locations[min(location_index, len(locations) - 1)]
+            previous_state = scenes[-1].end_state if scenes else f"{protagonist}尚未发现异常"
             scenes.append(
                 StoryScene(
                     scene_id=index,
-                    title=f"故事片段 {index}",
+                    title=title,
                     location=location.name,
                     time_of_day="连续时间",
                     characters=list(character_names),
-                    action=event,
-                    visible_action=event,
-                    narration=event,
+                    action=action,
+                    visible_action=action,
+                    narration=narration,
                     duration=duration,
-                    dialogue="" if index < scene_count else "我已经作出了选择。",
-                    props=list(story.visual_anchors[:2]),
-                    start_state="承接上一场的动作与人物状态",
-                    end_state=event,
-                    emotional_change=story.tone,
+                    dialogue=dialogue,
+                    props=list(props),
+                    start_state=f"承接上一场：{previous_state}",
+                    end_state=end_state,
+                    emotional_change=f"{story.tone}：局势向下一步行动推进",
                 )
             )
         return StoryScript(title=story.title, target_seconds=target_seconds, scenes=scenes)
+
+    @staticmethod
+    def _offline_script_material(
+        story: StoryDraft,
+        protagonist: str,
+    ) -> tuple[list[StoryLocation], list[str], list[tuple[str, int, str, str, str, str]]]:
+        """Create a filmable offline script without pretending abstract prose is a shot."""
+        corpus = " ".join(
+            (story.title, story.logline, story.story_text, story.core_conflict, story.ending)
+        )
+        if "玫瑰" in corpus and ("订单" in corpus or "花店" in corpus):
+            locations = [
+                StoryLocation("夜班花店", "临街花店的收银台与操作台", "冷白顶灯、红色玫瑰"),
+                StoryLocation("花店配送台", "堆放订单与包装纸的后场", "手机屏幕与标签特写"),
+                StoryLocation("花店门外警戒线", "警车灯映入橱窗的街道", "蓝红闪光与湿地面"),
+            ]
+            props = ["死者订单手机", "红玫瑰花束"]
+            conflict = story.core_conflict.strip() or "订单将在午夜删除，手机即将被警方带走"
+            ending = story.ending.strip() or "收花人就是店员，订单保存着求救证据"
+            beats = [
+                (
+                    "夜班来单",
+                    0,
+                    f"{protagonist}独自在收银台清点玫瑰，墙上时钟逼近午夜，订单手机突然亮起。",
+                    "",
+                    "情人节夜班原本平静。",
+                    "手机收到一笔异常玫瑰订单",
+                ),
+                (
+                    "死亡后的订单",
+                    0,
+                    f"{protagonist}放大订单时间，又对照手机里的死者遇害通报；两个时间相差十分钟。",
+                    "死人怎么会下单？",
+                    "",
+                    "她确认订单生成于死者死亡之后",
+                ),
+                (
+                    "留下证据",
+                    1,
+                    f"{protagonist}立即截屏并抄下订单号，删除倒计时在手机顶端跳动。",
+                    "",
+                    conflict,
+                    "她决定在手机被带走前找到收花人",
+                ),
+                (
+                    "追查收花人",
+                    1,
+                    f"{protagonist}翻查配送标签和夜班记录，把订单号、地址与死者姓名逐项连线。",
+                    "",
+                    "",
+                    "配送记录指向一张被撕掉姓名的标签",
+                ),
+                (
+                    "警方到门外",
+                    2,
+                    f"警车灯扫过橱窗；{protagonist}看见警员走近，迅速把订单截图传到自己的手机。",
+                    "再给我一分钟。",
+                    "",
+                    "警方即将收走订单手机",
+                ),
+                (
+                    "标签背面的线索",
+                    1,
+                    f"{protagonist}把撕裂标签贴回花束包装，背面的笔画拼成她自己的姓氏。",
+                    "",
+                    "",
+                    "她发现收花人的姓名可能与自己有关",
+                ),
+                (
+                    "收件人揭晓",
+                    0,
+                    f"{protagonist}重新打开订单详情，在收件人栏看到自己的全名，手里的玫瑰停在半空。",
+                    "这束花……是给我的。",
+                    "",
+                    "收花人确认是她本人",
+                ),
+                (
+                    "求救信息",
+                    0,
+                    f"{protagonist}拆开花束，在订单备注对应的花枝中找到存储卡，并插入手机。",
+                    "",
+                    ending,
+                    "订单与花束共同指向死者留下的证据",
+                ),
+                (
+                    "赶在删除前",
+                    2,
+                    f"倒计时归零前，{protagonist}把截图和存储卡交给警员；原订单随即从屏幕消失。",
+                    "证据不在订单里，在花里。",
+                    "",
+                    "警方接收了未被删除的求救证据",
+                ),
+                (
+                    "玫瑰送达",
+                    0,
+                    f"天将亮时，{protagonist}把那束红玫瑰放在空收银台上，手机里的证据上传完成。",
+                    "",
+                    "死后送达的花，终于完成了它真正的投递。",
+                    ending,
+                ),
+            ]
+            return locations, props, beats
+
+        usable_locations = [
+            item for item in story.locations if item.name.strip() != "故事核心场景"
+        ]
+        locations = usable_locations or [
+            StoryLocation(
+                f"{protagonist}所在的主要场所",
+                "由故事事件决定的具体行动空间",
+                "保持空间结构和光线方向一致",
+            )
+        ]
+        props = [
+            item
+            for item in story.visual_anchors
+            if item.strip() and item not in {"主角固定服装", "贯穿故事的关键物件", "统一场景主色"}
+        ][:2] or ["关键证据"]
+        conflict = story.core_conflict.strip() or story.logline.strip()
+        ending = story.ending.strip() or "主角完成关键行动并承担结果"
+        sentences = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？])", story.story_text)
+            if item.strip()
+        ]
+        concrete = sentences or [story.logline]
+        selected = [
+            concrete[round(i * (len(concrete) - 1) / 5)]
+            for i in range(6)
+        ]
+        beats = [
+            ("异常出现", 0, f"{protagonist}在日常动作中发现第一个异常细节。", "", selected[0], "异常被主角注意"),
+            ("核对线索", 0, f"{protagonist}拿起关键证据，逐项核对时间、人物和地点。", "", selected[1], "异常被证实并非偶然"),
+            ("作出决定", 0, f"{protagonist}保存证据并离开原位，开始主动追查。", "", conflict, "主角确立明确目标"),
+            ("推进调查", 0, f"{protagonist}沿着证据留下的痕迹行动，并排除一个错误答案。", "", selected[2], "线索指向新的对象"),
+            ("阻力逼近", 0, f"外部阻力进入现场，{protagonist}抢在证据失效前完成下一步。", "", selected[3], "行动代价变得具体"),
+            ("线索反转", 0, f"{protagonist}重新排列已有证据，发现此前忽略的对应关系。", "", selected[4], "旧线索获得相反含义"),
+            ("正面选择", 0, f"{protagonist}面对阻止者，当场执行无法撤回的决定。", "", conflict, "主角承担选择后果"),
+            ("结果落地", 0, f"{protagonist}完成最后一个可见动作，关键证据留在画面中央。", "", selected[5], ending),
+        ]
+        return locations, props, beats
 
     def revise_script(self, story: StoryDraft, script: StoryScript, feedback: str) -> StoryScript:
         if not feedback.strip():
@@ -651,6 +792,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         config_source: str = "constructor",
         json_mode: str = "auto",
         configuration_error: str = "",
+        allow_artifact_fallback: bool = True,
     ) -> None:
         self.client = client
         self.model = model
@@ -659,13 +801,14 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.config_source = config_source
         self.json_mode = json_mode
         self.configuration_error = configuration_error
+        self.allow_artifact_fallback = allow_artifact_fallback
         self.last_used_fallback = False
         self.last_fallback_kind = ""
         self.fallback_count = 0
         self.last_fallback_reason = ""
 
     @classmethod
-    def from_env(cls) -> OpenAIStoryAgent:
+    def from_env(cls, *, allow_artifact_fallback: bool = False) -> OpenAIStoryAgent:
         config = TextProviderConfig.from_env()
         model = config.model or "unconfigured"
         if not config.configured:
@@ -676,6 +819,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 config_source=config.source,
                 json_mode=config.json_mode,
                 configuration_error=config.error,
+                allow_artifact_fallback=allow_artifact_fallback,
             )
         try:
             from openai import OpenAI
@@ -694,6 +838,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 provider_name=config.provider,
                 config_source=config.source,
                 json_mode=config.json_mode,
+                allow_artifact_fallback=allow_artifact_fallback,
             )
         except Exception as exc:
             agent = cls(
@@ -703,6 +848,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 config_source=config.source,
                 json_mode=config.json_mode,
                 configuration_error=f"文本客户端初始化失败：{exc}",
+                allow_artifact_fallback=allow_artifact_fallback,
             )
             agent._mark_fallback("client_init", exc)
             return agent
@@ -827,7 +973,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             story = self._story_from(data, fallback)
         except Exception as exc:
-            self._mark_fallback("generate_story", exc)
+            self._handle_artifact_failure("generate_story", exc)
             return fallback
         return self._review_story_continuity(
             story,
@@ -850,7 +996,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             revised = self._story_from(data, fallback)
             revised.version = story.version + 1
         except Exception as exc:
-            self._mark_fallback("revise_story", exc)
+            self._handle_artifact_failure("revise_story", exc)
             return fallback
         reviewed = self._review_story_continuity(
             revised,
@@ -876,7 +1022,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             script = self._script_from_model(data, fallback, target_seconds)
         except Exception as exc:
-            self._mark_fallback("generate_script", exc)
+            self._handle_artifact_failure("generate_script", exc)
             return fallback
         return self._review_script_continuity(
             story,
@@ -901,7 +1047,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             revised = self._script_from_model(data, fallback, script.target_seconds)
         except Exception as exc:
-            self._mark_fallback("revise_script", exc)
+            self._handle_artifact_failure("revise_script", exc)
             return fallback
         return self._review_script_continuity(
             story,
@@ -935,7 +1081,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             self._validate_director_plan(script, result)
             return result
         except Exception as exc:
-            self._mark_fallback("plan_storyboard", exc)
+            self._handle_artifact_failure("plan_storyboard", exc)
             return None
 
     def evaluate_artifacts(
@@ -1258,7 +1404,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             reviewed.ai_filled_fields = list(story.ai_filled_fields)
             return reviewed
         except Exception as exc:
-            self._mark_fallback(operation, exc)
+            self._handle_artifact_failure(operation, exc, fallback_kind="partial")
             return story
 
     def _review_script_continuity(
@@ -1281,7 +1427,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             reviewed = self._script_from_model(data, script, script.target_seconds)
         except Exception as exc:
-            self._mark_fallback(operation, exc, fallback_kind="partial")
+            self._handle_artifact_failure(operation, exc, fallback_kind="partial")
         return self._repair_script_budget(story, reviewed, operation=operation)
 
     def _repair_script_budget(
@@ -1318,7 +1464,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             return compressed
         except Exception as exc:
-            self._mark_fallback(
+            self._handle_artifact_failure(
                 f"{operation}_scene_budget",
                 exc,
                 fallback_kind="whole",
@@ -1438,3 +1584,16 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_fallback_kind = fallback_kind
         self.fallback_count += 1
         self.last_fallback_reason = f"{operation}: {reason}"
+
+    def _handle_artifact_failure(
+        self,
+        operation: str,
+        reason: object,
+        *,
+        fallback_kind: str = "whole",
+    ) -> None:
+        self._mark_fallback(operation, reason, fallback_kind=fallback_kind)
+        if self.client is not None and not self.allow_artifact_fallback:
+            raise RuntimeError(
+                f"真实文本模型生成失败（{self.provider_label}，{operation}）：{reason}"
+            ) from reason if isinstance(reason, BaseException) else None

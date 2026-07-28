@@ -1073,8 +1073,15 @@ def main() -> None:
     if args.offline:
         agent_factory = RuleBasedStoryAgent
     else:
-        agent_factory = OpenAIStoryAgent.from_env
-        probe = OpenAIStoryAgent.from_env()
+        def configured_agent_factory() -> OpenAIStoryAgent:
+            return OpenAIStoryAgent.from_env(
+                allow_artifact_fallback=args.allow_fallback
+            )
+
+        agent_factory = configured_agent_factory
+        probe = OpenAIStoryAgent.from_env(
+            allow_artifact_fallback=args.allow_fallback
+        )
         if require_live_text and probe.client is None:
             parser.error(
                 "真实文本 API 未配置成功："

@@ -4,6 +4,7 @@ import json
 import re
 import warnings
 from copy import deepcopy
+from datetime import datetime, timezone
 from functools import wraps
 from hashlib import sha256
 from pathlib import Path
@@ -122,6 +123,64 @@ class GuidedStorySession:
         self.revision_cursor: dict[str, int] = {}
         self.user_action_count = 0
         self.free_text_count = 0
+        self.text_generation_events: list[dict[str, Any]] = []
+
+    def _run_text_operation(
+        self,
+        operation: str,
+        artifact_type: str,
+        callback: Any,
+    ) -> Any:
+        """Run and audit a formal text operation, including failed attempts."""
+        try:
+            result = callback()
+        except Exception as exc:
+            reason = str(getattr(self.agent, "last_fallback_reason", "") or exc)
+            self._record_text_generation_event(
+                operation=operation,
+                artifact_type=artifact_type,
+                status="failed",
+                reason=reason,
+            )
+            raise
+        used_fallback = bool(getattr(self.agent, "last_used_fallback", False))
+        is_remote_agent = hasattr(self.agent, "provider_name")
+        self._record_text_generation_event(
+            operation=operation,
+            artifact_type=artifact_type,
+            status=(
+                "fallback"
+                if used_fallback
+                else "succeeded"
+                if is_remote_agent
+                else "offline"
+            ),
+            reason=str(getattr(self.agent, "last_fallback_reason", "")),
+        )
+        return result
+
+    def _record_text_generation_event(
+        self,
+        *,
+        operation: str,
+        artifact_type: str,
+        status: str,
+        reason: str = "",
+    ) -> None:
+        provider = str(getattr(self.agent, "provider_name", "offline"))
+        model = str(getattr(self.agent, "model", "rule-based"))
+        self.text_generation_events.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": operation,
+                "artifact_type": artifact_type,
+                "status": status,
+                "provider": provider,
+                "model": model,
+                "fallback_kind": str(getattr(self.agent, "last_fallback_kind", "")),
+                "reason": reason,
+            }
+        )
 
     @property
     def current_batch(self) -> IdeaBatch | None:
@@ -401,10 +460,14 @@ class GuidedStorySession:
             for kind, option_id in self.selected_elements.items()
         }
         story = deepcopy(
-            self.agent.generate_story(
+            self._run_text_operation(
+                "generate_story",
+                "story",
+                lambda: self.agent.generate_story(
                 self.direction,
                 deepcopy(self.selected_cards),
                 deepcopy(selected_options),
+                ),
             )
         )
         self._preserve_user_choices(story, selected_options)
@@ -434,7 +497,13 @@ class GuidedStorySession:
             feedback,
             empty_message="请用一句话说明想怎样修改故事。",
         )
-        revised = deepcopy(self.agent.revise_story(deepcopy(self.story), cleaned_feedback))
+        revised = deepcopy(
+            self._run_text_operation(
+                "revise_story",
+                "story",
+                lambda: self.agent.revise_story(deepcopy(self.story), cleaned_feedback),
+            )
+        )
         selected_options = {
             kind: self._element_by_id(kind, option_id)
             for kind, option_id in self.selected_elements.items()
@@ -486,7 +555,13 @@ class GuidedStorySession:
         if self.story is None or not self.story.confirmed or self.stage != Stage.STORY_REVIEW:
             raise RuntimeError("请先确认完整故事。")
         target_seconds = self._compute_target_seconds()
-        script = deepcopy(self.agent.generate_script(deepcopy(self.story), target_seconds))
+        script = deepcopy(
+            self._run_text_operation(
+                "generate_script",
+                "script",
+                lambda: self.agent.generate_script(deepcopy(self.story), target_seconds),
+            )
+        )
         self._validate_or_repair_script(script, target_seconds=target_seconds)
         script.confirmed = False
         self.brief.resolved_target_seconds = target_seconds
@@ -515,10 +590,14 @@ class GuidedStorySession:
             empty_message="请用一句话说明想怎样修改剧本。",
         )
         script = deepcopy(
-            self.agent.revise_script(
-                deepcopy(self.story),
-                deepcopy(self.script),
-                cleaned_feedback,
+            self._run_text_operation(
+                "revise_script",
+                "script",
+                lambda: self.agent.revise_script(
+                    deepcopy(self.story),
+                    deepcopy(self.script),
+                    cleaned_feedback,
+                ),
             )
         )
         self._validate_or_repair_script(
@@ -556,10 +635,14 @@ class GuidedStorySession:
             raise RuntimeError("请先确认剧本。")
         facts = self._story_facts()
         planner = getattr(self.agent, "plan_storyboard", None)
-        director_plan = (
-            planner(deepcopy(self.script), deepcopy(facts))
-            if callable(planner)
-            else None
+        director_plan = self._run_text_operation(
+            "plan_storyboard",
+            "storyboard",
+            lambda: (
+                planner(deepcopy(self.script), deepcopy(facts))
+                if callable(planner)
+                else None
+            ),
         )
         storyboard = build_storyboard(
             self.script,
@@ -1219,6 +1302,7 @@ class GuidedStorySession:
                 else None,
                 "selected_elements": dict(self.selected_elements),
                 "chat_history": deepcopy(self.chat_history),
+                "text_generation_events": deepcopy(self.text_generation_events),
                 "story": to_plain_data(self.story) if self.story else None,
                 "story_history": to_plain_data(self.story_history),
                 "script": to_plain_data(self.script) if self.script else None,
@@ -1275,6 +1359,12 @@ class GuidedStorySession:
             str(k): str(v) for k, v in data.get("selected_elements", {}).items()
         }
         session.chat_history = list(data.get("chat_history", []))
+        raw_text_events = data.get("text_generation_events", [])
+        if not isinstance(raw_text_events, list) or not all(
+            isinstance(item, dict) for item in raw_text_events
+        ):
+            raise ValueError("text_generation_events 必须是 JSON 对象数组。")
+        session.text_generation_events = deepcopy(raw_text_events)
         if data.get("story"):
             session.story = session._story_from_data(data["story"])
         session.story_history = [

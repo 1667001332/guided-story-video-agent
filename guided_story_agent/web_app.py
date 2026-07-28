@@ -110,7 +110,7 @@ def restore_saved_session_view(
         *palette_updates,
         _story_markdown(session.story) if session.story else "",
         _ai_fill_markdown(session.story) if session.story else "",
-        _script_markdown(session.script) if session.script else "",
+        _script_markdown(session.script, session) if session.script else "",
         _storyboard_markdown(plan),
         _shot_choices_update(plan),
         _visual_inputs_markdown(plan),
@@ -405,7 +405,7 @@ def generate_script_view(
         script = session.generate_script()
         return (
             session,
-            _script_markdown(script),
+            _script_markdown(script, session),
             _text_status(
                 session,
                 f"故事已确认，剧本已按{script.target_seconds}秒生成。",
@@ -413,7 +413,7 @@ def generate_script_view(
         )
     except Exception as exc:
         current = session.script if session else None
-        return session, _script_markdown(current) if current else "", str(exc)
+        return session, _script_markdown(current, session) if current else "", str(exc)
 
 
 def revise_script_view(
@@ -425,13 +425,13 @@ def revise_script_view(
         script = session.revise_script(feedback)
         return (
             session,
-            _script_markdown(script),
+            _script_markdown(script, session),
             "",
             _text_status(session, "剧本已按反馈改写。"),
         )
     except Exception as exc:
         current = session.script if session else None
-        return session, _script_markdown(current) if current else "", feedback, str(exc)
+        return session, _script_markdown(current, session) if current else "", feedback, str(exc)
 
 
 def back_to_ideas_view(
@@ -2093,8 +2093,26 @@ def _story_markdown(story) -> str:
     )
 
 
-def _script_markdown(script) -> str:
+def _script_markdown(script, session: GuidedStorySession | None = None) -> str:
     sections = [f"### 《{script.title}》 · {script.total_duration}秒"]
+    if session is not None:
+        event = next(
+            (
+                item
+                for item in reversed(session.text_generation_events)
+                if item.get("artifact_type") == "script"
+                and item.get("status") in {"succeeded", "fallback", "offline"}
+            ),
+            None,
+        )
+        if event:
+            provider = f"{event.get('provider', 'offline')} · {event.get('model', 'rule-based')}"
+            if event.get("status") in {"fallback", "offline"}:
+                sections.append(
+                    f"> ⚠️ 来源：离线兜底（{provider}）。这不是远程模型结果。"
+                )
+            else:
+                sections.append(f"> 来源：真实文本模型（{provider}）")
     for scene in script.scenes:
         sections.append(
             f"#### 场景 {scene.scene_id}｜{scene.title} · {scene.duration}秒\n"

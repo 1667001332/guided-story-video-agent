@@ -71,7 +71,10 @@ python -m guided_story_agent.web_app
 http://127.0.0.1:7860/
 ```
 
-如果没有配置 API Key，文本生成会使用本地离线方案，不发送网络请求。页面会显示当前结果来自真实文本模型、离线模式还是 API 失败后的本地兜底。
+如果没有配置 API Key，文本生成会使用本地离线方案，不发送网络请求。配置了真实
+文本 API 后，故事、剧本和分镜规划采用失败关闭策略：请求、JSON 解析或结构校验失败
+都会停止当前操作并显示原始原因，不再把本地模板冒充成远程模型结果。会话文件中的
+`text_generation_events` 会保存每次正式文本生成的 Provider、模型、状态和错误。
 
 ## API 配置
 
@@ -152,7 +155,7 @@ python scripts/run_guided_story_selfplay.py --offline --output outputs/selfplay_
 
 ### 真实文本 API 测试
 
-要求所有文本请求都通过真实接口完成，发生本地兜底时测试失败：
+要求所有文本请求都通过真实接口完成；任一正式产物调用失败就停止，不生成替代成品：
 
 ```powershell
 python scripts/run_guided_story_selfplay.py --target-seconds 30 --output outputs/live_text --require-live-text

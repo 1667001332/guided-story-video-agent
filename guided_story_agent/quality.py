@@ -121,6 +121,56 @@ def review_script_against_story(
     if story.locations and location_coverage == 0:
         review.warnings.append("剧本没有沿用故事中已确认的地点")
 
+    scene_count = max(1, len(script.scenes))
+    generic_title_count = sum(
+        bool(re.fullmatch(r"(?:故事)?片段\s*\d+", scene.title.strip()))
+        for scene in script.scenes
+    )
+    copied_narration_count = sum(
+        bool(
+            (scene.visible_action or scene.action).strip()
+            and (scene.visible_action or scene.action).strip() == scene.narration.strip()
+        )
+        for scene in script.scenes
+    )
+    generic_location_count = sum(
+        scene.location.strip() in {"故事核心场景", "连续的故事空间", "主要场景"}
+        for scene in script.scenes
+    )
+    template_phrase_count = sum(
+        any(
+            phrase in " ".join(
+                (
+                    scene.visible_action or scene.action,
+                    scene.dialogue,
+                )
+            )
+            for phrase in (
+                "人物必须面对这一核心冲突",
+                "我已经作出了选择",
+                "故事在行动完成后的余波中结束",
+            )
+        )
+        for scene in script.scenes
+    )
+    review.scores.update(
+        {
+            "specific_scene_title_rate": round(1 - generic_title_count / scene_count, 3),
+            "action_narration_separation": round(
+                1 - copied_narration_count / scene_count, 3
+            ),
+            "specific_location_rate": round(1 - generic_location_count / scene_count, 3),
+        }
+    )
+    if generic_title_count / scene_count >= 0.5:
+        review.hard_errors.append("剧本场景标题仍是编号模板，没有表达具体事件")
+    if copied_narration_count / scene_count >= 0.5:
+        review.hard_errors.append("剧本把画面动作直接复制成旁白，尚未完成视听改编")
+    if generic_location_count == len(script.scenes) and script.scenes:
+        review.hard_errors.append("剧本所有场景都使用泛化地点，无法建立可拍摄空间")
+    if template_phrase_count:
+        review.hard_errors.append("剧本仍包含离线模板占位句")
+
     nonempty_state_scenes = sum(
         bool(scene.start_state.strip() and scene.end_state.strip())
         for scene in script.scenes
