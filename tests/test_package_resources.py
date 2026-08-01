@@ -5,6 +5,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from guided_story_agent.agent import OpenAIStoryAgent
+from guided_story_agent.v2.openai_director import OpenAIDirectorAgent
 
 
 class PackageResourceTests(unittest.TestCase):
@@ -37,6 +38,10 @@ class PackageResourceTests(unittest.TestCase):
             Path(agent.prompt_dir).resolve(),
         )
         self.assertIn("故事创作者", agent._load_prompt("story_writer.md"))
+        v2_prompt = prompt_root.joinpath("v2", "director", "movie_plan.md")
+        self.assertGreater(len(v2_prompt.read_text(encoding="utf-8").strip()), 100)
+        v2_agent = OpenAIDirectorAgent(None, "offline-test")
+        self.assertEqual(v2_prompt.resolve(), Path(v2_agent.prompt_path).resolve())
 
     def test_default_batch_cases_are_packaged(self) -> None:
         source = files("guided_story_agent").joinpath("resources", "batch_cases.jsonl")

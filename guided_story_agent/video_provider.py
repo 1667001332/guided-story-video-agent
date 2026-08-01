@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .models import ProviderCapabilities, StoryboardShot, VideoArtifact
+from .models import ProviderCapabilities, StoryboardShot, VideoArtifact, VideoJob
 from .provider_config import VideoProviderConfig
 
 
@@ -287,6 +287,10 @@ class AgnesVideoProvider:
             supports_reference_images=False,
             supports_seed=True,
             requires_public_image_url=True,
+            min_duration_seconds=3,
+            max_duration_seconds=15,
+            supports_long_video=False,
+            supports_multi_scene_prompt=True,
         )
 
     @classmethod
@@ -391,10 +395,13 @@ class AgnesVideoProvider:
                     f"原始错误：{exc}",
                     operation_id=operation_id,
                 ) from exc
-            video_id = self._extract_text(submitted, ("video_id", "id")) or ""
+            # Agnes currently documents both ``video_id`` and ``task_id``;
+            # some gateway responses expose only the latter.  Treat all
+            # documented identifiers as opaque and prefer the video id.
+            video_id = self._extract_text(submitted, ("video_id", "task_id", "id")) or ""
             if not video_id:
                 raise VideoSubmissionUncertainError(
-                    "Agnes 提交结果缺少 video_id，无法判断服务端是否已经受理。"
+                    "Agnes 提交结果缺少 video_id/task_id，无法判断服务端是否已经受理。"
                     "为避免重复付费，系统不会自动重提；请先到 Provider 后台核对任务。",
                     operation_id=operation_id,
                 )
@@ -452,6 +459,55 @@ class AgnesVideoProvider:
         )
         self._notify(progress_callback, "completed", 1.0, f"镜头 {shot.shot_id} 已保存")
         return artifact
+
+    def generate_video(
+        self,
+        job: VideoJob,
+        output_dir: str | Path,
+        *,
+        attempt: int = 1,
+        progress_callback: ProgressCallback | None = None,
+        resume_request_id: str | None = None,
+    ) -> VideoArtifact:
+        """Compatibility adapter for the whole-video core.
+
+        Agnes currently accepts only a single 3–15 second generation.  That
+        limitation is declared here, inside the Agnes adapter; the generic
+        VideoJob pipeline does not split or validate against it.  A future
+        long-video adapter can implement this method without changing the
+        session or renderer.
+        """
+        if not isinstance(job, VideoJob):
+            raise TypeError("AgnesVideoProvider.generate_video 需要 VideoJob。")
+        shot = StoryboardShot(
+            shot_id=1,
+            scene_id=1,
+            duration=int(job.target_seconds),
+            character="",
+            location="",
+            visual=job.prompt,
+            action=job.prompt,
+            camera="",
+            lighting="",
+            mood="",
+            narration=job.narration,
+            video_prompt=job.prompt,
+            negative_prompt=job.negative_prompt,
+            aspect_ratio=job.aspect_ratio,
+            dialogue=job.dialogue,
+            visual_style=job.visual_style,
+            reference_image_paths=list(job.reference_image_paths),
+            initial_frame_path=job.initial_frame_path,
+            initial_frame_url=job.initial_frame_url,
+            seed=job.seed,
+        )
+        return self.generate_shot(
+            shot,
+            output_dir,
+            attempt=attempt,
+            progress_callback=progress_callback,
+            resume_request_id=resume_request_id,
+        )
 
     def _build_payload(self, shot: StoryboardShot) -> dict[str, Any]:
         width, height = self._dimensions(shot.aspect_ratio)
@@ -635,7 +691,17 @@ class AgnesVideoProvider:
 
     @staticmethod
     def _dimensions(ratio: str) -> tuple[int, int]:
-        return {"16:9": (1152, 648), "9:16": (648, 1152), "1:1": (768, 768)}.get(ratio, (1152, 648))
+        dimensions = {
+            "16:9": (1152, 648),
+            "9:16": (648, 1152),
+            "1:1": (768, 768),
+        }
+        try:
+            return dimensions[ratio]
+        except KeyError as exc:
+            raise ValueError(
+                "Agnes 画幅比例只支持 16:9、9:16 或 1:1。"
+            ) from exc
 
     def _download_file(self, url: str, target: Path) -> None:
         temporary = target.with_suffix(".mp4.part")

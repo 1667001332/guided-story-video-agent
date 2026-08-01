@@ -35,4 +35,8 @@ include = ["guided_story_agent*"]
 exclude = ["tests*", "scripts*", "outputs*"]
 
 [tool.setuptools.package-data]
-guided_story_agent = ["prompts/*.md", "resources/*.jsonl"]
+guided_story_agent = [
+  "prompts/*.md",
+  "prompts/v2/director/*.md",
+  "resources/*.jsonl",
+]

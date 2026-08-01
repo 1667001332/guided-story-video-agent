@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-import re
+import math
 import warnings
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 from functools import wraps
 from hashlib import sha256
@@ -46,6 +47,7 @@ from .models import (
     StoryScript,
     StoryboardPlan,
     StoryboardShot,
+    VideoJob,
     VideoArtifact,
     VisualAsset,
     VisualBible,
@@ -53,15 +55,77 @@ from .models import (
     to_plain_data,
 )
 from .narration import normalize_narration_timeline
-from .quality import review_script_against_story, semantic_coverage
+from .quality import (
+    evaluate_storyboard_quality,
+    review_script_against_story,
+    semantic_coverage,
+)
 from .storyboard import (
-    apply_transition_prompt_context,
+    assess_director_plan_timing,
     build_storyboard,
     derive_retake_seed,
     fit_scenes_to_duration,
+    refresh_shot_prompts,
+    shot_prompts_match_content,
 )
-from .timing import allocate_durations, estimate_story_duration
+from .video_job import build_video_job
+from .timing import (
+    ShotTimingDemand,
+    assess_shot_readable_minimum,
+    estimate_story_duration,
+    plan_scene_durations,
+)
 from .video_provider import sanitize_remote_url
+from .v2.director import DirectorAgent as V2DirectorAgent, DirectorOrchestrator
+from .v2.compiler import VideoJobCompiler
+from .v2.film_ir import FilmIR
+from .v2.film_ir_builder import FilmIRBuilder
+from .v2.execution import (
+    CompilationOptions,
+    CompileResult,
+    ProviderCapabilities as V2ProviderCapabilities,
+    VideoJob as V2VideoJob,
+)
+from .v2.ir import MovieIR
+from .v2.ir_builder import MovieIRBuilder
+from .v2.creative_passes import creative_pass_pipeline
+from .v2.creative_analysis import creative_analysis_pipeline
+from .v2.creative_optimizer import creative_optimizer
+from .v2.revision_request import RevisionRequestBuilder
+from .v2.optimizer import FilmIROptimizer, MovieIROptimizer
+from .v2.passes import compiler_pass_pipeline, film_ir_pass_pipeline
+from .v2.revision_loop import RuleBasedDirectorRevisionLoop
+from .v2.revision_candidate import RevisionCandidate
+from .v2.revision_diff import RevisionDiffBuilder
+from .v2.revision_guard import RevisionGuard, RevisionGuardPolicy
+from .v2.director_revision_adapter import (
+    DirectorAgentRevisionAdapter,
+    DirectorRevisionContext,
+    GuardedRevisionResult,
+    RuleBasedDirectorRevisionAdapter,
+    run_director_revision_guarded,
+)
+from .v2.revision_apply import (
+    ApplyRevisionCommand,
+    RevisionApplyResult,
+    RollbackRevisionCommand,
+    RevisionRollbackResult,
+    apply_revision_to_session,
+    rollback_revision_to_session,
+)
+from .v2.lineage import LineageCheckResult, SourceLineageGuard
+from .v2.models import (
+    CreativeBrief as V2CreativeBrief,
+    MoviePlan as V2MoviePlan,
+    as_plain_data as v2_plain_data,
+)
+from .v2.openai_director import RuleBasedDirectorAgent, movie_plan_from_data
+from .v2.validation import (
+    FilmIRValidator,
+    MovieIRValidator,
+    validate_movie_plan,
+    validate_video_job,
+)
 
 
 MAX_USER_INPUT_CHARS = 4_000
@@ -70,9 +134,30 @@ CURRENT_STAGES = {
     Stage.STORY_REVIEW,
     Stage.SCRIPT_REVIEW,
     Stage.STORYBOARD_REVIEW,
+    Stage.MOVIE_PLAN_REVIEW,
+    Stage.MOVIE_PLAN_CONFIRMED,
+    Stage.MOVIE_PLAN_REVISED,
+    Stage.MOVIE_PLAN_ROLLED_BACK,
+    Stage.FILM_IR_BUILT,
+    Stage.MOVIE_IR_BUILT,
+    Stage.VIDEO_JOB_COMPILED,
     Stage.RENDER_READY,
     Stage.COMPLETED,
 }
+
+
+def _optimizer_records(result: Any) -> list[dict[str, Any]]:
+    """Serialize optimizer diagnostics and future transformation candidates."""
+
+    records = [
+        {"kind": "diagnostic", **v2_plain_data(item)}
+        for item in result.diagnostics
+    ]
+    records.extend(
+        {"kind": "transformation", **v2_plain_data(item)}
+        for item in result.transformations
+    )
+    return records
 
 
 def _state_mutation(method):
@@ -89,18 +174,23 @@ def _state_mutation(method):
 class GuidedStorySession:
     """Single source of truth for the low-pressure idea garden."""
 
-    schema_version = 4
+    schema_version = 5
 
     def __init__(
         self,
         brief: CreativeBrief | None = None,
         agent: StoryAgent | None = None,
+        *,
+        director_agent: V2DirectorAgent | None = None,
+        v2_enabled: bool = False,
     ) -> None:
         self._state_lock = RLock()
         self._render_in_progress = False
         self.brief = brief or CreativeBrief()
         self.brief.validate()
         self.agent = agent or RuleBasedStoryAgent()
+        self.director_agent = director_agent
+        self.v2_enabled = bool(v2_enabled)
         self.stage = Stage.IDEATING
         self.direction = ""
         self.idea_batches: list[IdeaBatch] = []
@@ -116,6 +206,66 @@ class GuidedStorySession:
         self.outline: StoryOutline | None = None
         self.script: StoryScript | None = None
         self.storyboard: StoryboardPlan | None = None
+        self.video_job: VideoJob | None = None
+        self.movie_plan: V2MoviePlan | None = None
+        self.movie_plan_revisions: list[V2MoviePlan] = []
+        self.confirmed_movie_plan: V2MoviePlan | None = None
+        self.film_ir: FilmIR | None = None
+        self.film_ir_revisions: list[FilmIR] = []
+        self.film_ir_build_diagnostics: list[dict[str, Any]] = []
+        self.film_ir_build_metadata: dict[str, Any] = {}
+        self.film_ir_validation_issues: list[dict[str, Any]] = []
+        self.film_ir_pass_diagnostics: list[dict[str, Any]] = []
+        self.creative_pass_diagnostics: list[dict[str, Any]] = []
+        self.creative_analysis_results: list[dict[str, Any]] = []
+        self.creative_analysis_diagnostics: list[dict[str, Any]] = []
+        self.creative_analysis_artifacts: list[dict[str, Any]] = []
+        self.creative_analysis_metrics: dict[str, float] = {}
+        self.creative_optimizer_result: dict[str, Any] | None = None
+        self.creative_optimizer_suggestions: list[dict[str, Any]] = []
+        self.creative_optimizer_candidates: list[dict[str, Any]] = []
+        self.creative_optimizer_diagnostics: list[dict[str, Any]] = []
+        self.creative_revision_requests: list[dict[str, Any]] = []
+        self.creative_revision_request_history: list[dict[str, Any]] = []
+        self.creative_revision_stop_reason: str | None = None
+        self.revision_candidates: list[dict[str, Any]] = []
+        self.revision_diffs: list[dict[str, Any]] = []
+        self.revision_decisions: list[dict[str, Any]] = []
+        self.revision_guard_diagnostics: list[dict[str, Any]] = []
+        self.revision_active_candidate_id: str | None = None
+        self.revision_accepted_movie_plan_id: str | None = None
+        self.revision_rollback_movie_plan_id: str | None = None
+        self.director_revision_adapter_results: list[dict[str, Any]] = []
+        self.director_revision_contexts: list[dict[str, Any]] = []
+        self.guarded_revision_results: list[dict[str, Any]] = []
+        self.director_revision_attempt_count = 0
+        self.director_revision_last_stop_reason: str | None = None
+        self.movie_plan_version_history: list[dict[str, Any]] = []
+        self.revision_apply_history: list[dict[str, Any]] = []
+        self.revision_rollback_history: list[dict[str, Any]] = []
+        self.revision_apply_results: list[dict[str, Any]] = []
+        self.revision_rollback_results: list[dict[str, Any]] = []
+        self.current_movie_plan_id: str | None = None
+        self.previous_movie_plan_id: str | None = None
+        self.stale_artifacts: list[dict[str, Any]] = []
+        self.source_lineage_diagnostics: list[dict[str, Any]] = []
+        self.stale_lineage_diagnostics: list[dict[str, Any]] = []
+        self.current_film_ir_id: str | None = None
+        self.current_movie_ir_id: str | None = None
+        self.current_video_job_id: str | None = None
+        self.film_ir_optimizer_diagnostics: list[dict[str, Any]] = []
+        self.director_revision_history: list[dict[str, Any]] = []
+        self.director_revision_stop_reason: str | None = None
+        self.movie_ir: MovieIR | None = None
+        self.movie_ir_revisions: list[MovieIR] = []
+        self.movie_ir_build_diagnostics: list[dict[str, Any]] = []
+        self.movie_ir_build_metadata: dict[str, Any] = {}
+        self.movie_ir_validation_issues: list[dict[str, Any]] = []
+        self.movie_ir_pass_diagnostics: list[dict[str, Any]] = []
+        self.movie_ir_optimizer_diagnostics: list[dict[str, Any]] = []
+        self.v2_video_job: V2VideoJob | None = None
+        self.v2_compile_diagnostics: list[dict[str, Any]] = []
+        self.v2_compile_metadata: dict[str, Any] = {}
         self.render_manifest: RenderManifest | None = None
         self._confirmed_storyboard_signature = ""
         self.legacy_facts = StoryFacts(genre=self.brief.genre)
@@ -267,6 +417,41 @@ class GuidedStorySession:
         self.outline = None
         self.script = None
         self.storyboard = None
+        self.video_job = None
+        self.v2_video_job = None
+        self.v2_compile_diagnostics = []
+        self.v2_compile_metadata = {}
+        self.film_ir = None
+        self.film_ir_revisions = []
+        self.film_ir_build_diagnostics = []
+        self.film_ir_build_metadata = {}
+        self.film_ir_validation_issues = []
+        self.film_ir_pass_diagnostics = []
+        self.creative_pass_diagnostics = []
+        self.creative_analysis_results = []
+        self.creative_analysis_diagnostics = []
+        self.creative_analysis_artifacts = []
+        self.creative_analysis_metrics = {}
+        self.creative_optimizer_result = None
+        self.creative_optimizer_suggestions = []
+        self.creative_optimizer_candidates = []
+        self.creative_optimizer_diagnostics = []
+        self.creative_revision_requests = []
+        self.creative_revision_request_history = []
+        self.creative_revision_stop_reason = None
+        self._clear_revision_guard_state()
+        self.film_ir_optimizer_diagnostics = []
+        self.director_revision_history = []
+        self.director_revision_stop_reason = None
+        self.source_lineage_diagnostics = []
+        self.stale_lineage_diagnostics = []
+        self.movie_ir = None
+        self.movie_ir_revisions = []
+        self.movie_ir_build_diagnostics = []
+        self.movie_ir_build_metadata = {}
+        self.movie_ir_validation_issues = []
+        self.movie_ir_pass_diagnostics = []
+        self.movie_ir_optimizer_diagnostics = []
         self.render_manifest = None
         self.legacy_facts = StoryFacts(genre=self.brief.genre)
         self.chat_history = [{"role": "user", "content": cleaned}]
@@ -451,6 +636,766 @@ class GuidedStorySession:
         )
 
     @_state_mutation
+    def generate_movie_plan(self, direction: str | None = None) -> V2MoviePlan:
+        """Generate the V2 MoviePlan through the sole DirectorAgent port.
+
+        This path is intentionally independent from the legacy idea/story/script
+        garden.  It records the plan as a revision and does not synthesize any
+        Provider or Storyboard fields.
+        """
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2 或 GUIDED_STORY_V2=1。")
+        if self.director_agent is None:
+            raise RuntimeError("V2 模式缺少 DirectorAgent。")
+        cleaned_direction = self._clean_user_input(
+            direction if direction is not None else self.direction,
+            empty_message="V2 MoviePlan 需要创作方向。",
+        )
+        brief = self._v2_brief()
+        plan = DirectorOrchestrator(self.director_agent, max_attempts=2).create_movie_plan(
+            brief,
+            cleaned_direction,
+        )
+        plan = replace(
+            plan,
+            revision=len(self.movie_plan_revisions) + 1,
+            confirmed=False,
+        )
+        self.direction = cleaned_direction
+        self.brief.resolved_target_seconds = brief.target_duration_seconds
+        self.previous_movie_plan_id = self.current_movie_plan_id
+        self.movie_plan = plan
+        self.current_movie_plan_id = plan.plan_id
+        self.current_film_ir_id = None
+        self.current_movie_ir_id = None
+        self.current_video_job_id = None
+        self.source_lineage_diagnostics = []
+        self.stale_lineage_diagnostics = []
+        self.movie_plan_revisions.append(deepcopy(plan))
+        self.confirmed_movie_plan = None
+        self.v2_video_job = None
+        self.v2_compile_diagnostics = []
+        self.v2_compile_metadata = {}
+        self.film_ir = None
+        self.film_ir_revisions = []
+        self.film_ir_build_diagnostics = []
+        self.film_ir_build_metadata = {}
+        self.film_ir_validation_issues = []
+        self.film_ir_pass_diagnostics = []
+        self.creative_pass_diagnostics = []
+        self.creative_analysis_results = []
+        self.creative_analysis_diagnostics = []
+        self.creative_analysis_artifacts = []
+        self.creative_analysis_metrics = {}
+        self.creative_optimizer_result = None
+        self.creative_optimizer_suggestions = []
+        self.creative_optimizer_candidates = []
+        self.creative_optimizer_diagnostics = []
+        self.creative_revision_requests = []
+        self.creative_revision_request_history = []
+        self.creative_revision_stop_reason = None
+        self._clear_revision_guard_state()
+        self.film_ir_optimizer_diagnostics = []
+        self.director_revision_history = []
+        self.director_revision_stop_reason = None
+        self.movie_ir = None
+        self.movie_ir_revisions = []
+        self.movie_ir_build_diagnostics = []
+        self.movie_ir_build_metadata = {}
+        self.movie_ir_validation_issues = []
+        self.movie_ir_pass_diagnostics = []
+        self.movie_ir_optimizer_diagnostics = []
+        self.stage = Stage.MOVIE_PLAN_REVIEW
+        self.user_action_count += 1
+        self._snapshot("movie_plan", v2_plain_data(plan))
+        return deepcopy(plan)
+
+    @_state_mutation
+    def confirm_movie_plan(self) -> None:
+        """Confirm the V2 plan without changing any director-authored field."""
+        if not self.v2_enabled or self.movie_plan is None:
+            raise RuntimeError("当前没有待确认的 V2 MoviePlan。")
+        if self.stage != Stage.MOVIE_PLAN_REVIEW:
+            raise RuntimeError("当前阶段不是 V2 MoviePlan 审查阶段。")
+        report = validate_movie_plan(self.movie_plan, self._v2_brief())
+        if not report.valid:
+            raise RuntimeError("MoviePlan 仍有必须修复的问题：" + "；".join(report.errors))
+        confirmed = replace(self.movie_plan, confirmed=True)
+        self.movie_plan = confirmed
+        self.movie_plan_revisions[-1] = deepcopy(confirmed)
+        self.confirmed_movie_plan = deepcopy(confirmed)
+        self.stage = Stage.MOVIE_PLAN_CONFIRMED
+        self._snapshot("movie_plan", v2_plain_data(confirmed), confirmed=True)
+
+    @_state_mutation
+    def build_film_ir_from_confirmed_movie_plan(self) -> FilmIR | None:
+        """Build the film-language IR from the confirmed MoviePlan."""
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        if self.confirmed_movie_plan is None:
+            raise RuntimeError("必须先确认 MoviePlan，才能构建 FilmIR。")
+        if self.stage not in {
+            Stage.MOVIE_PLAN_CONFIRMED,
+            Stage.MOVIE_PLAN_REVISED,
+            Stage.MOVIE_PLAN_ROLLED_BACK,
+            Stage.FILM_IR_BUILT,
+            Stage.MOVIE_IR_BUILT,
+            Stage.VIDEO_JOB_COMPILED,
+        }:
+            raise RuntimeError("当前阶段不是 V2 MoviePlan 已确认阶段。")
+        self.creative_pass_diagnostics = []
+        self.creative_analysis_results = []
+        self.creative_analysis_diagnostics = []
+        self.creative_analysis_artifacts = []
+        self.creative_analysis_metrics = {}
+        self.creative_optimizer_result = None
+        self.creative_optimizer_suggestions = []
+        self.creative_optimizer_candidates = []
+        self.creative_optimizer_diagnostics = []
+        self.creative_revision_requests = []
+        self.creative_revision_request_history = []
+        self.creative_revision_stop_reason = None
+        self._clear_revision_guard_state()
+        self.film_ir_optimizer_diagnostics = []
+        self.director_revision_history = []
+        self.director_revision_stop_reason = None
+        self.film_ir = None
+        self.movie_ir = None
+        self.v2_video_job = None
+        self.current_film_ir_id = None
+        self.current_movie_ir_id = None
+        self.current_video_job_id = None
+        self.stage = Stage.MOVIE_PLAN_CONFIRMED
+        result = FilmIRBuilder().build(deepcopy(self.confirmed_movie_plan))
+        self.film_ir_build_diagnostics = [
+            {"code": item.code, "message": item.message, "path": item.path}
+            for item in result.errors
+        ] + [
+            {"code": item.code, "message": item.message, "path": item.path}
+            for item in result.diagnostics
+        ]
+        self.film_ir_build_metadata = {
+            "source_movie_plan_id": self.confirmed_movie_plan.plan_id,
+            "error_count": len(result.errors),
+        }
+        if not result.ok or result.film_ir is None:
+            return None
+        validation = FilmIRValidator().validate(result.film_ir)
+        self.film_ir_validation_issues = [
+            v2_plain_data(item) for item in validation.issues
+        ]
+        if not validation.ok:
+            self.film_ir_pass_diagnostics = []
+            self.creative_pass_diagnostics = []
+            self.film_ir_optimizer_diagnostics = []
+            self._record_director_revision(
+                validation_issues=validation.issues,
+            )
+            return None
+        pass_result = film_ir_pass_pipeline().run(result.film_ir)
+        self.film_ir_pass_diagnostics = [
+            v2_plain_data(item) for item in pass_result.diagnostics
+        ]
+        if not pass_result.ok or not isinstance(pass_result.ir, FilmIR):
+            self.creative_pass_diagnostics = []
+            self.film_ir_optimizer_diagnostics = []
+            self._record_director_revision(
+                validation_issues=validation.issues,
+                creative_diagnostics=pass_result.diagnostics,
+            )
+            return None
+        creative_result = creative_pass_pipeline().run(pass_result.ir)
+        self.creative_pass_diagnostics = [
+            v2_plain_data(item) for item in creative_result.diagnostics
+        ]
+        if not creative_result.ok or not isinstance(creative_result.ir, FilmIR):
+            self.film_ir_optimizer_diagnostics = []
+            self._record_director_revision(
+                validation_issues=validation.issues,
+                creative_diagnostics=creative_result.diagnostics,
+            )
+            return None
+        optimizer_result = FilmIROptimizer().optimize(creative_result.ir)
+        self.film_ir_optimizer_diagnostics = _optimizer_records(optimizer_result)
+        self._record_director_revision(
+            validation_issues=validation.issues,
+            creative_diagnostics=creative_result.diagnostics,
+            optimizer_diagnostics=optimizer_result.diagnostics,
+        )
+        if not optimizer_result.ok or not isinstance(optimizer_result.after_ir, FilmIR):
+            return None
+        self.film_ir = deepcopy(optimizer_result.after_ir)
+        self.current_film_ir_id = self.film_ir.ir_id
+        self.film_ir_revisions.append(deepcopy(optimizer_result.after_ir))
+        self.movie_ir = None
+        self.movie_ir_revisions = []
+        self.movie_ir_build_diagnostics = []
+        self.movie_ir_build_metadata = {}
+        self.movie_ir_validation_issues = []
+        self.movie_ir_pass_diagnostics = []
+        self.movie_ir_optimizer_diagnostics = []
+        self.v2_video_job = None
+        self.v2_compile_diagnostics = []
+        self.v2_compile_metadata = {}
+        self.stage = Stage.FILM_IR_BUILT
+        self._snapshot("film_ir", optimizer_result.after_ir.to_dict(), confirmed=True)
+        self.refresh_source_lineage_diagnostics()
+        return deepcopy(optimizer_result.after_ir)
+
+    def _clear_revision_guard_state(self) -> None:
+        """Drop active candidate state when upstream creative inputs change."""
+
+        self.revision_candidates = []
+        self.revision_diffs = []
+        self.revision_decisions = []
+        self.revision_guard_diagnostics = []
+        self.revision_active_candidate_id = None
+        self.revision_accepted_movie_plan_id = None
+        self.revision_rollback_movie_plan_id = None
+        self.director_revision_adapter_results = []
+        self.director_revision_contexts = []
+        self.guarded_revision_results = []
+        self.director_revision_attempt_count = 0
+        self.director_revision_last_stop_reason = None
+
+    @_state_mutation
+    def run_creative_analysis(self) -> tuple[dict[str, Any], ...]:
+        """Run read-only StoryPlan/DirectorPlan/FilmIR analysis.
+
+        Analysis is intentionally independent from lowering.  It may run with
+        only a MoviePlan, or with the richer FilmIR when ``/build-film-ir`` has
+        already completed.  It never changes either input object or the
+        production stage.
+        """
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        movie_plan = self.confirmed_movie_plan or self.movie_plan
+        if movie_plan is None:
+            raise RuntimeError("必须先生成 MoviePlan，才能运行 Creative Analysis。")
+        self.creative_optimizer_result = None
+        self.creative_optimizer_suggestions = []
+        self.creative_optimizer_candidates = []
+        self.creative_optimizer_diagnostics = []
+        self.creative_revision_requests = []
+        self.creative_revision_request_history = []
+        self.creative_revision_stop_reason = None
+        self._clear_revision_guard_state()
+        results = creative_analysis_pipeline().run(
+            deepcopy(movie_plan),
+            deepcopy(self.film_ir),
+        )
+        self.creative_analysis_results = [item.to_dict() for item in results]
+        self.creative_analysis_diagnostics = [
+            diagnostic.to_dict()
+            for result in results
+            for diagnostic in result.diagnostics
+        ]
+        self.creative_analysis_artifacts = [
+            artifact.to_dict()
+            for result in results
+            for artifact in result.artifacts
+        ]
+        self.creative_analysis_metrics = {
+            f"{result.analysis_type}.{key}": float(value)
+            for result in results
+            for key, value in result.metrics.items()
+        }
+        return tuple(deepcopy(self.creative_analysis_results))
+
+    @_state_mutation
+    def run_creative_optimization(self) -> dict[str, Any]:
+        """Turn stored creative diagnostics into director-facing requests.
+
+        This operation is read-only with respect to MoviePlan and all IR
+        layers.  It only persists analysis-derived optimizer artifacts.
+        """
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        movie_plan = self.confirmed_movie_plan or self.movie_plan
+        if movie_plan is None:
+            raise RuntimeError("必须先生成 MoviePlan，才能运行 Creative Optimizer。")
+        if not self.creative_analysis_results:
+            raise RuntimeError("必须先执行 /analysis，才能运行 Creative Optimizer。")
+        self._clear_revision_guard_state()
+        optimizer_result = creative_optimizer().optimize(
+            deepcopy(movie_plan),
+            deepcopy(self.creative_analysis_results),
+            deepcopy(self.film_ir),
+        )
+        request_result = RevisionRequestBuilder().build(
+            deepcopy(movie_plan),
+            optimizer_result,
+            validation_issues=tuple(self.film_ir_validation_issues),
+            analysis_diagnostics=tuple(self.creative_analysis_diagnostics),
+        )
+        director_result = RuleBasedDirectorRevisionLoop(max_revisions=1).run(
+            deepcopy(movie_plan),
+            creative_revision_requests=request_result.requests,
+        )
+        self.director_revision_history = deepcopy(list(director_result.revision_history))
+        self.director_revision_stop_reason = director_result.stop_reason
+        self.creative_optimizer_result = deepcopy(optimizer_result.to_dict())
+        self.creative_optimizer_suggestions = [
+            item.to_dict() for item in optimizer_result.suggestions
+        ]
+        self.creative_optimizer_candidates = [
+            item.to_dict() for item in optimizer_result.transformation_candidates
+        ]
+        self.creative_optimizer_diagnostics = [
+            item.to_dict() for item in optimizer_result.diagnostics
+        ]
+        self.creative_revision_requests = [
+            item.to_dict() for item in request_result.requests
+        ]
+        self.creative_revision_request_history.append(
+            {
+                "source_movie_plan_id": request_result.source_movie_plan_id,
+                "requests": deepcopy(self.creative_revision_requests),
+                "deferred_suggestions": [
+                    item.to_dict() for item in request_result.deferred_suggestions
+                ],
+                "stop_reason": request_result.stop_reason,
+            }
+        )
+        self.creative_revision_stop_reason = request_result.stop_reason
+        return {
+            "optimizer": deepcopy(self.creative_optimizer_result),
+            "revision_requests": deepcopy(self.creative_revision_requests),
+            "revision_stop_reason": self.creative_revision_stop_reason,
+        }
+
+    @_state_mutation
+    def run_revision_guard(
+        self,
+        candidate: RevisionCandidate | None = None,
+        *,
+        policy: RevisionGuardPolicy | None = None,
+    ) -> dict[str, Any]:
+        """Diff and guard a supplied candidate without applying it.
+
+        With no candidate this records a safe ``pending_director`` decision.
+        The default CLI path intentionally never creates a fake candidate.
+        """
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        movie_plan = self.confirmed_movie_plan or self.movie_plan
+        if movie_plan is None:
+            raise RuntimeError("必须先生成 MoviePlan，才能运行 RevisionGuard。")
+        if candidate is None and self.revision_active_candidate_id:
+            raw_candidate = next(
+                (
+                    item
+                    for item in self.revision_candidates
+                    if item.get("candidate_id") == self.revision_active_candidate_id
+                ),
+                None,
+            )
+            if raw_candidate is not None:
+                raw_plan = raw_candidate.get("revised_movie_plan")
+                revised_plan = movie_plan_from_data(raw_plan) if isinstance(raw_plan, dict) else None
+                candidate = RevisionCandidate.from_dict(
+                    raw_candidate,
+                    revised_movie_plan=revised_plan,
+                )
+        requests = tuple(self.creative_revision_requests)
+        diff = RevisionDiffBuilder().build_diff(movie_plan, candidate, requests)
+        decision = RevisionGuard(policy=policy).evaluate(
+            movie_plan,
+            candidate,
+            diff,
+            validation_issues=tuple(self.film_ir_validation_issues),
+            analysis_results=tuple(self.creative_analysis_results),
+            requests=requests,
+        )
+        if candidate is not None:
+            candidate_payload = candidate.to_dict()
+            existing_index = next(
+                (
+                    index
+                    for index, item in enumerate(self.revision_candidates)
+                    if item.get("candidate_id") == candidate.candidate_id
+                ),
+                None,
+            )
+            if existing_index is None:
+                self.revision_candidates.append(candidate_payload)
+            else:
+                self.revision_candidates[existing_index] = candidate_payload
+            self.revision_active_candidate_id = candidate.candidate_id
+        else:
+            self.revision_active_candidate_id = None
+        self.revision_diffs.append(diff.to_dict())
+        self.revision_decisions.append(decision.to_dict())
+        self.revision_guard_diagnostics.extend(
+            deepcopy(list(decision.diagnostics))
+        )
+        if decision.decision in {"accept", "accept_with_warning"} and candidate is not None:
+            self.revision_accepted_movie_plan_id = (
+                candidate.revised_movie_plan.plan_id
+                if candidate.revised_movie_plan is not None
+                else None
+            )
+        elif decision.decision == "rollback":
+            self.revision_rollback_movie_plan_id = decision.rollback_to_movie_plan_id
+        return deepcopy(decision.to_dict())
+
+    @_state_mutation
+    def run_director_revision_guarded(
+        self,
+        adapter: Any | None = None,
+        context: DirectorRevisionContext | None = None,
+        *,
+        policy: RevisionGuardPolicy | None = None,
+    ) -> dict[str, Any]:
+        """Generate one candidate and run it through validate, Diff, and Guard.
+
+        This method intentionally persists only the proposal and its decision.
+        Even an ``accept`` decision never replaces ``movie_plan``; explicit
+        apply/rollback belongs to Phase 4D.3.
+        """
+
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        movie_plan = self.confirmed_movie_plan or self.movie_plan
+        if movie_plan is None:
+            raise RuntimeError("必须先生成 MoviePlan，才能运行 Director Revision。")
+        requests = tuple(self.creative_revision_requests)
+        revision_context = context or DirectorRevisionContext.from_requests(
+            movie_plan,
+            requests,
+            max_revision_attempts=1,
+        )
+        if adapter is None:
+            if self.director_agent is None or isinstance(self.director_agent, RuleBasedDirectorAgent):
+                revision_adapter = RuleBasedDirectorRevisionAdapter()
+            else:
+                revision_adapter = DirectorAgentRevisionAdapter(
+                    self.director_agent,
+                    brief=self._v2_brief(),
+                )
+        else:
+            revision_adapter = adapter
+        result: GuardedRevisionResult = run_director_revision_guarded(
+            deepcopy(movie_plan),
+            requests,
+            revision_adapter,
+            revision_context,
+            brief=self._v2_brief(),
+            validation_issues=tuple(self.film_ir_validation_issues),
+            analysis_results=tuple(self.creative_analysis_results),
+            optimizer_result=self.creative_optimizer_result,
+            policy=policy,
+        )
+        self.director_revision_attempt_count += 1
+        self.director_revision_last_stop_reason = result.stop_reason
+        self.director_revision_adapter_results.append(result.adapter_result.to_dict())
+        self.director_revision_contexts.append(revision_context.to_dict())
+        self.guarded_revision_results.append(result.to_dict())
+        candidate = result.candidate
+        if candidate is not None:
+            candidate_payload = candidate.to_dict()
+            existing_index = next(
+                (
+                    index
+                    for index, item in enumerate(self.revision_candidates)
+                    if item.get("candidate_id") == candidate.candidate_id
+                ),
+                None,
+            )
+            if existing_index is None:
+                self.revision_candidates.append(candidate_payload)
+            else:
+                self.revision_candidates[existing_index] = candidate_payload
+            self.revision_active_candidate_id = candidate.candidate_id
+        else:
+            self.revision_active_candidate_id = None
+        if result.diff is not None:
+            self.revision_diffs.append(result.diff.to_dict())
+        if result.decision is not None:
+            self.revision_decisions.append(result.decision.to_dict())
+            self.revision_guard_diagnostics.extend(
+                deepcopy(list(result.decision.diagnostics))
+            )
+            if result.decision.decision in {"accept", "accept_with_warning"} and candidate is not None:
+                self.revision_accepted_movie_plan_id = (
+                    candidate.revised_movie_plan.plan_id
+                    if candidate.revised_movie_plan is not None
+                    else None
+                )
+            elif result.decision.decision == "rollback":
+                self.revision_rollback_movie_plan_id = result.decision.rollback_to_movie_plan_id
+        return deepcopy(result.to_dict())
+
+    @_state_mutation
+    def apply_revision(self, command: ApplyRevisionCommand) -> RevisionApplyResult:
+        """Explicitly apply an accepted candidate; never rebuild downstream IR."""
+
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        if not isinstance(command, ApplyRevisionCommand):
+            raise TypeError("apply_revision 需要 ApplyRevisionCommand。")
+        return apply_revision_to_session(self, command)
+
+    @_state_mutation
+    def rollback_revision(self, command: RollbackRevisionCommand) -> RevisionRollbackResult:
+        """Explicitly restore a version-history snapshot; never rebuild downstream IR."""
+
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        if not isinstance(command, RollbackRevisionCommand):
+            raise TypeError("rollback_revision 需要 RollbackRevisionCommand。")
+        return rollback_revision_to_session(self, command)
+
+    @_state_mutation
+    def build_movie_ir_from_film_ir(self) -> MovieIR | None:
+        """Lower an existing FilmIR into the executable MovieIR."""
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        if self.film_ir is None:
+            raise RuntimeError("Build FilmIR first with /build-film-ir.")
+        self._require_film_ir_lineage()
+        if self.stage not in {
+            Stage.FILM_IR_BUILT,
+            Stage.MOVIE_IR_BUILT,
+            Stage.VIDEO_JOB_COMPILED,
+        }:
+            raise RuntimeError("当前阶段不是 V2 FilmIR 已构建阶段。")
+        self.movie_ir_optimizer_diagnostics = []
+        self.movie_ir = None
+        self.v2_video_job = None
+        self.current_movie_ir_id = None
+        self.current_video_job_id = None
+        self.stage = Stage.FILM_IR_BUILT
+        result = MovieIRBuilder().build(deepcopy(self.film_ir))
+        self.movie_ir_build_diagnostics = [
+            {"code": item.code, "message": item.message, "path": item.path}
+            for item in result.errors
+        ] + [
+            {"code": item.code, "message": item.message, "path": item.path}
+            for item in result.diagnostics
+        ]
+        self.movie_ir_build_metadata = {
+            "source_movie_plan_id": self.film_ir.source_movie_plan_id,
+            "source_film_ir_id": self.film_ir.ir_id,
+            "error_count": len(result.errors),
+        }
+        if not result.ok or result.movie_ir is None:
+            return None
+        validation = MovieIRValidator().validate(result.movie_ir)
+        self.movie_ir_validation_issues = [
+            v2_plain_data(item) for item in validation.issues
+        ]
+        if not validation.ok:
+            self.movie_ir_pass_diagnostics = []
+            self.movie_ir_optimizer_diagnostics = []
+            return None
+        pass_result = compiler_pass_pipeline().run(result.movie_ir)
+        self.movie_ir_pass_diagnostics = [
+            v2_plain_data(item) for item in pass_result.diagnostics
+        ]
+        if not pass_result.ok or not isinstance(pass_result.ir, MovieIR):
+            self.movie_ir_optimizer_diagnostics = []
+            return None
+        optimizer_result = MovieIROptimizer().optimize(pass_result.ir)
+        self.movie_ir_optimizer_diagnostics = _optimizer_records(optimizer_result)
+        if not optimizer_result.ok or not isinstance(optimizer_result.after_ir, MovieIR):
+            return None
+        self.movie_ir = deepcopy(optimizer_result.after_ir)
+        self.current_movie_ir_id = self.movie_ir.ir_id
+        self.movie_ir_revisions.append(deepcopy(optimizer_result.after_ir))
+        self.v2_video_job = None
+        self.v2_compile_diagnostics = []
+        self.v2_compile_metadata = {}
+        self.stage = Stage.MOVIE_IR_BUILT
+        self._snapshot("movie_ir", optimizer_result.after_ir.to_dict(), confirmed=True)
+        self.refresh_source_lineage_diagnostics()
+        return deepcopy(optimizer_result.after_ir)
+
+    @_state_mutation
+    def build_movie_ir_from_confirmed_movie_plan(self) -> MovieIR | None:
+        """Legacy V2 facade that performs both explicit IR lowering steps."""
+        if self.film_ir is None:
+            if self.build_film_ir_from_confirmed_movie_plan() is None:
+                return None
+        return self.build_movie_ir_from_film_ir()
+
+    @_state_mutation
+    def compile_confirmed_movie_plan(
+        self,
+        capabilities: V2ProviderCapabilities | None = None,
+        options: CompilationOptions | None = None,
+    ) -> CompileResult:
+        """Compile only the confirmed V2 plan; never invoke a Provider."""
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        if self.confirmed_movie_plan is None:
+            raise RuntimeError("必须先确认 MoviePlan，才能编译 VideoJob。")
+        if self.film_ir is None:
+            raise RuntimeError("必须先执行 /build-film-ir，才能编译 VideoJob。")
+        if self.movie_ir is None:
+            raise RuntimeError("必须先执行 /build-ir，才能编译 VideoJob。")
+        self._require_movie_ir_lineage()
+        if self.stage not in {
+            Stage.MOVIE_IR_BUILT,
+            Stage.VIDEO_JOB_COMPILED,
+        }:
+            raise RuntimeError("当前阶段不是 V2 MoviePlan 已确认阶段。")
+        provider_capabilities = capabilities or V2ProviderCapabilities(
+            provider_key="generic-v2",
+            provider_profile="generic",
+            supports_long_video=True,
+            supports_multi_scene_prompt=True,
+            supports_audio=True,
+        )
+        result = VideoJobCompiler().compile(
+            deepcopy(self.movie_ir),
+            provider_capabilities,
+            options,
+        )
+        self.v2_compile_diagnostics = [
+            {"kind": "error", **v2_plain_data(item)} for item in result.errors
+        ] + [
+            {"kind": "warning", **v2_plain_data(item)} for item in result.warnings
+        ]
+        self.v2_compile_metadata = deepcopy(dict(result.metadata))
+        if not result.success or result.video_job is None:
+            return result
+        self.v2_video_job = deepcopy(result.video_job)
+        self.current_video_job_id = self.v2_video_job.job_id
+        self.stage = Stage.VIDEO_JOB_COMPILED
+        self._snapshot("v2_video_job", v2_plain_data(result.video_job), confirmed=True)
+        self.refresh_source_lineage_diagnostics()
+        return result
+
+    def refresh_source_lineage_diagnostics(self) -> LineageCheckResult:
+        """Recompute persisted source/stale diagnostics without rebuilding anything."""
+
+        result = SourceLineageGuard().check_session(self)
+        records = [item.to_dict() for item in result.diagnostics]
+        self.source_lineage_diagnostics = records
+        self.stale_lineage_diagnostics = [
+            item for item in records if item.get("severity") in {"error", "warning"}
+        ]
+        return result
+
+    def _lineage_ids(self) -> tuple[str | None, str | None, str | None]:
+        plan = self.confirmed_movie_plan or self.movie_plan
+        plan_id = self.current_movie_plan_id or (plan.plan_id if plan else None)
+        story_id = (
+            f"{plan_id}:story_plan"
+            if plan_id and plan is not None and plan.story_plan is not None
+            else None
+        )
+        director_id = (
+            f"{plan_id}:director_plan"
+            if plan_id and plan is not None and plan.director_plan is not None
+            else None
+        )
+        return plan_id, story_id, director_id
+
+    def _store_lineage_result(self, results: tuple[LineageCheckResult, ...]) -> None:
+        diagnostics = [
+            item.to_dict()
+            for result in results
+            for item in result.diagnostics
+        ]
+        self.source_lineage_diagnostics = diagnostics
+        self.stale_lineage_diagnostics = [
+            item for item in diagnostics if item.get("severity") in {"error", "warning"}
+        ]
+
+    @staticmethod
+    def _lineage_failure_message(results: tuple[LineageCheckResult, ...]) -> str:
+        messages = []
+        for result in results:
+            for item in result.diagnostics:
+                action = f"；请先执行 {item.action}" if item.action else ""
+                messages.append(f"{item.message}{action}")
+        return "；".join(messages) or "来源 lineage 校验失败。"
+
+    def _require_film_ir_lineage(self) -> None:
+        plan_id, story_id, director_id = self._lineage_ids()
+        result = SourceLineageGuard().check_film_ir(
+            self.film_ir,
+            current_movie_plan_id=plan_id or "",
+            current_story_plan_id=story_id or "",
+            current_director_plan_id=director_id or "",
+            current_film_ir_id=self.current_film_ir_id or "",
+        )
+        self._store_lineage_result((result,))
+        if not result.valid:
+            raise RuntimeError(self._lineage_failure_message((result,)))
+
+    def _require_movie_ir_lineage(self) -> None:
+        plan_id, story_id, director_id = self._lineage_ids()
+        guard = SourceLineageGuard()
+        film_result = guard.check_film_ir(
+            self.film_ir,
+            current_movie_plan_id=plan_id or "",
+            current_story_plan_id=story_id or "",
+            current_director_plan_id=director_id or "",
+            current_film_ir_id=self.current_film_ir_id or "",
+        )
+        movie_result = guard.check_movie_ir(
+            self.movie_ir,
+            current_movie_plan_id=plan_id or "",
+            current_film_ir_id=self.current_film_ir_id or "",
+            current_movie_ir_id=self.current_movie_ir_id or "",
+        )
+        results = (film_result, movie_result)
+        self._store_lineage_result(results)
+        if not all(item.valid for item in results):
+            raise RuntimeError(self._lineage_failure_message(results))
+
+    def _require_video_job_lineage(self) -> None:
+        plan_id, _, _ = self._lineage_ids()
+        result = SourceLineageGuard().check_video_job(
+            self.v2_video_job,
+            current_movie_plan_id=plan_id or "",
+            current_film_ir_id=self.current_film_ir_id or "",
+            current_movie_ir_id=self.current_movie_ir_id or "",
+            current_video_job_id=self.current_video_job_id or "",
+        )
+        self._store_lineage_result((result,))
+        if not result.valid:
+            raise RuntimeError(self._lineage_failure_message((result,)))
+
+    def _v2_brief(self) -> V2CreativeBrief:
+        target = self.brief.resolved_target_seconds or self.brief.target_seconds
+        if target is None:
+            raise RuntimeError("V2 模式必须通过 --target-seconds 指定目标时长。")
+        return V2CreativeBrief(
+            target_duration_seconds=int(target),
+            video_type=self.brief.genre or "short_film",
+            visual_style=self.brief.visual_style or "cinematic",
+            audience="general audience",
+            narration_requirement="required" if self.brief.narration_enabled else "none",
+            output_format="mp4",
+        )
+
+    def _record_director_revision(
+        self,
+        *,
+        validation_issues: tuple[Any, ...] = (),
+        creative_diagnostics: tuple[Any, ...] = (),
+        optimizer_diagnostics: tuple[Any, ...] = (),
+    ) -> None:
+        """Persist the offline revision-loop decision without changing content."""
+
+        if self.confirmed_movie_plan is None:
+            self.director_revision_history = []
+            self.director_revision_stop_reason = "missing_confirmed_movie_plan"
+            return
+        result = RuleBasedDirectorRevisionLoop(max_revisions=1).run(
+            self.confirmed_movie_plan,
+            validation_issues=validation_issues,
+            creative_diagnostics=creative_diagnostics,
+            optimizer_diagnostics=optimizer_diagnostics,
+        )
+        self.director_revision_history = deepcopy(list(result.revision_history))
+        self.director_revision_stop_reason = result.stop_reason
+
+    @_state_mutation
     def generate_story(self) -> StoryDraft:
         if self.stage not in {Stage.IDEATING, Stage.STORY_REVIEW}:
             raise RuntimeError("请先返回灵感区，再生成新的完整故事。")
@@ -483,6 +1428,7 @@ class GuidedStorySession:
         self.draft = None
         self.outline = None
         self.storyboard = None
+        self.video_job = None
         self.render_manifest = None
         self.stage = Stage.STORY_REVIEW
         self.user_action_count += 1
@@ -521,6 +1467,7 @@ class GuidedStorySession:
         self.draft = None
         self.outline = None
         self.storyboard = None
+        self.video_job = None
         self.render_manifest = None
         self.stage = Stage.STORY_REVIEW
         self.free_text_count += 1
@@ -570,6 +1517,7 @@ class GuidedStorySession:
         self.draft = None
         self.outline = None
         self.storyboard = None
+        self.video_job = None
         self.render_manifest = None
         self.stage = Stage.SCRIPT_REVIEW
         self.user_action_count += 1
@@ -609,6 +1557,7 @@ class GuidedStorySession:
         self.draft = None
         self.outline = None
         self.storyboard = None
+        self.video_job = None
         self.render_manifest = None
         self.stage = Stage.SCRIPT_REVIEW
         self.free_text_count += 1
@@ -628,6 +1577,30 @@ class GuidedStorySession:
             raise RuntimeError("剧本仍有必须修复的问题：" + "；".join(review.hard_errors))
         self.script.confirmed = True
         self._snapshot("script", to_plain_data(self.script), confirmed=True)
+
+    @_state_mutation
+    def build_video_job(self) -> VideoJob:
+        """Create the direct script-to-video request.
+
+        This is the default path for the current product stage.  The old
+        ``build_storyboard`` method remains available as a compatibility API,
+        but it is no longer required to reach rendering.
+        """
+        if self.script is None or not self.script.confirmed:
+            raise RuntimeError("请先确认剧本。")
+        if self.stage not in {Stage.SCRIPT_REVIEW, Stage.STORYBOARD_REVIEW, Stage.RENDER_READY}:
+            raise RuntimeError("当前阶段不能重新生成视频任务。")
+        job = build_video_job(
+            deepcopy(self.script),
+            story=deepcopy(self.story),
+            facts=deepcopy(self._story_facts()),
+            visual_style=self.brief.visual_style,
+        )
+        self.video_job = job
+        self.stage = Stage.RENDER_READY
+        self.render_manifest = None
+        self._snapshot("video_job", to_plain_data(job))
+        return deepcopy(job)
 
     @_state_mutation
     def build_storyboard(self) -> StoryboardPlan:
@@ -878,7 +1851,25 @@ class GuidedStorySession:
             raise ValueError("镜头不存在。")
         if not isinstance(patch, dict) or not patch:
             raise ValueError("镜头修改必须包含至少一个字段。")
-        allowed = set(StoryboardShot.__dataclass_fields__) - {"shot_id", "scene_id"}
+        computed_timing_fields = {
+            "dialogue",
+            "duration_reason",
+            "duration_weight",
+            "end_frame_prompt",
+            "estimated_duration",
+            "first_frame_prompt",
+            "minimum_readable_duration",
+            "motion_prompt",
+            "narration",
+            "negative_prompt",
+            "source_action",
+            "video_prompt",
+        }
+        allowed = (
+            set(StoryboardShot.__dataclass_fields__)
+            - {"shot_id", "scene_id"}
+            - computed_timing_fields
+        )
         unsupported = [field for field in patch if field not in allowed]
         if unsupported:
             raise ValueError(f"不支持的镜头字段：{unsupported[0]}")
@@ -887,29 +1878,49 @@ class GuidedStorySession:
         candidate = candidate_plan.shots[shot_index]
         for field, value in patch.items():
             setattr(candidate, field, deepcopy(value))
+        if "action" in patch and candidate.source_action:
+            if candidate.action.strip() != candidate.source_action.strip():
+                raise ValueError(
+                    "已确认剧情动作不能在 Retake 中改写；请回到剧本阶段修改事件内容。"
+                )
+        if {"action", "shot_kind", "shot_purpose"}.intersection(patch):
+            same_scene = [
+                shot
+                for shot in candidate_plan.shots
+                if shot.scene_id == candidate.scene_id
+            ]
+            retake_floor = assess_shot_readable_minimum(
+                ShotTimingDemand(
+                    shot_kind=candidate.shot_kind,
+                    purpose=candidate.shot_purpose,
+                    priority=6 if candidate.shot_kind == "action" else 4,
+                    action=(
+                        f"{candidate.action}，{candidate.retake_instruction}"
+                        if candidate.retake_instruction.strip()
+                        else candidate.action
+                    ),
+                    dialogue="",
+                    narration=candidate.narration,
+                    emotional_change="",
+                    scene_duration=sum(shot.duration for shot in same_scene),
+                    scene_shot_count=max(1, len(same_scene)),
+                    narration_is_per_shot=True,
+                )
+            )
+            candidate.minimum_readable_duration = max(
+                candidate.minimum_readable_duration,
+                retake_floor.minimum_seconds,
+            )
+            candidate.duration_reason = (
+                f"{candidate.duration_reason}；Retake后复核：{retake_floor.reason}"
+            ).strip("；")
         if "seed" not in patch:
             candidate.seed = derive_retake_seed(
                 candidate.seed,
                 candidate.shot_id,
                 patch,
             )
-        if "duration" in patch:
-            candidate.motion_prompt = self._motion_with_duration(
-                candidate.motion_prompt,
-                candidate.duration,
-            )
-            candidate.video_prompt = self._motion_with_duration(
-                candidate.video_prompt,
-                candidate.duration,
-            )
-        if {
-            "continuity_mode",
-            "transition_type",
-            "transition_reason",
-            "inherit_previous_frame",
-            "previous_shot_id",
-        }.intersection(patch):
-            apply_transition_prompt_context([candidate])
+        refresh_shot_prompts(candidate)
         candidate.initial_frame_source_path = ""
         candidate.initial_frame_path = ""
         candidate.initial_frame_url = ""
@@ -994,6 +2005,104 @@ class GuidedStorySession:
                         self.render_manifest.failed_shots.append(shot_id)
                     self.render_manifest.error = artifact.error_message
             return deepcopy(artifact)
+
+    @_state_mutation
+    def resolve_video_submission_uncertainty(
+        self,
+        *,
+        accepted_by_provider: bool,
+        provider_request_id: str = "",
+    ) -> VideoArtifact:
+        """Resolve the single whole-video write-ahead intent after manual checks."""
+        if self.video_job is None or self.render_manifest is None:
+            raise RuntimeError("当前没有可核对的完整视频任务。")
+        candidates = [
+            artifact
+            for artifact in self.render_manifest.artifacts
+            if artifact.status == "submission_uncertain"
+        ]
+        if not candidates:
+            raise RuntimeError("当前没有等待人工核对的完整视频提交记录。")
+        artifact = candidates[-1]
+        cleaned_request_id = " ".join(provider_request_id.split())
+        if accepted_by_provider:
+            if not cleaned_request_id or cleaned_request_id.startswith("submit-intent-"):
+                raise ValueError("请填写 Provider 后台核实后的真实任务 ID。")
+            artifact.status = "pending"
+            artifact.request_id = cleaned_request_id
+            artifact.error_message = (
+                "已登记 Provider 真实任务 ID；下次生成只会查询该任务，不会重新提交。"
+            )
+            self.render_manifest.status = "pending"
+        else:
+            artifact.status = "failed"
+            artifact.request_id = None
+            artifact.error_message = "已确认 Provider 未受理；下次允许重新提交完整视频任务。"
+            self.render_manifest.status = "failed"
+            if 1 not in self.render_manifest.failed_shots:
+                self.render_manifest.failed_shots.append(1)
+        self.render_manifest.error = artifact.error_message
+        self.render_manifest.artifacts[-1] = deepcopy(artifact)
+        return deepcopy(artifact)
+
+    def render_confirmed_video(self, renderer, output_dir: str | Path) -> RenderManifest:
+        """Render the confirmed whole-video job in one provider call.
+
+        Provider-specific duration limits and optional internal chunking are
+        intentionally handled by the adapter behind ``renderer``.
+        """
+        with self._state_lock:
+            if self._render_in_progress:
+                raise RuntimeError("视频生成正在进行，请等待当前任务结束。")
+            if self.stage != Stage.RENDER_READY or self.video_job is None:
+                raise RuntimeError("必须先生成并确认完整视频任务，才能调用视频生成。")
+            if not self.video_job.confirmed:
+                raise RuntimeError("完整视频任务尚未确认，禁止调用视频生成。")
+            if (
+                self.story is None
+                or not self.story.confirmed
+                or self.script is None
+                or not self.script.confirmed
+            ):
+                raise RuntimeError("故事与剧本确认状态不一致，禁止视频生成。")
+            confirmed_job = deepcopy(self.video_job)
+            previous_stage = self.stage
+            previous_manifest = deepcopy(self.render_manifest)
+            self._render_in_progress = True
+
+        try:
+            render_target = output_dir
+            if (
+                self.render_manifest is not None
+                and self.render_manifest.status in {"pending", "submission_uncertain"}
+                and self.render_manifest.output_dir
+            ):
+                # Reuse the original write-ahead directory so a retry can
+                # resume/query the same remote task instead of submitting a
+                # second whole-video request.
+                render_target = self.render_manifest.output_dir
+            manifest = renderer.render(confirmed_job, render_target)
+            if not isinstance(manifest, RenderManifest):
+                raise TypeError("渲染器必须返回 RenderManifest。")
+            if manifest.status in {"succeeded", "succeeded_with_warnings"}:
+                final = Path(manifest.final_video_path).expanduser()
+                if not manifest.final_video_path or not final.is_file():
+                    raise RuntimeError("渲染器报告成功，但没有可用的完整视频文件。")
+            with self._state_lock:
+                if self.video_job is None or self.stage != Stage.RENDER_READY:
+                    raise RuntimeError("渲染期间完整视频任务发生变化，结果未写入当前会话。")
+                self.render_manifest = deepcopy(manifest)
+                if manifest.status in {"succeeded", "succeeded_with_warnings"}:
+                    self.stage = Stage.COMPLETED
+                return manifest
+        except Exception:
+            with self._state_lock:
+                self.stage = previous_stage
+                self.render_manifest = previous_manifest
+            raise
+        finally:
+            with self._state_lock:
+                self._render_in_progress = False
 
     def render_confirmed_plan(self, renderer, output_dir: str | Path) -> RenderManifest:
         with self._state_lock:
@@ -1099,7 +2208,19 @@ class GuidedStorySession:
 
     def review_current_artifact(self, artifact_type: str | None = None) -> ArtifactReview:
         kind = artifact_type or (
-            "storyboard" if self.storyboard else "script" if self.script else "story"
+            "v2_video_job"
+            if self.v2_video_job
+            else "movie_ir"
+            if self.movie_ir
+            else "film_ir"
+            if self.film_ir
+            else "video_job"
+            if self.video_job
+            else "storyboard"
+            if self.storyboard
+            else "script"
+            if self.script
+            else "story"
         )
         review = ArtifactReview(artifact_type=kind)
         if kind == "story" and self.story:
@@ -1142,6 +2263,14 @@ class GuidedStorySession:
                 review.scores["shot_diversity"] = 0.0
                 review.scores["visual_identity_coverage"] = 0.0
                 return review
+            try:
+                self._validate_storyboard_plan(self.storyboard)
+            except (TypeError, ValueError) as exc:
+                review.hard_errors.append(f"分镜结构无效：{exc}")
+                review.scores["shot_diversity"] = 0.0
+                review.scores["visual_identity_coverage"] = 0.0
+                review.scores["timing_budget_fit"] = 0.0
+                return review
             if abs(self.storyboard.total_duration - target_seconds) > 1:
                 review.hard_errors.append("分镜总时长不符合目标")
             minimum = max(1, (target_seconds + 14) // 15)
@@ -1150,6 +2279,99 @@ class GuidedStorySession:
                 review.hard_errors.append(f"当前时长下分镜数量必须在{minimum}到{maximum}之间")
             if any(not 3 <= shot.duration <= 15 for shot in self.storyboard.shots):
                 review.hard_errors.append("存在超出3到15秒限制的镜头")
+            try:
+                if self.script is None:
+                    raise ValueError("缺少已确认剧本")
+                timing_assessment = assess_director_plan_timing(
+                    self.script,
+                    [
+                        {
+                            "scene_id": shot.scene_id,
+                            "kind": shot.shot_kind,
+                            "action": (
+                                f"{shot.action}，{shot.retake_instruction}"
+                                if shot.retake_instruction.strip()
+                                else shot.action
+                            ),
+                            "purpose": shot.shot_purpose,
+                            "transition_type": shot.transition_type,
+                            "transition_reason": shot.transition_reason,
+                            "inherit_previous_frame": shot.inherit_previous_frame,
+                            "camera": shot.camera,
+                            "camera_movement": shot.camera_movement,
+                            "composition": shot.composition,
+                        }
+                        for shot in self.storyboard.shots
+                    ],
+                    dialogue_overrides=[
+                        shot.dialogue for shot in self.storyboard.shots
+                    ],
+                    narration_overrides=[
+                        shot.narration for shot in self.storyboard.shots
+                    ],
+                )
+            except (TypeError, ValueError) as exc:
+                review.hard_errors.append(
+                    f"无法根据当前剧本重新核验分镜时长预算：{exc}"
+                )
+                review.scores["timing_budget_fit"] = 0.0
+            else:
+                readable_minimums = list(timing_assessment.minimum_durations)
+                minimum_total = sum(readable_minimums)
+                over_capacity = [
+                    shot.shot_id
+                    for shot, minimum_duration in zip(
+                        self.storyboard.shots,
+                        readable_minimums,
+                    )
+                    if minimum_duration > 15
+                ]
+                if over_capacity:
+                    review.hard_errors.append(
+                        "存在单镜内容可读下限超过15秒、必须拆分的镜头："
+                        + "、".join(str(shot_id) for shot_id in over_capacity)
+                    )
+                underfunded = [
+                    shot.shot_id
+                    for shot, minimum_duration in zip(
+                        self.storyboard.shots,
+                        readable_minimums,
+                    )
+                    if shot.duration < minimum_duration
+                ]
+                if underfunded:
+                    review.hard_errors.append(
+                        "存在实际时长低于内容可读下限的镜头："
+                        + "、".join(str(shot_id) for shot_id in underfunded)
+                    )
+                if minimum_total > target_seconds:
+                    review.hard_errors.append(
+                        f"分镜内容至少需要 {minimum_total} 秒，"
+                        f"超过目标时长 {target_seconds} 秒"
+                    )
+                review.scores["timing_budget_fit"] = round(
+                    min(1.0, target_seconds / max(1, minimum_total)),
+                    3,
+                )
+                stored_minimums = [
+                    shot.minimum_readable_duration
+                    for shot in self.storyboard.shots
+                ]
+                if stored_minimums != readable_minimums:
+                    review.warnings.append(
+                        "已按当前剧本和镜头内容重新计算可读时长下限；"
+                        "持久化的旧时长元数据未被用作确认依据"
+                    )
+            preferred_total = sum(
+                shot.estimated_duration
+                for shot in self.storyboard.shots
+                if math.isfinite(float(shot.estimated_duration))
+                and shot.estimated_duration > 0
+            )
+            review.scores["timing_preferred_fit"] = round(
+                min(1.0, target_seconds / preferred_total),
+                3,
+            ) if preferred_total else 0.0
             if any(
                 not shot.first_frame_prompt.strip()
                 or not shot.motion_prompt.strip()
@@ -1157,10 +2379,42 @@ class GuidedStorySession:
                 for shot in self.storyboard.shots
             ):
                 review.hard_errors.append("存在缺少首帧、动作或结束帧描述的镜头")
+            inconsistent_prompts = [
+                shot.shot_id
+                for shot in self.storyboard.shots
+                if not shot_prompts_match_content(shot)
+            ]
+            if inconsistent_prompts:
+                review.hard_errors.append(
+                    "Provider 最终提示词与已审查的结构化镜头内容不一致：镜头"
+                    + "、".join(str(shot_id) for shot_id in inconsistent_prompts)
+                )
             cameras = {shot.camera for shot in self.storyboard.shots}
             review.scores["shot_diversity"] = min(1.0, len(cameras) / 4)
             referenced = sum(bool(shot.reference_asset_ids) for shot in self.storyboard.shots)
             review.scores["visual_identity_coverage"] = referenced / len(self.storyboard.shots)
+            deterministic_quality = evaluate_storyboard_quality(self.storyboard)
+            for key in (
+                "storyboard_action_uniqueness",
+                "storyboard_transition_explicitness",
+                "storyboard_atomic_action_rate",
+            ):
+                review.scores[key] = float(deterministic_quality[key])
+            atomic_rate = float(
+                deterministic_quality["storyboard_atomic_action_rate"]
+            )
+            if atomic_rate < 0.8:
+                review.hard_errors.append(
+                    "过多镜头包含复合动作，必须拆成原子动作或压缩剧本内容"
+                )
+            elif atomic_rate < 1.0:
+                review.warnings.append("少量镜头仍包含较多动作阶段，请重点预览")
+        elif kind == "video_job" and self.video_job:
+            if not self.video_job.title.strip() or not self.video_job.prompt.strip():
+                review.hard_errors.append("完整视频任务缺少标题或提示词")
+            if self.video_job.target_seconds <= 0:
+                review.hard_errors.append("完整视频任务目标时长无效")
+            review.scores["filmability"] = 1.0 if not review.hard_errors else 0.5
         else:
             raise RuntimeError("当前没有可审查的产物。")
         return review
@@ -1266,6 +2520,7 @@ class GuidedStorySession:
         self.draft = None
         self.outline = None
         self.storyboard = None
+        self.video_job = None
         self.render_manifest = None
         self.stage = Stage.SCRIPT_REVIEW
         self._snapshot("script", to_plain_data(self.script), user_feedback=f"edit scene {scene_id}")
@@ -1309,6 +2564,79 @@ class GuidedStorySession:
                 "draft": to_plain_data(self.draft) if self.draft else None,
                 "draft_history": to_plain_data(self.draft_history),
                 "storyboard": to_plain_data(self.storyboard) if self.storyboard else None,
+                "video_job": to_plain_data(self.video_job) if self.video_job else None,
+                "v2_enabled": self.v2_enabled,
+                # Phase 4A keeps StoryPlan/DirectorPlan nested in MoviePlan so
+                # Session has one source of truth instead of duplicate layers.
+                "movie_plan": v2_plain_data(self.movie_plan) if self.movie_plan else None,
+                "movie_plan_revisions": v2_plain_data(self.movie_plan_revisions),
+                "confirmed_movie_plan": (
+                    v2_plain_data(self.confirmed_movie_plan)
+                    if self.confirmed_movie_plan
+                    else None
+                ),
+                "film_ir": self.film_ir.to_dict() if self.film_ir else None,
+                "film_ir_revisions": [item.to_dict() for item in self.film_ir_revisions],
+                "film_ir_build_diagnostics": deepcopy(self.film_ir_build_diagnostics),
+                "film_ir_build_metadata": deepcopy(self.film_ir_build_metadata),
+                "film_ir_validation_issues": deepcopy(self.film_ir_validation_issues),
+                "film_ir_pass_diagnostics": deepcopy(self.film_ir_pass_diagnostics),
+                "creative_pass_diagnostics": deepcopy(self.creative_pass_diagnostics),
+                "creative_analysis_results": deepcopy(self.creative_analysis_results),
+                "creative_analysis_diagnostics": deepcopy(self.creative_analysis_diagnostics),
+                "creative_analysis_artifacts": deepcopy(self.creative_analysis_artifacts),
+                "creative_analysis_metrics": deepcopy(self.creative_analysis_metrics),
+                "creative_optimizer_result": deepcopy(self.creative_optimizer_result),
+                "creative_optimizer_suggestions": deepcopy(self.creative_optimizer_suggestions),
+                "creative_optimizer_candidates": deepcopy(self.creative_optimizer_candidates),
+                "creative_optimizer_diagnostics": deepcopy(self.creative_optimizer_diagnostics),
+                "creative_revision_requests": deepcopy(self.creative_revision_requests),
+                "creative_revision_request_history": deepcopy(self.creative_revision_request_history),
+                "creative_revision_stop_reason": self.creative_revision_stop_reason,
+                "revision_candidates": deepcopy(self.revision_candidates),
+                "revision_diffs": deepcopy(self.revision_diffs),
+                "revision_decisions": deepcopy(self.revision_decisions),
+                "revision_guard_diagnostics": deepcopy(self.revision_guard_diagnostics),
+                "revision_active_candidate_id": self.revision_active_candidate_id,
+                "revision_accepted_movie_plan_id": self.revision_accepted_movie_plan_id,
+                "revision_rollback_movie_plan_id": self.revision_rollback_movie_plan_id,
+                "director_revision_adapter_results": deepcopy(
+                    self.director_revision_adapter_results
+                ),
+                "director_revision_contexts": deepcopy(self.director_revision_contexts),
+                "guarded_revision_results": deepcopy(self.guarded_revision_results),
+                "director_revision_attempt_count": self.director_revision_attempt_count,
+                "director_revision_last_stop_reason": self.director_revision_last_stop_reason,
+                "movie_plan_version_history": deepcopy(self.movie_plan_version_history),
+                "revision_apply_history": deepcopy(self.revision_apply_history),
+                "revision_rollback_history": deepcopy(self.revision_rollback_history),
+                "revision_apply_results": deepcopy(self.revision_apply_results),
+                "revision_rollback_results": deepcopy(self.revision_rollback_results),
+                "current_movie_plan_id": self.current_movie_plan_id,
+                "previous_movie_plan_id": self.previous_movie_plan_id,
+                "stale_artifacts": deepcopy(self.stale_artifacts),
+                "source_lineage_diagnostics": deepcopy(self.source_lineage_diagnostics),
+                "stale_lineage_diagnostics": deepcopy(self.stale_lineage_diagnostics),
+                "current_film_ir_id": self.current_film_ir_id,
+                "current_movie_ir_id": self.current_movie_ir_id,
+                "current_video_job_id": self.current_video_job_id,
+                "film_ir_optimizer_diagnostics": deepcopy(
+                    self.film_ir_optimizer_diagnostics
+                ),
+                "director_revision_history": deepcopy(self.director_revision_history),
+                "director_revision_stop_reason": self.director_revision_stop_reason,
+                "movie_ir": self.movie_ir.to_dict() if self.movie_ir else None,
+                "movie_ir_revisions": [item.to_dict() for item in self.movie_ir_revisions],
+                "movie_ir_build_diagnostics": deepcopy(self.movie_ir_build_diagnostics),
+                "movie_ir_build_metadata": deepcopy(self.movie_ir_build_metadata),
+                "movie_ir_validation_issues": deepcopy(self.movie_ir_validation_issues),
+                "movie_ir_pass_diagnostics": deepcopy(self.movie_ir_pass_diagnostics),
+                "movie_ir_optimizer_diagnostics": deepcopy(
+                    self.movie_ir_optimizer_diagnostics
+                ),
+                "v2_video_job": v2_plain_data(self.v2_video_job) if self.v2_video_job else None,
+                "v2_compile_diagnostics": deepcopy(self.v2_compile_diagnostics),
+                "v2_compile_metadata": deepcopy(self.v2_compile_metadata),
                 "render_manifest": to_plain_data(self.render_manifest)
                 if self.render_manifest
                 else None,
@@ -1325,7 +2653,14 @@ class GuidedStorySession:
             return deepcopy(payload)
 
     @classmethod
-    def load(cls, path: str | Path, *, agent: StoryAgent | None = None) -> GuidedStorySession:
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        agent: StoryAgent | None = None,
+        director_agent: V2DirectorAgent | None = None,
+        v2_enabled: bool | None = None,
+    ) -> GuidedStorySession:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("会话文件顶层必须是 JSON 对象。")
@@ -1340,7 +2675,19 @@ class GuidedStorySession:
         brief_data = data.get("brief", {})
         if not isinstance(brief_data, dict):
             raise ValueError("brief 必须是 JSON 对象。")
-        session = cls(CreativeBrief(**brief_data), agent=agent)
+        session = cls(
+            CreativeBrief(**brief_data),
+            agent=agent,
+            director_agent=director_agent,
+            v2_enabled=bool(
+                data.get("v2_enabled", v2_enabled or False)
+                or data.get("movie_plan")
+                or data.get("confirmed_movie_plan")
+                or data.get("film_ir")
+                or data.get("movie_ir")
+                or data.get("v2_video_job")
+            ),
+        )
         if schema_version < 3:
             session._load_v2(data)
             session._validate_loaded_state(schema_version=schema_version)
@@ -1384,7 +2731,10 @@ class GuidedStorySession:
             session._draft_from(item) for item in data.get("draft_history", [])
         ]
         if data.get("storyboard"):
-            session.storyboard = session._storyboard_from(data["storyboard"])
+            session.storyboard = session._storyboard_from(
+                data["storyboard"],
+                normalize_legacy_narration=schema_version < 5,
+            )
             stored_signature = str(data.get("confirmed_storyboard_signature", ""))
             session._confirmed_storyboard_signature = (
                 stored_signature
@@ -1394,6 +2744,230 @@ class GuidedStorySession:
                     else ""
                 )
             )
+        if data.get("video_job"):
+            session.video_job = session._video_job_from(data["video_job"])
+        if data.get("movie_plan"):
+            # movie_plan_from_data migrates pre-Phase-4A JSON that lacks the
+            # nested story_plan/director_plan fields.
+            session.movie_plan = movie_plan_from_data(data["movie_plan"])
+        session.movie_plan_revisions = [
+            movie_plan_from_data(item) for item in data.get("movie_plan_revisions", [])
+        ]
+        if data.get("confirmed_movie_plan"):
+            session.confirmed_movie_plan = movie_plan_from_data(data["confirmed_movie_plan"])
+        for field_name in ("current_movie_plan_id", "previous_movie_plan_id"):
+            raw_id = data.get(field_name)
+            if raw_id is not None and not isinstance(raw_id, str):
+                raise ValueError(f"{field_name} 必须是字符串或 null。")
+            setattr(session, field_name, raw_id)
+        if session.current_movie_plan_id is None:
+            current_plan = session.confirmed_movie_plan or session.movie_plan
+            session.current_movie_plan_id = current_plan.plan_id if current_plan else None
+        if data.get("film_ir"):
+            session.film_ir = FilmIR.from_dict(data["film_ir"])
+        session.film_ir_revisions = [
+            FilmIR.from_dict(item) for item in data.get("film_ir_revisions", [])
+        ]
+        raw_film_diagnostics = data.get("film_ir_build_diagnostics", [])
+        if not isinstance(raw_film_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_film_diagnostics
+        ):
+            raise ValueError("film_ir_build_diagnostics 必须是 JSON 对象数组。")
+        session.film_ir_build_diagnostics = deepcopy(raw_film_diagnostics)
+        raw_film_metadata = data.get("film_ir_build_metadata", {})
+        if not isinstance(raw_film_metadata, dict):
+            raise ValueError("film_ir_build_metadata 必须是 JSON 对象。")
+        session.film_ir_build_metadata = deepcopy(raw_film_metadata)
+        raw_film_issues = data.get("film_ir_validation_issues", [])
+        if not isinstance(raw_film_issues, list) or any(
+            not isinstance(item, dict) for item in raw_film_issues
+        ):
+            raise ValueError("film_ir_validation_issues 必须是 JSON 对象数组。")
+        session.film_ir_validation_issues = deepcopy(raw_film_issues)
+        raw_film_passes = data.get("film_ir_pass_diagnostics", [])
+        if not isinstance(raw_film_passes, list) or any(
+            not isinstance(item, dict) for item in raw_film_passes
+        ):
+            raise ValueError("film_ir_pass_diagnostics 必须是 JSON 对象数组。")
+        session.film_ir_pass_diagnostics = deepcopy(raw_film_passes)
+        raw_creative_diagnostics = data.get("creative_pass_diagnostics", [])
+        if not isinstance(raw_creative_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_creative_diagnostics
+        ):
+            raise ValueError("creative_pass_diagnostics 必须是 JSON 对象数组。")
+        session.creative_pass_diagnostics = deepcopy(raw_creative_diagnostics)
+        raw_analysis_results = data.get("creative_analysis_results", [])
+        if not isinstance(raw_analysis_results, list) or any(
+            not isinstance(item, dict) for item in raw_analysis_results
+        ):
+            raise ValueError("creative_analysis_results 必须是 JSON 对象数组。")
+        session.creative_analysis_results = deepcopy(raw_analysis_results)
+        raw_analysis_diagnostics = data.get("creative_analysis_diagnostics", [])
+        if not isinstance(raw_analysis_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_analysis_diagnostics
+        ):
+            raise ValueError("creative_analysis_diagnostics 必须是 JSON 对象数组。")
+        session.creative_analysis_diagnostics = deepcopy(raw_analysis_diagnostics)
+        raw_analysis_artifacts = data.get("creative_analysis_artifacts", [])
+        if not isinstance(raw_analysis_artifacts, list) or any(
+            not isinstance(item, dict) for item in raw_analysis_artifacts
+        ):
+            raise ValueError("creative_analysis_artifacts 必须是 JSON 对象数组。")
+        session.creative_analysis_artifacts = deepcopy(raw_analysis_artifacts)
+        raw_analysis_metrics = data.get("creative_analysis_metrics", {})
+        if not isinstance(raw_analysis_metrics, dict):
+            raise ValueError("creative_analysis_metrics 必须是 JSON 对象。")
+        session.creative_analysis_metrics = {
+            str(key): float(value) for key, value in raw_analysis_metrics.items()
+        }
+        raw_creative_optimizer_result = data.get("creative_optimizer_result")
+        if raw_creative_optimizer_result is not None and not isinstance(raw_creative_optimizer_result, dict):
+            raise ValueError("creative_optimizer_result 必须是 JSON 对象或 null。")
+        session.creative_optimizer_result = deepcopy(raw_creative_optimizer_result)
+        for field_name in (
+            "creative_optimizer_suggestions",
+            "creative_optimizer_candidates",
+            "creative_optimizer_diagnostics",
+            "creative_revision_requests",
+            "creative_revision_request_history",
+        ):
+            raw_items = data.get(field_name, [])
+            if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
+                raise ValueError(f"{field_name} 必须是 JSON 对象数组。")
+            setattr(session, field_name, deepcopy(raw_items))
+        raw_creative_revision_stop = data.get("creative_revision_stop_reason")
+        if raw_creative_revision_stop is not None and not isinstance(raw_creative_revision_stop, str):
+            raise ValueError("creative_revision_stop_reason 必须是字符串或 null。")
+        session.creative_revision_stop_reason = raw_creative_revision_stop
+        for field_name in (
+            "revision_candidates",
+            "revision_diffs",
+            "revision_decisions",
+            "revision_guard_diagnostics",
+        ):
+            raw_items = data.get(field_name, [])
+            if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
+                raise ValueError(f"{field_name} 必须是 JSON 对象数组。")
+            setattr(session, field_name, deepcopy(raw_items))
+        for field_name in (
+            "revision_active_candidate_id",
+            "revision_accepted_movie_plan_id",
+            "revision_rollback_movie_plan_id",
+        ):
+            raw_id = data.get(field_name)
+            if raw_id is not None and not isinstance(raw_id, str):
+                raise ValueError(f"{field_name} 必须是字符串或 null。")
+            setattr(session, field_name, raw_id)
+        for field_name in (
+            "director_revision_adapter_results",
+            "director_revision_contexts",
+            "guarded_revision_results",
+        ):
+            raw_items = data.get(field_name, [])
+            if not isinstance(raw_items, list) or any(
+                not isinstance(item, dict) for item in raw_items
+            ):
+                raise ValueError(f"{field_name} 必须是 JSON 对象数组。")
+            setattr(session, field_name, deepcopy(raw_items))
+        raw_attempt_count = data.get("director_revision_attempt_count", 0)
+        if isinstance(raw_attempt_count, bool) or not isinstance(raw_attempt_count, int) or raw_attempt_count < 0:
+            raise ValueError("director_revision_attempt_count 必须是非负整数。")
+        session.director_revision_attempt_count = raw_attempt_count
+        raw_last_stop = data.get("director_revision_last_stop_reason")
+        if raw_last_stop is not None and not isinstance(raw_last_stop, str):
+            raise ValueError("director_revision_last_stop_reason 必须是字符串或 null。")
+        session.director_revision_last_stop_reason = raw_last_stop
+        for field_name in (
+            "movie_plan_version_history",
+            "revision_apply_history",
+            "revision_rollback_history",
+            "revision_apply_results",
+            "revision_rollback_results",
+            "stale_artifacts",
+        ):
+            raw_items = data.get(field_name, [])
+            if not isinstance(raw_items, list) or any(
+                not isinstance(item, dict) for item in raw_items
+            ):
+                raise ValueError(f"{field_name} 必须是 JSON 对象数组。")
+            setattr(session, field_name, deepcopy(raw_items))
+        for field_name in ("source_lineage_diagnostics", "stale_lineage_diagnostics"):
+            raw_items = data.get(field_name, [])
+            if not isinstance(raw_items, list) or any(
+                not isinstance(item, dict) for item in raw_items
+            ):
+                raise ValueError(f"{field_name} 必须是 JSON 对象数组。")
+            setattr(session, field_name, deepcopy(raw_items))
+        for field_name in (
+            "current_film_ir_id",
+            "current_movie_ir_id",
+            "current_video_job_id",
+        ):
+            raw_id = data.get(field_name)
+            if raw_id is not None and not isinstance(raw_id, str):
+                raise ValueError(f"{field_name} 必须是字符串或 null。")
+            setattr(session, field_name, raw_id)
+        raw_film_optimizer = data.get("film_ir_optimizer_diagnostics", [])
+        if not isinstance(raw_film_optimizer, list) or any(
+            not isinstance(item, dict) for item in raw_film_optimizer
+        ):
+            raise ValueError("film_ir_optimizer_diagnostics 必须是 JSON 对象数组。")
+        session.film_ir_optimizer_diagnostics = deepcopy(raw_film_optimizer)
+        raw_revision_history = data.get("director_revision_history", [])
+        if not isinstance(raw_revision_history, list) or any(
+            not isinstance(item, dict) for item in raw_revision_history
+        ):
+            raise ValueError("director_revision_history 必须是 JSON 对象数组。")
+        session.director_revision_history = deepcopy(raw_revision_history)
+        raw_stop_reason = data.get("director_revision_stop_reason")
+        if raw_stop_reason is not None and not isinstance(raw_stop_reason, str):
+            raise ValueError("director_revision_stop_reason 必须是字符串或 null。")
+        session.director_revision_stop_reason = raw_stop_reason
+        if data.get("movie_ir"):
+            session.movie_ir = MovieIR.from_dict(data["movie_ir"])
+        session.movie_ir_revisions = [
+            MovieIR.from_dict(item) for item in data.get("movie_ir_revisions", [])
+        ]
+        raw_ir_diagnostics = data.get("movie_ir_build_diagnostics", [])
+        if not isinstance(raw_ir_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_ir_diagnostics
+        ):
+            raise ValueError("movie_ir_build_diagnostics 必须是 JSON 对象数组。")
+        session.movie_ir_build_diagnostics = deepcopy(raw_ir_diagnostics)
+        raw_ir_metadata = data.get("movie_ir_build_metadata", {})
+        if not isinstance(raw_ir_metadata, dict):
+            raise ValueError("movie_ir_build_metadata 必须是 JSON 对象。")
+        session.movie_ir_build_metadata = deepcopy(raw_ir_metadata)
+        raw_movie_issues = data.get("movie_ir_validation_issues", [])
+        if not isinstance(raw_movie_issues, list) or any(
+            not isinstance(item, dict) for item in raw_movie_issues
+        ):
+            raise ValueError("movie_ir_validation_issues 必须是 JSON 对象数组。")
+        session.movie_ir_validation_issues = deepcopy(raw_movie_issues)
+        raw_movie_passes = data.get("movie_ir_pass_diagnostics", [])
+        if not isinstance(raw_movie_passes, list) or any(
+            not isinstance(item, dict) for item in raw_movie_passes
+        ):
+            raise ValueError("movie_ir_pass_diagnostics 必须是 JSON 对象数组。")
+        session.movie_ir_pass_diagnostics = deepcopy(raw_movie_passes)
+        raw_movie_optimizer = data.get("movie_ir_optimizer_diagnostics", [])
+        if not isinstance(raw_movie_optimizer, list) or any(
+            not isinstance(item, dict) for item in raw_movie_optimizer
+        ):
+            raise ValueError("movie_ir_optimizer_diagnostics 必须是 JSON 对象数组。")
+        session.movie_ir_optimizer_diagnostics = deepcopy(raw_movie_optimizer)
+        if data.get("v2_video_job"):
+            session.v2_video_job = session._v2_video_job_from(data["v2_video_job"])
+        raw_compile_diagnostics = data.get("v2_compile_diagnostics", [])
+        if not isinstance(raw_compile_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_compile_diagnostics
+        ):
+            raise ValueError("v2_compile_diagnostics 必须是 JSON 对象数组。")
+        session.v2_compile_diagnostics = deepcopy(raw_compile_diagnostics)
+        raw_compile_metadata = data.get("v2_compile_metadata", {})
+        if not isinstance(raw_compile_metadata, dict):
+            raise ValueError("v2_compile_metadata 必须是 JSON 对象。")
+        session.v2_compile_metadata = deepcopy(raw_compile_metadata)
         if data.get("render_manifest"):
             session.render_manifest = session._manifest_from(data["render_manifest"])
         session.legacy_facts = session._facts_from(data.get("legacy_facts", {}))
@@ -1405,7 +2979,16 @@ class GuidedStorySession:
         session.free_text_count = int(metrics.get("free_text_count", 0))
         if session.user_action_count < 0 or session.free_text_count < 0:
             raise ValueError("会话计数不能是负数。")
+        # Migrate old sessions that already have artifact IDs but did not yet
+        # persist the explicit current_* lineage pointers.
+        if session.current_film_ir_id is None and session.film_ir is not None:
+            session.current_film_ir_id = session.film_ir.ir_id
+        if session.current_movie_ir_id is None and session.movie_ir is not None:
+            session.current_movie_ir_id = session.movie_ir.ir_id
+        if session.current_video_job_id is None and session.v2_video_job is not None:
+            session.current_video_job_id = session.v2_video_job.job_id
         session._validate_loaded_state(schema_version=schema_version)
+        session.refresh_source_lineage_diagnostics()
         return session
 
     def _load_v2(self, data: dict[str, Any]) -> GuidedStorySession:
@@ -1439,7 +3022,10 @@ class GuidedStorySession:
         else:
             self.stage = Stage.IDEATING
         if data.get("storyboard"):
-            self.storyboard = self._storyboard_from(data["storyboard"])
+            self.storyboard = self._storyboard_from(
+                data["storyboard"],
+                normalize_legacy_narration=True,
+            )
             old_stage = str(data.get("stage", ""))
             if self.script is None or self.story is None:
                 raise ValueError("旧版分镜缺少可迁移的故事或剧本。")
@@ -1501,10 +3087,42 @@ class GuidedStorySession:
             self._validate_loaded_script(self.script)
         if self.storyboard is not None:
             self._validate_storyboard_plan(self.storyboard)
-        if self.render_manifest is not None and self.storyboard is None:
-            raise ValueError("存在渲染记录，但分镜缺失。")
+        if self.render_manifest is not None and self.storyboard is None and self.video_job is None:
+            raise ValueError("存在渲染记录，但视频任务缺失。")
         if self.render_manifest is not None and self.storyboard is not None:
             self._validate_render_outputs(self.storyboard, self.render_manifest)
+        if self.video_job is not None:
+            if not self.video_job.title.strip() or not self.video_job.prompt.strip():
+                raise ValueError("保存的视频任务缺少标题或提示词。")
+            if self.video_job.target_seconds <= 0:
+                raise ValueError("保存的视频任务目标时长无效。")
+
+        if self.movie_plan is not None:
+            report = validate_movie_plan(self.movie_plan, self._v2_brief())
+            if not report.valid:
+                raise ValueError("保存的 V2 MoviePlan 无效：" + "；".join(report.errors))
+            if self.current_movie_plan_id not in {None, self.movie_plan.plan_id}:
+                raise ValueError("current_movie_plan_id 与当前 MoviePlan 不一致。")
+        if any(not isinstance(item, V2MoviePlan) for item in self.movie_plan_revisions):
+            raise ValueError("保存的 V2 MoviePlan revisions 无效。")
+        if self.confirmed_movie_plan is not None:
+            report = validate_movie_plan(self.confirmed_movie_plan, self._v2_brief())
+            if not report.valid or not self.confirmed_movie_plan.confirmed:
+                raise ValueError("保存的 confirmed_movie_plan 无效。")
+        if self.film_ir is not None:
+            if not self.film_ir.beats or not self.film_ir.shots:
+                raise ValueError("保存的 FilmIR 缺少 beats 或 shots。")
+        if any(not isinstance(item, FilmIR) for item in self.film_ir_revisions):
+            raise ValueError("保存的 FilmIR revisions 无效。")
+        if self.movie_ir is not None:
+            if not self.movie_ir.shots:
+                raise ValueError("保存的 MovieIR 缺少 shots。")
+        if any(not isinstance(item, MovieIR) for item in self.movie_ir_revisions):
+            raise ValueError("保存的 MovieIR revisions 无效。")
+        if self.v2_video_job is not None:
+            report = validate_video_job(self.v2_video_job)
+            if not report.valid or not self.v2_video_job.confirmed:
+                raise ValueError("保存的 V2 VideoJob 无效。")
 
         if self.stage == Stage.STORY_REVIEW and self.story is None:
             raise ValueError("故事审查阶段缺少故事。")
@@ -1525,15 +3143,55 @@ class GuidedStorySession:
             or not self.story.confirmed
             or self.script is None
             or not self.script.confirmed
-            or self.storyboard is None
-            or not self.storyboard.confirmed
+            or not (
+                (self.storyboard is not None and self.storyboard.confirmed)
+                or (self.video_job is not None and self.video_job.confirmed)
+            )
         ):
-            raise ValueError("可渲染阶段的故事、剧本或分镜确认链不完整。")
+            raise ValueError("可渲染阶段的故事、剧本或视频任务确认链不完整。")
         if self.stage == Stage.COMPLETED and (
             self.render_manifest is None
             or self.render_manifest.status not in {"succeeded", "succeeded_with_warnings"}
         ):
             raise ValueError("已完成阶段缺少成功的渲染记录。")
+        if self.stage == Stage.MOVIE_PLAN_REVIEW and self.movie_plan is None:
+            raise ValueError("V2 MoviePlan 审查阶段缺少 MoviePlan。")
+        if self.stage == Stage.MOVIE_PLAN_CONFIRMED and (
+            self.confirmed_movie_plan is None
+            or not self.confirmed_movie_plan.confirmed
+        ):
+            raise ValueError("V2 MoviePlan 已确认阶段缺少 confirmed_movie_plan。")
+        if self.stage in {Stage.MOVIE_PLAN_REVISED, Stage.MOVIE_PLAN_ROLLED_BACK} and (
+            self.movie_plan is None
+            or self.confirmed_movie_plan is None
+            or not self.confirmed_movie_plan.confirmed
+            or self.film_ir is not None
+            or self.movie_ir is not None
+            or self.v2_video_job is not None
+        ):
+            raise ValueError("V2 MoviePlan 修订/回滚阶段必须只有重新确认的 MoviePlan，旧下游产物必须失效。")
+        if self.stage == Stage.FILM_IR_BUILT and (
+            self.confirmed_movie_plan is None
+            or not self.confirmed_movie_plan.confirmed
+            or self.film_ir is None
+        ):
+            raise ValueError("V2 FilmIR 已构建阶段缺少 confirmed_movie_plan 或 film_ir。")
+        if self.stage == Stage.MOVIE_IR_BUILT and (
+            self.confirmed_movie_plan is None
+            or not self.confirmed_movie_plan.confirmed
+            or self.movie_ir is None
+            or (self.movie_ir.source_film_ir_id and self.film_ir is None)
+        ):
+            raise ValueError("V2 MovieIR 已构建阶段缺少 confirmed_movie_plan、film_ir 或 movie_ir。")
+        if self.stage == Stage.VIDEO_JOB_COMPILED and (
+            self.confirmed_movie_plan is None
+            or not self.confirmed_movie_plan.confirmed
+            or self.v2_video_job is None
+            or not self.v2_video_job.confirmed
+            or self.movie_ir is None
+            or (self.v2_video_job.source_film_ir_id and self.film_ir is None)
+        ):
+            raise ValueError("V2 VideoJob 已编译阶段缺少 confirmed_movie_plan、film_ir 或 v2_video_job。")
 
         for kind, cursor in self.revision_cursor.items():
             history = self.revisions.get(kind)
@@ -1626,14 +3284,21 @@ class GuidedStorySession:
                     )
             previous_end_state = scene.end_state
         script.scenes = fit_scenes_to_duration(script.scenes, target, minimum=3)
-        durations = allocate_durations(
+        durations, weights, reasons = plan_scene_durations(
+            script.scenes,
             target,
-            len(script.scenes),
             minimum=3,
             maximum=target,
         )
-        for scene, duration in zip(script.scenes, durations):
+        for scene, duration, weight, reason in zip(
+            script.scenes,
+            durations,
+            weights,
+            reasons,
+        ):
             scene.duration = duration
+            scene.duration_weight = weight
+            scene.duration_reason = reason
         script.target_seconds = target
         self._validate_script_story_boundary(script)
 
@@ -1709,7 +3374,8 @@ class GuidedStorySession:
     ) -> None:
         character_text = "\n".join(f"{item.name} {item.description}" for item in story.characters)
         for card in self.selected_cards:
-            if card.protagonist not in character_text or card.protagonist not in story.story_text:
+            character_material = f"{character_text}\n{story.story_text}"
+            if semantic_coverage(card.protagonist, character_material) < 0.45:
                 raise ValueError("所选创意卡的主角没有落实到故事结构中。")
             source = f"{card.central_conflict} {card.ending_direction}"
             target = f"{story.core_conflict} {story.ending} {story.story_text}"
@@ -1784,6 +3450,7 @@ class GuidedStorySession:
         self.outline = None
         self.script = None
         self.storyboard = None
+        self.video_job = None
         self.render_manifest = None
         if clear_palette:
             self.element_palette = None
@@ -1875,20 +3542,20 @@ class GuidedStorySession:
             raise ValueError("；".join(review.hard_errors))
 
     def _required_story_characters(self) -> list[str]:
+        if self.story is not None:
+            confirmed = [
+                character.name.strip()
+                for character in self.story.characters[:1]
+                if character.name.strip()
+            ]
+            if confirmed:
+                return confirmed
         selected = [
             card.protagonist.strip()
             for card in self.selected_cards
             if card.protagonist.strip()
         ]
-        if selected:
-            return list(dict.fromkeys(selected))
-        if self.story is None:
-            return []
-        return [
-            character.name.strip()
-            for character in self.story.characters[:1]
-            if character.name.strip()
-        ]
+        return list(dict.fromkeys(selected))
 
     @staticmethod
     def _validate_storyboard_plan(plan: StoryboardPlan) -> None:
@@ -1942,6 +3609,12 @@ class GuidedStorySession:
             "lighting",
             "mood",
             "narration",
+            "dialogue",
+            "source_action",
+            "retake_instruction",
+            "time_of_day",
+            "visual_style",
+            "color_palette",
             "video_prompt",
             "negative_prompt",
             "aspect_ratio",
@@ -1989,6 +3662,12 @@ class GuidedStorySession:
                 raise ValueError("镜头时长必须是整数。")
             if not 3 <= shot.duration <= 15:
                 raise ValueError("镜头时长必须在 3 到 15 秒之间。")
+            if (
+                isinstance(shot.minimum_readable_duration, bool)
+                or not isinstance(shot.minimum_readable_duration, int)
+                or shot.minimum_readable_duration < 0
+            ):
+                raise ValueError("镜头内容可读下限必须是非负整数。")
             for field in text_fields:
                 if not isinstance(getattr(shot, field), str):
                     raise ValueError(f"镜头字段 {field} 必须是字符串。")
@@ -1996,6 +3675,8 @@ class GuidedStorySession:
                 value = getattr(shot, field)
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError(f"镜头缺少有效字段：{field}")
+            if shot.aspect_ratio not in {"16:9", "9:16", "1:1"}:
+                raise ValueError("镜头画幅比例只支持 16:9、9:16 或 1:1。")
             for field in list_fields:
                 values = getattr(shot, field)
                 if not isinstance(values, list) or not all(
@@ -2013,6 +3694,8 @@ class GuidedStorySession:
                 value = getattr(shot, field)
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise ValueError(f"镜头字段 {field} 必须是数字。")
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"镜头字段 {field} 必须是有限数字。")
                 if value < 0:
                     raise ValueError(f"镜头字段 {field} 不能为负数。")
             if shot.continuity_mode not in {
@@ -2214,6 +3897,11 @@ class GuidedStorySession:
                     artifact["remote_url"] = sanitize_remote_url(
                         str(artifact.get("remote_url", ""))
                     )
+        job = payload.get("video_job")
+        if isinstance(job, dict):
+            job["initial_frame_url"] = sanitize_remote_url(
+                str(job.get("initial_frame_url", ""))
+            )
 
     @staticmethod
     def _storyboard_confirmation_signature(plan: StoryboardPlan) -> str:
@@ -2246,13 +3934,6 @@ class GuidedStorySession:
             separators=(",", ":"),
         ).encode("utf-8")
         return sha256(encoded).hexdigest()
-
-    @staticmethod
-    def _motion_with_duration(prompt: str, duration: int) -> str:
-        value = str(prompt)
-        if re.search(r"在\d+秒内", value):
-            return re.sub(r"在\d+秒内", f"在{int(duration)}秒内", value)
-        return f"在{int(duration)}秒内完成。{value}"
 
     def _require_direction(self) -> None:
         if not self.direction:
@@ -2340,7 +4021,19 @@ class GuidedStorySession:
     @_state_mutation
     def undo_artifact(self, artifact_type: str | None = None) -> Any:
         kind = artifact_type or (
-            "storyboard" if self.storyboard else "script" if self.script else "story"
+            "v2_video_job"
+            if self.v2_video_job
+            else "movie_ir"
+            if self.movie_ir
+            else "film_ir"
+            if self.film_ir
+            else "video_job"
+            if self.video_job
+            else "storyboard"
+            if self.storyboard
+            else "script"
+            if self.script
+            else "story"
         )
         cursor = self.revision_cursor.get(kind, -1)
         if cursor <= 0:
@@ -2355,7 +4048,19 @@ class GuidedStorySession:
     @_state_mutation
     def redo_artifact(self, artifact_type: str | None = None) -> Any:
         kind = artifact_type or (
-            "storyboard" if self.storyboard else "script" if self.script else "story"
+            "v2_video_job"
+            if self.v2_video_job
+            else "movie_ir"
+            if self.movie_ir
+            else "film_ir"
+            if self.film_ir
+            else "video_job"
+            if self.video_job
+            else "storyboard"
+            if self.storyboard
+            else "script"
+            if self.script
+            else "story"
         )
         cursor = self.revision_cursor.get(kind, -1)
         history = self.revisions.get(kind, [])
@@ -2402,6 +4107,38 @@ class GuidedStorySession:
             candidate = self._storyboard_from(deepcopy(revision.payload))
             self._validate_storyboard_plan(candidate)
             return candidate
+        if revision.artifact_type == "video_job":
+            if self.story is None or not self.story.confirmed or self.script is None or not self.script.confirmed:
+                raise ValueError("恢复视频任务版本前必须存在已确认故事和剧本。")
+            candidate = self._video_job_from(deepcopy(revision.payload))
+            if not candidate.title.strip() or not candidate.prompt.strip() or candidate.target_seconds <= 0:
+                raise ValueError("恢复的视频任务版本无效。")
+            return candidate
+        if revision.artifact_type == "v2_video_job":
+            if self.confirmed_movie_plan is None or not self.confirmed_movie_plan.confirmed:
+                raise ValueError("恢复 V2 VideoJob 前必须存在已确认 MoviePlan。")
+            candidate = self._v2_video_job_from(deepcopy(revision.payload))
+            if not validate_video_job(candidate).valid or not candidate.confirmed:
+                raise ValueError("恢复的 V2 VideoJob 版本无效。")
+            return candidate
+        if revision.artifact_type == "movie_ir":
+            if self.confirmed_movie_plan is None or not self.confirmed_movie_plan.confirmed:
+                raise ValueError("恢复 MovieIR 前必须存在已确认 MoviePlan。")
+            candidate = MovieIR.from_dict(deepcopy(revision.payload))
+            if candidate.source_movie_plan_id != self.confirmed_movie_plan.plan_id:
+                raise ValueError("恢复的 MovieIR 来源不一致。")
+            if candidate.source_film_ir_id and (
+                self.film_ir is None or candidate.source_film_ir_id != self.film_ir.ir_id
+            ):
+                raise ValueError("恢复的 MovieIR 来源 FilmIR 不一致。")
+            return candidate
+        if revision.artifact_type == "film_ir":
+            if self.confirmed_movie_plan is None or not self.confirmed_movie_plan.confirmed:
+                raise ValueError("恢复 FilmIR 前必须存在已确认 MoviePlan。")
+            candidate = FilmIR.from_dict(deepcopy(revision.payload))
+            if candidate.source_movie_plan_id != self.confirmed_movie_plan.plan_id:
+                raise ValueError("恢复的 FilmIR 来源 MoviePlan 不一致。")
+            return candidate
         raise ValueError("未知版本类型。")
 
     def _commit_revision_candidate(self, artifact_type: str, candidate: Any) -> Any:
@@ -2412,6 +4149,7 @@ class GuidedStorySession:
             self.outline = None
             self.script = None
             self.storyboard = None
+            self.video_job = None
             self.render_manifest = None
             return self.story
         if artifact_type == "script":
@@ -2420,6 +4158,7 @@ class GuidedStorySession:
             self.draft = None
             self.outline = None
             self.storyboard = None
+            self.video_job = None
             self.render_manifest = None
             return self.script
         if artifact_type == "draft":
@@ -2427,6 +4166,7 @@ class GuidedStorySession:
             self.outline, self.script = self.draft.outline, self.draft.script
             self.stage = Stage.SCRIPT_REVIEW
             self.storyboard = None
+            self.video_job = None
             self.render_manifest = None
             return self.draft
         if artifact_type == "storyboard":
@@ -2434,6 +4174,26 @@ class GuidedStorySession:
             self.stage = Stage.STORYBOARD_REVIEW
             self.render_manifest = None
             return self.storyboard
+        if artifact_type == "video_job":
+            self.video_job = candidate
+            self.stage = Stage.RENDER_READY
+            self.render_manifest = None
+            return self.video_job
+        if artifact_type == "v2_video_job":
+            self.v2_video_job = candidate
+            self.stage = Stage.VIDEO_JOB_COMPILED
+            return self.v2_video_job
+        if artifact_type == "movie_ir":
+            self.movie_ir = candidate
+            self.stage = Stage.MOVIE_IR_BUILT
+            self.v2_video_job = None
+            return self.movie_ir
+        if artifact_type == "film_ir":
+            self.film_ir = candidate
+            self.stage = Stage.FILM_IR_BUILT
+            self.movie_ir = None
+            self.v2_video_job = None
+            return self.film_ir
         raise ValueError("未知版本类型。")
 
     def _load_revisions(self, data: dict[str, Any]) -> None:
@@ -2441,7 +4201,17 @@ class GuidedStorySession:
         raw_cursors = data.get("revision_cursor", {})
         if not isinstance(raw_revisions, dict) or not isinstance(raw_cursors, dict):
             raise ValueError("revisions 和 revision_cursor 必须是 JSON 对象。")
-        allowed_kinds = {"story", "script", "draft", "storyboard"}
+        allowed_kinds = {
+            "story",
+            "script",
+            "draft",
+            "storyboard",
+            "video_job",
+            "movie_plan",
+            "film_ir",
+            "movie_ir",
+            "v2_video_job",
+        }
         for raw_kind, entries in raw_revisions.items():
             kind = str(raw_kind)
             if kind not in allowed_kinds:
@@ -2643,7 +4413,100 @@ class GuidedStorySession:
         )
 
     @staticmethod
-    def _storyboard_from(data: dict[str, Any]) -> StoryboardPlan:
+    def _v2_video_job_from(data: dict[str, Any]) -> V2VideoJob:
+        if not isinstance(data, dict):
+            raise ValueError("v2_video_job 必须是 JSON 对象。")
+        allowed = {
+            "job_id",
+            "provider_key",
+            "provider_prompt",
+            "negative_prompt",
+            "duration_seconds",
+            "output_format",
+            "aspect_ratio",
+            "resolution",
+            "fps",
+            "references",
+            "character_references",
+            "continuity_references",
+            "source_movie_plan_id",
+            "source_movie_ir_id",
+            "source_film_ir_id",
+            "compiler_version",
+            "provider_profile",
+            "execution_units",
+            "metadata",
+            "created_at",
+            "confirmed",
+        }
+        unexpected = sorted(set(data) - allowed)
+        if unexpected:
+            raise ValueError("v2_video_job 包含未允许字段：" + ", ".join(unexpected))
+        payload = {key: deepcopy(value) for key, value in data.items() if key in allowed}
+        payload["job_id"] = str(payload.get("job_id", ""))
+        payload["provider_key"] = str(payload.get("provider_key", ""))
+        payload["provider_prompt"] = str(payload.get("provider_prompt", ""))
+        payload["negative_prompt"] = str(payload.get("negative_prompt", ""))
+        payload["duration_seconds"] = float(payload.get("duration_seconds", 0))
+        payload["output_format"] = str(payload.get("output_format", ""))
+        payload["aspect_ratio"] = str(payload.get("aspect_ratio", "16:9"))
+        payload["resolution"] = str(payload.get("resolution", ""))
+        payload["fps"] = (
+            None if payload.get("fps") is None else float(payload.get("fps"))
+        )
+        for key in ("references", "character_references", "continuity_references"):
+            payload[key] = tuple(str(item) for item in payload.get(key, []))
+        payload["source_movie_plan_id"] = str(payload.get("source_movie_plan_id", ""))
+        payload["source_movie_ir_id"] = str(payload.get("source_movie_ir_id", ""))
+        payload["source_film_ir_id"] = str(payload.get("source_film_ir_id", ""))
+        payload["compiler_version"] = str(payload.get("compiler_version", ""))
+        payload["provider_profile"] = str(payload.get("provider_profile", ""))
+        payload["execution_units"] = tuple(
+            dict(item) for item in payload.get("execution_units", [])
+        )
+        payload["metadata"] = dict(payload.get("metadata", {}))
+        payload["created_at"] = str(payload.get("created_at", ""))
+        payload["confirmed"] = GuidedStorySession._strict_bool(
+            payload.get("confirmed", False),
+            "v2_video_job.confirmed",
+        )
+        return V2VideoJob(**payload)
+
+    @staticmethod
+    def _video_job_from(data: dict[str, Any]) -> VideoJob:
+        if not isinstance(data, dict):
+            raise ValueError("video_job 必须是 JSON 对象。")
+        fields = VideoJob.__dataclass_fields__
+        payload = {key: deepcopy(value) for key, value in data.items() if key in fields}
+        payload["title"] = str(payload.get("title", ""))
+        payload["prompt"] = str(payload.get("prompt", ""))
+        payload["target_seconds"] = int(payload.get("target_seconds", 0))
+        payload["negative_prompt"] = str(payload.get("negative_prompt", ""))
+        payload["aspect_ratio"] = str(payload.get("aspect_ratio", "16:9"))
+        payload["dialogue"] = str(payload.get("dialogue", ""))
+        payload["narration"] = str(payload.get("narration", ""))
+        payload["visual_style"] = str(payload.get("visual_style", ""))
+        payload["reference_image_paths"] = [
+            str(item) for item in payload.get("reference_image_paths", [])
+        ]
+        payload["initial_frame_path"] = str(payload.get("initial_frame_path", ""))
+        payload["initial_frame_url"] = sanitize_remote_url(
+            str(payload.get("initial_frame_url", ""))
+        )
+        payload["metadata"] = dict(payload.get("metadata", {}))
+        payload["job_id"] = str(payload.get("job_id", ""))
+        payload["confirmed"] = GuidedStorySession._strict_bool(
+            payload.get("confirmed", False),
+            "video_job.confirmed",
+        )
+        return VideoJob(**payload)
+
+    @staticmethod
+    def _storyboard_from(
+        data: dict[str, Any],
+        *,
+        normalize_legacy_narration: bool = False,
+    ) -> StoryboardPlan:
         bible_data = data.get("visual_bible", {})
         visual_bible = VisualBible(
             visual_style=str(bible_data.get("visual_style", "电影感写实")),
@@ -2690,7 +4553,10 @@ class GuidedStorySession:
                 GuidedStorySession._artifact_from_data(item) for item in data.get("artifacts", [])
             ],
         )
-        normalize_narration_timeline(plan)
+        normalize_narration_timeline(
+            plan,
+            deduplicate_legacy=normalize_legacy_narration,
+        )
         return plan
 
     @staticmethod
@@ -2771,6 +4637,10 @@ class GuidedStorySession:
             or payload.get("end_frame")
             or payload.get("video_prompt", "")
         )
+        payload["source_action"] = str(
+            payload.get("source_action") or payload.get("action", "")
+        )
+        payload["retake_instruction"] = str(payload.get("retake_instruction", ""))
         for field_name in (
             "reference_asset_ids",
             "reference_image_paths",

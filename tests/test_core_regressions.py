@@ -49,13 +49,109 @@ class CoreStateRegressionTests(unittest.TestCase):
             )
 
         self.assertEqual(original_prompt, session.storyboard.shots[0].video_prompt)
+        with self.assertRaisesRegex(ValueError, "video_prompt"):
+            session.update_storyboard_shot(
+                1,
+                {"video_prompt": "绕过结构化镜头审查的最终提示词"},
+            )
+        for prompt_field in (
+            "first_frame_prompt",
+            "end_frame_prompt",
+            "negative_prompt",
+        ):
+            with self.subTest(prompt_field=prompt_field):
+                with self.assertRaisesRegex(ValueError, prompt_field):
+                    session.update_storyboard_shot(
+                        1,
+                        {prompt_field: "绕过结构化镜头审查的帧提示词"},
+                    )
+        with self.assertRaisesRegex(ValueError, "画幅比例"):
+            session.update_storyboard_shot(
+                1,
+                {"aspect_ratio": "2.39:1"},
+            )
         self.assertTrue(session.storyboard.confirmed)
         self.assertEqual(Stage.RENDER_READY, session.stage)
 
-        session.update_storyboard_shot(1, {"action": "重新设计的镜头动作"})
+        session.update_storyboard_shot(1, {"camera": "close-up"})
         self.assertFalse(session.storyboard.confirmed)
         self.assertEqual(Stage.STORYBOARD_REVIEW, session.stage)
         self.assertIsNone(session.render_manifest)
+
+        with self.assertRaisesRegex(ValueError, "剧情动作"):
+            session.update_storyboard_shot(1, {"action": "忽略证据跳舞离开"})
+
+    def test_provider_prompt_and_spoken_text_cannot_bypass_render_gate(self) -> None:
+        class Renderer:
+            called = False
+
+            def render(self, plan, output_dir):
+                self.called = True
+                raise AssertionError("审查失败后不应调用视频 Provider")
+
+        prompt_session = render_ready_session()
+        prompt_session.storyboard.shots[0].video_prompt += (
+            " 随后奔跑，接着坠落，最后爆炸。"
+        )
+        prompt_review = prompt_session.review_current_artifact("storyboard")
+        self.assertFalse(prompt_review.can_confirm)
+        self.assertTrue(
+            any(
+                "Provider 最终提示词" in error
+                for error in prompt_review.hard_errors
+            )
+        )
+        prompt_renderer = Renderer()
+        with self.assertRaisesRegex(RuntimeError, "Provider 最终提示词"):
+            prompt_session.render_confirmed_plan(prompt_renderer, "outputs")
+        self.assertFalse(prompt_renderer.called)
+
+        frame_session = render_ready_session()
+        frame_session.storyboard.shots[0].first_frame_prompt += (
+            " then run, fall, and explode"
+        )
+        frame_review = frame_session.review_current_artifact("storyboard")
+        self.assertFalse(frame_review.can_confirm)
+        self.assertTrue(
+            any(
+                "Provider 最终提示词" in error
+                for error in frame_review.hard_errors
+            )
+        )
+        frame_renderer = Renderer()
+        with self.assertRaisesRegex(RuntimeError, "Provider 最终提示词"):
+            frame_session.render_confirmed_plan(frame_renderer, "outputs")
+        self.assertFalse(frame_renderer.called)
+
+        narration_session = render_ready_session()
+        narration_session.storyboard.shots[0].narration += "新增未审查旁白" * 80
+        narration_review = narration_session.review_current_artifact("storyboard")
+        self.assertFalse(narration_review.can_confirm)
+        self.assertTrue(
+            any("逐镜旁白" in error for error in narration_review.hard_errors)
+        )
+        narration_renderer = Renderer()
+        with self.assertRaisesRegex(RuntimeError, "逐镜旁白"):
+            narration_session.render_confirmed_plan(
+                narration_renderer,
+                "outputs",
+        )
+        self.assertFalse(narration_renderer.called)
+
+        dialogue_session = render_ready_session()
+        dialogue_session.storyboard.shots[0].dialogue = "新增未审查对白"
+        dialogue_review = dialogue_session.review_current_artifact("storyboard")
+        self.assertFalse(dialogue_review.can_confirm)
+        self.assertTrue(
+            any("对白" in error for error in dialogue_review.hard_errors)
+        )
+        dialogue_renderer = Renderer()
+        with self.assertRaisesRegex(RuntimeError, "对白"):
+            dialogue_session.render_confirmed_plan(
+                dialogue_renderer,
+                "outputs",
+            )
+        self.assertFalse(dialogue_renderer.called)
 
     def test_script_patch_is_atomic_and_clears_all_downstream_state(self) -> None:
         session = render_ready_session()
@@ -215,7 +311,9 @@ class CoreStateRegressionTests(unittest.TestCase):
 
 
 class CoreGenerationRegressionTests(unittest.TestCase):
-    def test_dense_script_scenes_are_merged_without_losing_actions(self) -> None:
+    def test_dense_script_scenes_do_not_hide_ten_actions_inside_five_shots(
+        self,
+    ) -> None:
         class DenseScriptAgent(RuleBasedStoryAgent):
             def generate_script(self, story, target_seconds):
                 protagonist = story.characters[0].name
@@ -254,10 +352,8 @@ class CoreGenerationRegressionTests(unittest.TestCase):
         self.assertTrue(all(scene.duration >= 3 for scene in script.scenes))
 
         session.confirm_script()
-        plan = session.build_storyboard()
-        shot_text = "\n".join(shot.action for shot in plan.shots)
-        for index in range(1, 11):
-            self.assertIn(f"动作{index}", shot_text)
+        with self.assertRaisesRegex(ValueError, "不可省略动作阶段"):
+            session.build_storyboard()
 
     def test_character_and_turning_point_choices_become_verifiable_constraints(self) -> None:
         session = GuidedStorySession(agent=RuleBasedStoryAgent())

@@ -88,7 +88,7 @@ class NarrationRenderingTests(unittest.TestCase):
             shot.scene_id = 1
             shot.narration = "这句旁白只能出现一次。"
         plan.narration_text = "旧的重复旁白"
-        normalize_narration_timeline(plan)
+        normalize_narration_timeline(plan, deduplicate_legacy=True)
 
         captured: list[str] = []
         assembled_cues = []
@@ -122,6 +122,75 @@ class NarrationRenderingTests(unittest.TestCase):
         self.assertEqual(plan.narration_text, narration_text_from_timeline(plan))
         self.assertEqual(1, subtitle.count("这句旁白只能出现一次。"))
         self.assertNotIn("动作2", subtitle)
+
+    def test_confirmed_repeated_narration_is_not_mutated_during_synthesis(self) -> None:
+        plan = make_plan()
+        plan.shots = plan.shots[:2]
+        plan.target_seconds = 12
+        for shot in plan.shots:
+            shot.scene_id = 1
+            shot.narration = "快跑！"
+        plan.narration_text = "快跑！\n快跑！"
+        captured: list[str] = []
+
+        class Communicate:
+            def __init__(self, text, voice, *, rate):
+                del voice, rate
+                captured.append(text)
+
+            def save_sync(self, target):
+                Path(target).write_bytes(b"audio")
+
+        def assemble(segments, target, total_duration):
+            self.assertEqual(2, len(segments))
+            self.assertEqual(12, total_duration)
+            Path(target).write_bytes(b"assembled-audio")
+            return str(target)
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(sys.modules, {"edge_tts": SimpleNamespace(Communicate=Communicate)}),
+        ):
+            EdgeNarrationSynthesizer(
+                timeline_assembler=assemble,
+            ).synthesize(plan, temp)
+
+        self.assertEqual(["快跑！", "快跑！"], captured)
+        self.assertEqual(["快跑！", "快跑！"], [shot.narration for shot in plan.shots])
+        self.assertEqual("快跑！\n快跑！", plan.narration_text)
+
+    def test_dialogue_is_delivered_to_tts_and_subtitles(self) -> None:
+        plan = make_single_shot_plan()
+        plan.shots[0].narration = ""
+        plan.shots[0].dialogue = "列车会在午夜离站。"
+        captured: list[str] = []
+
+        class Communicate:
+            def __init__(self, text, voice, *, rate):
+                del voice, rate
+                captured.append(text)
+
+            def save_sync(self, target):
+                Path(target).write_bytes(b"audio")
+
+        def assemble(segments, target, total_duration):
+            self.assertEqual(1, len(segments))
+            self.assertEqual(plan.total_duration, total_duration)
+            Path(target).write_bytes(b"assembled-audio")
+            return str(target)
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(sys.modules, {"edge_tts": SimpleNamespace(Communicate=Communicate)}),
+        ):
+            artifact = EdgeNarrationSynthesizer(
+                timeline_assembler=assemble,
+            ).synthesize(plan, temp)
+            subtitle = Path(artifact.subtitle_path).read_text(encoding="utf-8")
+
+        self.assertEqual(["列车会在午夜离站。"], captured)
+        self.assertIn("列车会在午夜离站。", subtitle)
+        self.assertEqual("列车会在午夜离站。", plan.shots[0].dialogue)
 
     def test_generated_storyboard_assigns_scene_narration_only_once(self) -> None:
         from guided_story_agent import CreativeBrief, RuleBasedStoryAgent
@@ -434,6 +503,35 @@ class NarrationRenderingTests(unittest.TestCase):
         self.assertEqual("job-1", plan.artifacts[0].request_id)
         self.assertEqual("https://cdn.example.test/shot.mp4", plan.artifacts[0].remote_url)
 
+    def test_task_id_only_submit_response_is_resumed(self) -> None:
+        statuses = iter(
+            [
+                {
+                    "status": "completed",
+                    "metadata": {"url": "https://cdn.example.test/task-only.mp4"},
+                }
+            ]
+        )
+
+        def download(_url: str, target: Path) -> None:
+            target.write_bytes(b"fake-video")
+
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            submit_fn=lambda _payload: {"task_id": "task-only-1"},
+            status_fn=lambda _video_id: next(statuses),
+            download_fn=download,
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("guided_story_agent.video_provider.validate_mp4_file", return_value=True),
+        ):
+            artifact = provider.generate_shot(make_plan().shots[0], temp_dir)
+
+        self.assertEqual("succeeded", artifact.status)
+        self.assertEqual("task-only-1", artifact.request_id)
+        self.assertEqual("https://cdn.example.test/task-only.mp4", artifact.remote_url)
+
     def test_uncertain_submit_response_is_never_retried_automatically(self) -> None:
         submissions = 0
 
@@ -728,6 +826,7 @@ class NarrationRenderingTests(unittest.TestCase):
                 return_value=None,
             ),
             patch.object(Path, "is_file", return_value=True),
+            patch.object(Path, "stat", return_value=SimpleNamespace(st_size=1)),
             patch("guided_story_agent.rendering.subprocess.run") as run,
             self.assertRaisesRegex(RuntimeError, "ffprobe"),
         ):
@@ -785,6 +884,30 @@ class NarrationRenderingTests(unittest.TestCase):
 
         self.assertIsNotNone(duration)
         self.assertGreater(duration, 1.8)
+
+    def test_mux_ignores_empty_subtitle_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir)
+            subtitle = target / "empty.srt"
+            subtitle.touch()
+            output = target / "final.mp4"
+            with (
+                patch("guided_story_agent.rendering.shutil.which", return_value="ffmpeg"),
+                patch(
+                    "guided_story_agent.rendering.subprocess.run",
+                    return_value=SimpleNamespace(returncode=0, stderr=""),
+                ) as run,
+            ):
+                result = mux_audio_and_subtitles(
+                    "video.mp4",
+                    "",
+                    str(subtitle),
+                    output,
+                )
+
+        command = run.call_args.args[0]
+        self.assertNotIn(str(subtitle), command)
+        self.assertEqual(result, str(output.resolve()))
 
 
 if __name__ == "__main__":

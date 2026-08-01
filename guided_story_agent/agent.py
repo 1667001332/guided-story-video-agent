@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -25,7 +26,11 @@ from .models import (
     to_plain_data,
 )
 from .provider_config import TextProviderConfig
-from .timing import allocate_durations
+from .storyboard import assess_director_plan_timing
+from .timing import (
+    count_sequential_action_phases,
+    plan_scene_durations,
+)
 
 
 IDEA_COUNT = 8
@@ -37,6 +42,29 @@ MAX_LLM_RESPONSE_CHARS = 1_000_000
 
 def _natural_join(values: list[str], separator: str) -> str:
     return separator.join(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def _fit_offline_spoken_material(
+    dialogue: str,
+    narration: str,
+    duration: int,
+) -> tuple[str, str]:
+    """Keep deterministic fallback speech inside its scene's audible window."""
+
+    capacity = max(0, int(max(0, duration) * 4.5))
+
+    def clipped(value: str, limit: int) -> str:
+        cleaned = " ".join(str(value or "").split())
+        if not cleaned or limit <= 0:
+            return ""
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[: max(1, limit - 1)].rstrip('，,；;：:')}…"
+
+    fitted_dialogue = clipped(dialogue, capacity)
+    remaining = max(0, capacity - len(fitted_dialogue))
+    fitted_narration = clipped(narration, remaining)
+    return fitted_dialogue, fitted_narration
 
 
 class StoryAgent(Protocol):
@@ -482,14 +510,29 @@ class RuleBasedStoryAgent:
         return revised
 
     def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
-        scene_count = max(3, round(int(target_seconds) / 9))
-        durations = allocate_durations(target_seconds, scene_count, minimum=3, maximum=15)
+        # Keep very short offline scripts from degenerating into three equal
+        # buckets; the scene count is a pacing choice, not a fixed template.
+        scene_count = max(2, round(int(target_seconds) / 9))
         character_names = [item.name for item in story.characters] or ["主角"]
         protagonist = character_names[0]
         locations, props, beats = self._offline_script_material(story, protagonist)
+        if scene_count == 1:
+            beat_indexes = [len(beats) - 1]
+        elif scene_count == 2:
+            beat_indexes = [0, len(beats) - 1]
+        else:
+            interior_count = scene_count - 2
+            interior = [
+                1
+                + round(
+                    offset * max(0, len(beats) - 3) / max(1, interior_count - 1)
+                )
+                for offset in range(interior_count)
+            ]
+            interior[-1] = max(1, len(beats) - 2)
+            beat_indexes = [0, *interior, len(beats) - 1]
         scenes: list[StoryScene] = []
-        for index, duration in enumerate(durations, 1):
-            beat_index = round((index - 1) * (len(beats) - 1) / max(1, scene_count - 1))
+        for index, beat_index in enumerate(beat_indexes, 1):
             title, location_index, action, dialogue, narration, end_state = beats[beat_index]
             location = locations[min(location_index, len(locations) - 1)]
             previous_state = scenes[-1].end_state if scenes else f"{protagonist}尚未发现异常"
@@ -503,13 +546,28 @@ class RuleBasedStoryAgent:
                     action=action,
                     visible_action=action,
                     narration=narration,
-                    duration=duration,
+                    duration=3,
                     dialogue=dialogue,
                     props=list(props),
                     start_state=f"承接上一场：{previous_state}",
                     end_state=end_state,
                     emotional_change=f"{story.tone}：局势向下一步行动推进",
                 )
+            )
+        durations, weights, reasons = plan_scene_durations(
+            scenes,
+            target_seconds,
+            minimum=3,
+            maximum=target_seconds,
+        )
+        for scene, duration, weight, reason in zip(scenes, durations, weights, reasons):
+            scene.duration = duration
+            scene.duration_weight = weight
+            scene.duration_reason = reason
+            scene.dialogue, scene.narration = _fit_offline_spoken_material(
+                scene.dialogue,
+                scene.narration,
+                duration,
             )
         return StoryScript(title=story.title, target_seconds=target_seconds, scenes=scenes)
 
@@ -1016,6 +1074,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 "script_writer.md",
                 {
                     "confirmed_story": to_plain_data(story),
+                    "required_constraints": self._script_constraints(story),
                     "target_seconds": target_seconds,
                     "maximum_scenes": max(1, target_seconds // 3),
                 },
@@ -1041,6 +1100,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 "script_rewriter.md",
                 {
                     "confirmed_story": to_plain_data(story),
+                    "required_constraints": self._script_constraints(story),
                     "script": to_plain_data(script),
                     "feedback": feedback,
                 },
@@ -1065,21 +1125,38 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             self._mark_fallback("plan_storyboard", self._unavailable_reason)
             return None
         try:
-            data = self._json_completion(
-                "storyboard_director.md",
-                {
-                    "confirmed_script": to_plain_data(script),
-                    "story_facts": to_plain_data(facts),
-                    "minimum_shots": max(1, (script.target_seconds + 14) // 15),
-                    "maximum_shots": max(1, script.target_seconds // 3),
-                },
-            )
-            shots = data.get("shots")
-            if not isinstance(shots, list) or not all(isinstance(item, dict) for item in shots):
-                raise ValueError("storyboard director must return a shots array")
-            result = [dict(item) for item in shots]
-            self._validate_director_plan(script, result)
-            return result
+            timing_feedback = ""
+            for attempt in range(2):
+                data = self._json_completion(
+                    "storyboard_director.md",
+                    {
+                        "confirmed_script": to_plain_data(script),
+                        "story_facts": to_plain_data(facts),
+                        "target_seconds": script.target_seconds,
+                        "minimum_shots": max(1, (script.target_seconds + 14) // 15),
+                        "maximum_shots": max(1, script.target_seconds // 3),
+                        "timing_feedback": timing_feedback,
+                    },
+                )
+                shots = data.get("shots")
+                if not isinstance(shots, list) or not all(
+                    isinstance(item, dict) for item in shots
+                ):
+                    error = ValueError("storyboard director must return a shots array")
+                else:
+                    result = [dict(item) for item in shots]
+                    try:
+                        self._validate_director_plan(script, result)
+                        assessment = assess_director_plan_timing(script, result)
+                        if not assessment.feasible:
+                            raise ValueError(assessment.feedback())
+                        return result
+                    except ValueError as exc:
+                        error = exc
+                if attempt == 0:
+                    timing_feedback = str(error)
+                    continue
+                raise error
         except Exception as exc:
             self._handle_artifact_failure("plan_storyboard", exc)
             return None
@@ -1157,8 +1234,15 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 raise ValueError("director plan references an unknown scene")
             if str(shot.get("kind", "")) not in allowed_kinds:
                 raise ValueError("director plan contains an unsupported shot kind")
-            if not str(shot.get("action", "")).strip():
+            action = str(shot.get("action", "")).strip()
+            if not action:
                 raise ValueError("director plan contains an empty action")
+            if not str(shot.get("purpose", "")).strip():
+                raise ValueError("director plan contains an empty purpose")
+            if count_sequential_action_phases(action) > 3:
+                raise ValueError(
+                    "director plan contains a shot with too many sequential action phases"
+                )
             transition = str(shot.get("transition_type", ""))
             if transition not in allowed_transitions:
                 raise ValueError("director plan contains an unsupported transition")
@@ -1356,6 +1440,17 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             props = item.get("props", [])
             if not isinstance(characters, list) or not isinstance(props, list):
                 raise ValueError("script scene characters and props must be arrays")
+            fallback_scene = fallback.scenes[index - 1] if index <= len(fallback.scenes) else None
+            raw_weight = item.get(
+                "duration_weight",
+                getattr(fallback_scene, "duration_weight", 0.0),
+            )
+            try:
+                duration_weight = float(raw_weight)
+            except (TypeError, ValueError):
+                duration_weight = 0.0
+            if not math.isfinite(duration_weight) or duration_weight < 0:
+                raise ValueError("duration_weight must be a finite non-negative number")
             scenes.append(
                 StoryScene(
                     scene_id=index,
@@ -1371,6 +1466,16 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     start_state=str(item.get("start_state", "")).strip(),
                     end_state=str(item.get("end_state", "")).strip(),
                     emotional_change=str(item.get("emotional_change", "")).strip(),
+                    duration_weight=duration_weight,
+                    duration_reason=str(
+                        item.get(
+                            "timing_reason",
+                            item.get(
+                                "duration_reason",
+                                getattr(fallback_scene, "duration_reason", ""),
+                            ),
+                        )
+                    ).strip(),
                     duration=1,
                 )
             )
@@ -1420,6 +1525,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 "script_continuity_reviewer.md",
                 {
                     "confirmed_story": to_plain_data(story),
+                    "required_constraints": self._script_constraints(story),
                     "script": to_plain_data(script),
                     "target_seconds": script.target_seconds,
                     "maximum_scenes": max(1, script.target_seconds // 3),
@@ -1446,6 +1552,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 "script_compressor.md",
                 {
                     "confirmed_story": to_plain_data(story),
+                    "required_constraints": self._script_constraints(story),
                     "script": to_plain_data(script),
                     "target_seconds": script.target_seconds,
                     "maximum_scenes": maximum,
@@ -1472,18 +1579,37 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             return RuleBasedStoryAgent().generate_script(story, script.target_seconds)
 
     @staticmethod
+    def _script_constraints(story: StoryDraft) -> dict[str, Any]:
+        return {
+            "character_names": [
+                character.name
+                for character in story.characters
+                if character.name.strip()
+            ],
+            "character_identities": [
+                f"{character.name}：{character.description}".strip("：")
+                for character in story.characters
+                if character.name.strip() or character.description.strip()
+            ],
+            "core_conflict": story.core_conflict,
+            "ending": story.ending,
+        }
+
+    @staticmethod
     def _normalize_script_durations(
         scenes: list[StoryScene],
         target_seconds: int,
     ) -> None:
-        durations = allocate_durations(
+        durations, weights, reasons = plan_scene_durations(
+            scenes,
             target_seconds,
-            len(scenes),
             minimum=3,
             maximum=target_seconds,
         )
-        for scene, duration in zip(scenes, durations):
+        for scene, duration, weight, reason in zip(scenes, durations, weights, reasons):
             scene.duration = duration
+            scene.duration_weight = weight
+            scene.duration_reason = reason
 
     @property
     def provider_label(self) -> str:

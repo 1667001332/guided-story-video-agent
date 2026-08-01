@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .models import CreativeBrief, ElementPalette, Stage
-from .rendering import StoryRenderer
+from .rendering import StoryRenderer, VideoJobRenderer  # noqa: F401 - legacy patch/API compatibility
 from .session import GuidedStorySession
 from .video_provider import AgnesVideoProvider
 
@@ -450,12 +450,12 @@ def build_storyboard_view(
         return session, "", None, "请先生成剧本。"
     try:
         session.confirm_script()
-        plan = session.build_storyboard()
+        job = session.build_video_job()
         return (
             session,
-            _storyboard_markdown(plan),
-            _shot_choices_update(plan),
-            "分镜已生成；确认前不会调用视频API。",
+            _video_job_markdown(job),
+            _shot_choices_update(None),
+            "完整视频任务已生成；Provider 将自行决定是否需要内部拆分。",
         )
     except Exception as exc:
         current = session.storyboard if session else None
@@ -493,7 +493,7 @@ def add_visual_reference_view(
             _visual_reference_choices_update(None),
             uploaded_image,
             content_summary,
-            "请先生成分镜。",
+            "当前直连模式不需要分镜参考图。",
             _gr_update(value=False),
         )
     try:
@@ -699,38 +699,23 @@ def _retake_patch(shot, requirement: str) -> dict[str, str]:
             camera_movement = value
             break
 
-    first_frame = shot.first_frame_prompt
-    end_frame = shot.end_frame_prompt
+    first_frame = shot.start_frame
+    end_frame = shot.end_frame
     if camera_label:
         first_frame = f"{camera_label}。{first_frame}"
         end_frame = f"{camera_label}。{end_frame}"
     if "首帧" in requirement or "开场画面" in requirement:
-        first_frame = f"Retake 首帧要求：{requirement}。原始连续性：{shot.first_frame_prompt}"
+        first_frame = f"Retake 首帧要求：{requirement}。原始连续性：{shot.start_frame}"
     if any(marker in requirement for marker in ("结束帧", "尾帧", "末帧", "结尾画面")):
-        end_frame = f"Retake 结束帧要求：{requirement}。原始连续性：{shot.end_frame_prompt}"
+        end_frame = f"Retake 结束帧要求：{requirement}。原始连续性：{shot.end_frame}"
 
-    action = f"按 Retake 要求“{requirement}”重做动作：{shot.action}"
-    motion = (
-        f"在{shot.duration}秒内完成：{action} 摄影机运动："
-        f"{camera_movement or 'static'}。"
-        "保持人物身份、动作方向、道具位置与相邻镜头连续。"
-    )
-    video_prompt = (
-        f"Cinematic narrative shot. Purpose: {shot.shot_purpose}. "
-        f"CAMERA: {camera}. COMPOSITION: {composition}. "
-        f"FIRST FRAME: {first_frame} "
-        f"MOTION: {motion} "
-        f"END FRAME: {end_frame}"
-    )
     return {
         "camera": camera,
         "composition": composition,
         "camera_movement": camera_movement,
-        "first_frame_prompt": first_frame,
-        "end_frame_prompt": end_frame,
-        "action": action,
-        "motion_prompt": motion,
-        "video_prompt": video_prompt,
+        "start_frame": first_frame,
+        "end_frame": end_frame,
+        "retake_instruction": requirement,
     }
 
 
@@ -740,8 +725,10 @@ def confirm_storyboard_view(
     if session is None:
         return session, "请先生成分镜。"
     try:
+        if session.video_job is not None:
+            return session, "完整视频任务已确认。真实视频仍需勾选费用确认。"
         session.confirm_storyboard()
-        return session, "分镜已确认。真实视频仍需勾选费用确认。"
+        return session, "旧版分镜已确认。真实视频仍需勾选费用确认。"
     except Exception as exc:
         return session, str(exc)
 
@@ -758,6 +745,17 @@ def resolve_submission_uncertainty_view(
             "请先选择一条提交结果不确定的镜头记录。"
         )
     try:
+        if session.video_job is not None:
+            artifact = session.resolve_video_submission_uncertainty(
+                accepted_by_provider=accepted_by_provider,
+                provider_request_id=provider_request_id,
+            )
+            message = (
+                "完整视频任务已登记 Provider 真实任务 ID；再次生成时只会继续查询。"
+                if accepted_by_provider
+                else "完整视频任务已确认为 Provider 未受理；再次生成时允许重新提交。"
+            )
+            return session, _uncertain_shot_choices_update(session.render_manifest), "", message
         artifact = session.resolve_submission_uncertainty(
             int(shot_id),
             accepted_by_provider=accepted_by_provider,
@@ -777,7 +775,9 @@ def resolve_submission_uncertainty_view(
     except Exception as exc:
         return (
             session,
-            _uncertain_shot_choices_update(session.storyboard),
+            _uncertain_shot_choices_update(
+                session.render_manifest if session.video_job is not None else session.storyboard
+            ),
             provider_request_id,
             str(exc),
         )
@@ -808,7 +808,7 @@ def render_video_with_progress(
         yield (
             session,
             previous_video,
-            "必须先确认完整分镜，才能生成真实视频。",
+            "必须先确认完整视频任务，才能生成真实视频。",
             reset_confirmation,
         )
         return
@@ -828,9 +828,8 @@ def render_video_with_progress(
 
     def work() -> None:
         try:
-            renderer = StoryRenderer(
-                provider or AgnesVideoProvider.from_env(), progress_callback=progress
-            )
+            active_provider = provider or AgnesVideoProvider.from_env()
+            renderer = VideoJobRenderer(active_provider, progress_callback=progress)
             base = (
                 Path(output_dir or os.getenv("VIDEO_OUTPUT_DIR", "outputs/videos"))
                 .expanduser()
@@ -841,7 +840,7 @@ def render_video_with_progress(
             result["output_dir"] = target
             session.save(target / "session_before_render.json")
             try:
-                result["manifest"] = session.render_confirmed_plan(renderer, target)
+                result["manifest"] = session.render_confirmed_video(renderer, target)
             finally:
                 session.save(target / "session.json")
         except Exception as exc:
@@ -970,9 +969,10 @@ def build_app(agent_factory: Callable[[], StoryAgent] | None = None):
     def confirm_storyboard_and_open(session):
         active, message = confirm_storyboard_view(session)
         plan = active.storyboard if active is not None else None
+        job = active.video_job if active is not None else None
         return (
             active,
-            _storyboard_markdown(plan),
+            _storyboard_markdown(plan) if plan is not None else _video_job_markdown(job),
             _visual_inputs_markdown(plan),
             _visual_reference_choices_update(plan),
             message,
@@ -1018,7 +1018,13 @@ def build_app(agent_factory: Callable[[], StoryAgent] | None = None):
 
     def uncertain_choices(session):
         return _uncertain_shot_choices_update(
-            session.storyboard if session is not None else None
+            (
+                session.render_manifest
+                if session is not None and session.video_job is not None
+                else session.storyboard
+                if session is not None
+                else None
+            )
         )
 
     start_saved = _autosaving_view(start)
@@ -1423,38 +1429,38 @@ footer{display:none!important}
                             )
                             rewrite_script = gr.Button("改写剧本", elem_classes=["quiet-action"])
                             make_storyboard = gr.Button(
-                                "接受剧本并生成分镜  →",
+                                "接受剧本并生成完整视频任务  →",
                                 variant="primary",
                                 elem_classes=["primary-action"],
                             )
 
-                with gr.Tab("04  分镜", id="storyboard", elem_classes=["stage-surface"]):
+                with gr.Tab("04  视频任务", id="storyboard", elem_classes=["stage-surface"]):
                     gr.HTML(
                         """
                         <div class="stage-kicker">Design the shots</div>
-                        <div class="stage-heading">在生成视频前，先把每个镜头看清楚</div>
-                        <p class="stage-copy">检查动作、景别、节奏和连续性。
-                        此时仍然不会调用真实视频 API。</p>
-                        <div class="shot-strip">SHOT PLAN　·　ACTION　·　CAMERA　·　CONTINUITY</div>
+                        <div class="stage-heading">把确认后的剧本交给视频 Provider</div>
+                        <p class="stage-copy">这是一个完整视频任务。场景是叙事上下文，
+                        不会被本地机械切成相同时长的镜头。</p>
+                        <div class="shot-strip">VIDEO JOB　·　FULL SCRIPT　·　PROVIDER CONTROLLED</div>
                         """
                     )
                     with gr.Row(equal_height=False):
                         with gr.Column(scale=7, elem_classes=["paper-panel", "storyboard-paper"]):
                             storyboard = gr.Markdown(
-                                "*确认剧本后，镜头时间线会出现在这里。*",
+                                "*确认剧本后，完整视频任务会出现在这里。*",
                                 elem_classes=["storyboard-copy", "empty-state"],
                             )
                             visual_inputs = gr.Markdown(
-                                "*生成分镜后，可在这里上传并绑定参考图。*",
+                                "*当前直连模式不需要先制作分镜。*",
                                 elem_classes=["visual-input-summary"],
                             )
                         with gr.Column(scale=3, elem_classes=["side-panel", "storyboard-controls"]):
                             gr.HTML(
                                 """
-                                <div class="panel-label">镜头修改</div>
-                                <div class="assistant-note"><strong>先检查连续性。</strong><br>
-                                选择任一镜头修改景别、动作或节奏；确认整套分镜之前，
-                                不会调用真实视频服务。</div>
+                                <div class="panel-label">完整视频任务</div>
+                                <div class="assistant-note"><strong>先检查剧本。</strong><br>
+                                Provider 会根据完整剧本和自身能力决定生成策略；
+                                本地不预设镜头数量。</div>
                                 """
                             )
                             shot_choice = gr.Dropdown(label="选择镜头")
@@ -1463,7 +1469,7 @@ footer{display:none!important}
                                 placeholder="例如：改成近景，动作更克制",
                                 lines=4,
                             )
-                            retake = gr.Button("重做这个镜头方案", elem_classes=["quiet-action"])
+                            retake = gr.Button("（兼容入口）修改旧版镜头方案", elem_classes=["quiet-action"])
                             with gr.Accordion("参考图管理", open=True):
                                 visual_upload = gr.Image(
                                     label="上传参考图",
@@ -1502,7 +1508,7 @@ footer{display:none!important}
                                     elem_classes=["quiet-action"],
                                 )
                             confirm_storyboard = gr.Button(
-                                "确认整套分镜  →",
+                                "确认完整视频任务  →",
                                 variant="primary",
                                 elem_classes=["primary-action"],
                             )
@@ -1511,9 +1517,9 @@ footer{display:none!important}
                     gr.HTML(
                         """
                         <div class="stage-kicker">Render the film</div>
-                        <div class="stage-heading">最后一步：把确认过的镜头变成影片</div>
-                        <p class="stage-copy">只有确认完整分镜并主动勾选费用确认后，
-                        才会调用真实视频服务。生成进度会保留，失败镜头可以单独重试。</p>
+                        <div class="stage-heading">最后一步：把完整视频任务变成影片</div>
+                        <p class="stage-copy">只有确认完整视频任务并主动勾选费用确认后，
+                        才会调用真实视频服务。</p>
                         """
                     )
                     with gr.Row(equal_height=False):
@@ -1527,7 +1533,7 @@ footer{display:none!important}
                             gr.HTML(
                                 """
                                 <div class="video-ready-note">
-                                成片生成后会在这里直接播放；每个镜头的成功、失败和重试记录
+                                成片生成后会在这里直接播放；完整任务的 Provider 状态和恢复记录
                                 都会保存在本次项目中。
                                 </div>
                                 """
@@ -1537,8 +1543,8 @@ footer{display:none!important}
                                 """
                                 <div class="panel-label">生成设置</div>
                                 <div class="assistant-note"><strong>先确认，再生成。</strong><br>
-                                视频会按照已确认分镜逐镜头制作，成功片段会即时保存，
-                                全部完成后自动合成为一条成片。</div>
+                                视频会作为一个完整 VideoJob 提交；Provider 若需要分段，
+                                由 Provider 在适配器内部处理。</div>
                                 """
                             )
                             cost_confirmed = gr.Checkbox(label="我确认下一步会调用付费视频 API")
@@ -2181,6 +2187,20 @@ def _storyboard_markdown(plan) -> str:
             f"**起始参考：** {_shot_start_reference(shot)}"
         )
     return "\n\n".join(sections)
+
+
+def _video_job_markdown(job) -> str:
+    if job is None:
+        return ""
+    scene_count = len(job.metadata.get("scenes", [])) if isinstance(job.metadata, dict) else 0
+    return (
+        f"### 《{job.title}》 · 完整视频任务 · {job.target_seconds}秒\n\n"
+        "剧本已作为一个连续的视频生成请求提交给 Provider。"
+        "场景只作为叙事上下文，不会在本地被切成等长镜头。\n\n"
+        f"**场景上下文：** {scene_count} 个\n\n"
+        f"**视觉风格：** {job.visual_style or '由剧本与 Provider 默认能力决定'}\n\n"
+        f"**提示词摘要：** {job.prompt[:800]}"
+    )
 
 
 def _shot_start_reference(shot) -> str:

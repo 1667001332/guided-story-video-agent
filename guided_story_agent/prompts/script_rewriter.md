@@ -4,4 +4,6 @@
 
 修改后重新检查相邻场景的 start_state 与上一场 end_state；如果反馈改变了人物决定、信息或道具状态，必须同步修复前因、过程和后果。
 
+Timing contract: preserve or revise duration_weight and timing_reason for every scene. duration_weight is a positive relative pacing weight, not a fixed seconds value.
+
 只返回与 script_writer.md 完全相同的 JSON 结构。

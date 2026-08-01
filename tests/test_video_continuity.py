@@ -1023,7 +1023,7 @@ class VideoContinuityTests(unittest.TestCase):
         original_seed = plan.shots[0].seed
         session.update_storyboard_shot(
             plan.shots[0].shot_id,
-            {"action": f"{plan.shots[0].action}，动作更克制"},
+            {"retake_instruction": "动作更克制"},
         )
         self.assertNotEqual(original_seed, session.storyboard.shots[0].seed)
         self.assertFalse(session.storyboard.confirmed)

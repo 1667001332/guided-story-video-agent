@@ -15,6 +15,13 @@ class Stage(str, Enum):
     DETAILING = "detailing"
     SCRIPT_REVIEW = "script_review"
     STORYBOARD_REVIEW = "storyboard_review"
+    MOVIE_PLAN_REVIEW = "movie_plan_review"
+    MOVIE_PLAN_CONFIRMED = "movie_plan_confirmed"
+    MOVIE_PLAN_REVISED = "movie_plan_revised"
+    MOVIE_PLAN_ROLLED_BACK = "movie_plan_rolled_back"
+    FILM_IR_BUILT = "film_ir_built"
+    MOVIE_IR_BUILT = "movie_ir_built"
+    VIDEO_JOB_COMPILED = "video_job_compiled"
     RENDER_READY = "render_ready"
     COMPLETED = "completed"
 
@@ -301,6 +308,8 @@ class StoryScene:
     start_state: str = ""
     end_state: str = ""
     emotional_change: str = ""
+    duration_weight: float = 0.0
+    duration_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -380,6 +389,39 @@ class ProviderCapabilities:
     supports_reference_images: bool = False
     supports_seed: bool = False
     requires_public_image_url: bool = False
+    # These are declarations of a concrete adapter, not constraints of the
+    # story pipeline.  ``None`` means that the adapter does not advertise a
+    # maximum duration and the core should submit one complete VideoJob.
+    min_duration_seconds: int | None = None
+    max_duration_seconds: int | None = None
+    supports_long_video: bool = True
+    supports_multi_scene_prompt: bool = True
+
+
+@dataclass(slots=True)
+class VideoJob:
+    """Provider-independent request for one complete generated video.
+
+    A VideoJob deliberately contains no shot index or storyboard timing.  A
+    provider may split it internally when its own API requires that, but that
+    implementation detail must not leak into the user-facing story flow.
+    """
+
+    title: str
+    prompt: str
+    target_seconds: int
+    negative_prompt: str = ""
+    aspect_ratio: str = "16:9"
+    dialogue: str = ""
+    narration: str = ""
+    visual_style: str = ""
+    reference_image_paths: list[str] = field(default_factory=list)
+    initial_frame_path: str = ""
+    initial_frame_url: str = ""
+    seed: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    job_id: str = ""
+    confirmed: bool = False
 
 
 @dataclass(slots=True)
@@ -398,6 +440,12 @@ class StoryboardShot:
     video_prompt: str
     negative_prompt: str
     aspect_ratio: str = "16:9"
+    dialogue: str = ""
+    source_action: str = ""
+    retake_instruction: str = ""
+    time_of_day: str = ""
+    visual_style: str = ""
+    color_palette: str = ""
     continuity_notes: list[str] = field(default_factory=list)
     shot_purpose: str = ""
     composition: str = ""
@@ -409,6 +457,7 @@ class StoryboardShot:
     duration_reason: str = ""
     duration_weight: float = 0.0
     estimated_duration: float = 0.0
+    minimum_readable_duration: int = 0
     first_frame_prompt: str = ""
     motion_prompt: str = ""
     end_frame_prompt: str = ""

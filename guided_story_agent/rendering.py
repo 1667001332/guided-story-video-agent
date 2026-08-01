@@ -24,11 +24,13 @@ from .models import (
     RenderManifest,
     StoryboardPlan,
     StoryboardShot,
+    VideoJob,
     VideoArtifact,
     VisualReference,
     to_plain_data,
 )
 from .narration import EdgeNarrationSynthesizer, NarrationUnavailable
+from .storyboard import refresh_shot_prompts
 from .video_provider import (
     PublishedImage,
     VideoSubmissionUncertainError,
@@ -51,6 +53,242 @@ class ShotProvider(Protocol):
         progress_callback: Callable[[str, float, str], None] | None = None,
         resume_request_id: str | None = None,
     ) -> VideoArtifact: ...
+
+
+class VideoProvider(Protocol):
+    """Provider contract for one complete video request.
+
+    Providers that need internal chunking may implement it behind this
+    boundary.  The story/session layer never has to manufacture storyboard
+    shots merely to satisfy an adapter's API.
+    """
+
+    endpoint: str
+    capabilities: ProviderCapabilities
+
+    def generate_video(
+        self,
+        job: VideoJob,
+        output_dir: str | Path,
+        *,
+        attempt: int = 1,
+        progress_callback: Callable[[str, float, str], None] | None = None,
+        resume_request_id: str | None = None,
+    ) -> VideoArtifact: ...
+
+
+class VideoJobRenderer:
+    """Render one VideoJob without a storyboard or local clip assembly."""
+
+    def __init__(
+        self,
+        provider: VideoProvider,
+        *,
+        progress_callback: Callable[[str, float, str], None] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.progress_callback = progress_callback
+
+    def render(self, job: VideoJob, output_dir: str | Path) -> RenderManifest:
+        if not isinstance(job, VideoJob) or not job.confirmed:
+            raise RuntimeError("视频任务尚未确认，禁止调用视频生成。")
+        if (
+            isinstance(job.target_seconds, bool)
+            or not isinstance(job.target_seconds, int)
+            or job.target_seconds <= 0
+        ):
+            raise ValueError("视频任务目标时长必须是正整数。")
+        target = Path(output_dir).expanduser().resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        run_id = f"video-job-{uuid4().hex[:16]}"
+        manifest = RenderManifest(
+            status="running",
+            output_dir=str(target),
+            render_run_id=run_id,
+        )
+        capabilities = getattr(self.provider, "capabilities", ProviderCapabilities())
+        minimum = capabilities.min_duration_seconds
+        maximum = capabilities.max_duration_seconds
+        if minimum is not None and job.target_seconds < minimum:
+            raise ValueError(
+                f"当前 Provider 的最短时长为 {minimum} 秒；"
+                "这是 Provider 适配器限制，不是脚本或核心流程限制。"
+            )
+        if maximum is not None and job.target_seconds > maximum:
+            raise ValueError(
+                f"当前 Provider 的最长时长为 {maximum} 秒；"
+                "请更换支持长视频的 Provider，或让该适配器自行分段。"
+            )
+        existing = self._read_manifest(target)
+        if existing is not None:
+            if existing.status == "submission_uncertain":
+                return existing
+        self._write_manifest(manifest, target)
+        self._progress("submitting", 0.05, "正在提交完整视频任务")
+        resume_request_id = None
+        attempt = 1
+        if existing is not None and existing.status == "pending" and existing.artifacts:
+            pending = existing.artifacts[-1]
+            resume_request_id = pending.request_id or None
+            attempt = max(1, pending.attempt)
+        intent = VideoArtifact(
+            artifact_id=f"submit-intent-video-{uuid4().hex[:12]}",
+            shot_id=1,
+            provider=str(getattr(self.provider, "provider_name", "unknown")),
+            model=str(getattr(self.provider, "endpoint", type(self.provider).__name__)),
+            status="submission_uncertain",
+            local_path="",
+            remote_url="",
+            duration=job.target_seconds,
+            prompt=job.prompt,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            request_id=f"submit-intent-{uuid4().hex}",
+            attempt=attempt,
+            error_message=(
+                "完整视频提交意图已持久化；若进程中断，必须先核对 Provider 后台，"
+                "不会自动重复提交。"
+            ),
+        )
+        manifest.artifacts = [intent]
+        manifest.status = "submission_uncertain"
+        manifest.error = intent.error_message
+        self._write_manifest(manifest, target)
+        try:
+            provider_kwargs = {
+                "attempt": attempt,
+                "progress_callback": self._provider_progress,
+            }
+            if resume_request_id:
+                provider_kwargs["resume_request_id"] = resume_request_id
+            artifact = self.provider.generate_video(
+                job,
+                target,
+                **provider_kwargs,
+            )
+            if artifact.status == "succeeded" and not validate_mp4_file(artifact.local_path):
+                raise RuntimeError("Provider 返回的文件不是可用的 MP4 视频。")
+            if artifact.status not in {"succeeded", "pending", "submission_uncertain", "failed"}:
+                raise RuntimeError(f"Provider 返回了无法识别的状态：{artifact.status}")
+        except VideoTaskTerminalError as exc:
+            artifact = VideoArtifact(
+                artifact_id=f"failed-video-{uuid4().hex[:12]}",
+                shot_id=1,
+                provider=str(getattr(self.provider, "provider_name", "unknown")),
+                model=str(getattr(self.provider, "endpoint", type(self.provider).__name__)),
+                status="failed",
+                local_path="",
+                remote_url="",
+                duration=job.target_seconds,
+                prompt=job.prompt,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                request_id=exc.request_id,
+                error_message=str(exc),
+            )
+        except VideoSubmissionUncertainError as exc:
+            artifact = VideoArtifact(
+                artifact_id=f"uncertain-video-{uuid4().hex[:12]}",
+                shot_id=1,
+                provider=str(getattr(self.provider, "provider_name", "unknown")),
+                model=str(getattr(self.provider, "endpoint", type(self.provider).__name__)),
+                status="submission_uncertain",
+                local_path="",
+                remote_url="",
+                duration=job.target_seconds,
+                prompt=job.prompt,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                request_id=exc.operation_id,
+                error_message=str(exc),
+            )
+        except Exception as exc:
+            artifact = VideoArtifact(
+                artifact_id=f"failed-video-{uuid4().hex[:12]}",
+                shot_id=1,
+                provider=str(getattr(self.provider, "provider_name", "unknown")),
+                model=str(getattr(self.provider, "endpoint", type(self.provider).__name__)),
+                status="failed",
+                local_path="",
+                remote_url="",
+                duration=job.target_seconds,
+                prompt=job.prompt,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                error_message=str(exc),
+            )
+
+        manifest.artifacts = [artifact]
+        if artifact.status == "succeeded":
+            manifest.status = "succeeded"
+            manifest.generated_shots = [1]
+            manifest.final_video_path = artifact.local_path
+            self._progress("completed", 1.0, "完整视频已经生成")
+        elif artifact.status == "pending":
+            manifest.status = "pending"
+            manifest.error = artifact.error_message or "远端视频任务仍在处理中。"
+            self._progress("pending", 0.6, manifest.error)
+        elif artifact.status == "submission_uncertain":
+            manifest.status = "submission_uncertain"
+            manifest.error = artifact.error_message
+            self._progress("submission_uncertain", 0.6, manifest.error)
+        else:
+            manifest.status = "failed"
+            manifest.failed_shots = [1]
+            manifest.error = artifact.error_message or "完整视频生成失败。"
+            self._progress("failed", 1.0, manifest.error)
+        self._write_manifest(manifest, target)
+        return manifest
+
+    def _provider_progress(self, stage: str, fraction: float, message: str) -> None:
+        self._progress(stage, 0.05 + 0.9 * max(0.0, min(1.0, fraction)), message)
+
+    def _progress(self, stage: str, fraction: float, message: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(stage, fraction, message)
+
+    @staticmethod
+    def _write_manifest(manifest: RenderManifest, target: Path) -> None:
+        (target / "render_manifest.json").write_text(
+            json.dumps(to_plain_data(manifest), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _read_manifest(target: Path) -> RenderManifest | None:
+        path = target / "render_manifest.json"
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            artifacts = []
+            fields = set(VideoArtifact.__dataclass_fields__)
+            for raw in payload.get("artifacts", []):
+                if isinstance(raw, dict):
+                    artifacts.append(
+                        VideoArtifact(
+                            **{key: value for key, value in raw.items() if key in fields}
+                        )
+                    )
+            return RenderManifest(
+                status=str(payload.get("status", "")),
+                output_dir=str(payload.get("output_dir", str(target))),
+                render_run_id=str(payload.get("render_run_id", "")),
+                generated_shots=[int(item) for item in payload.get("generated_shots", [])],
+                reused_shots=[int(item) for item in payload.get("reused_shots", [])],
+                failed_shots=[int(item) for item in payload.get("failed_shots", [])],
+                dependency_failed_shots=[
+                    int(item) for item in payload.get("dependency_failed_shots", [])
+                ],
+                unreferenced_fallback_shots=[
+                    int(item) for item in payload.get("unreferenced_fallback_shots", [])
+                ],
+                artifacts=artifacts,
+                final_video_path=str(payload.get("final_video_path", "")),
+                audio_path=str(payload.get("audio_path", "")),
+                subtitle_path=str(payload.get("subtitle_path", "")),
+                error=str(payload.get("error", "")),
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
 
 
 class StoryRenderer:
@@ -120,8 +358,9 @@ class StoryRenderer:
             shot.continuity_diagnostics = self._unique(
                 [*shot.continuity_diagnostics, *diagnostics]
             )
+            refresh_shot_prompts(provider_shot)
             fingerprint = build_input_fingerprint(
-                shot,
+                provider_shot,
                 provider=provider_name,
                 model=model,
             )
@@ -130,13 +369,13 @@ class StoryRenderer:
                     item.shot_id == shot.shot_id for item in plan.artifacts
                 )
                 artifact = self._failed_artifact(
-                    shot,
+                    provider_shot,
                     attempt,
                     RuntimeError(dependency_error),
                 )
                 self._attach_evidence(
                     artifact,
-                    shot,
+                    provider_shot,
                     fingerprint,
                     diagnostics,
                     used_fallback=used_fallback,
@@ -157,11 +396,11 @@ class StoryRenderer:
                 self._write_manifest(manifest, target)
                 continue
 
-            reusable = self._find_reusable(plan, shot, fingerprint)
+            reusable = self._find_reusable(plan, provider_shot, fingerprint)
             if reusable:
                 self._attach_evidence(
                     reusable,
-                    shot,
+                    provider_shot,
                     fingerprint,
                     diagnostics,
                     used_fallback=used_fallback,
@@ -187,10 +426,10 @@ class StoryRenderer:
                 )
                 self._write_manifest(manifest, target)
                 continue
-            pending = self._find_pending(plan, shot)
+            pending = self._find_pending(plan, provider_shot)
             if pending and not self._artifact_matches_input(
                 pending,
-                shot,
+                provider_shot,
                 fingerprint,
             ):
                 manifest.status = "pending"
@@ -207,7 +446,7 @@ class StoryRenderer:
                 )
                 self._write_manifest(manifest, target)
                 return manifest
-            uncertain = self._find_uncertain(plan, shot)
+            uncertain = self._find_uncertain(plan, provider_shot)
             if uncertain is not None:
                 manifest.status = "submission_uncertain"
                 manifest.artifacts.append(uncertain)
@@ -231,12 +470,12 @@ class StoryRenderer:
             submission_intent: VideoArtifact | None = None
             if pending is None:
                 submission_intent = self._submission_intent_artifact(
-                    shot,
+                    provider_shot,
                     attempt,
                 )
                 self._attach_evidence(
                     submission_intent,
-                    shot,
+                    provider_shot,
                     fingerprint,
                     diagnostics,
                     used_fallback=used_fallback,
@@ -270,23 +509,23 @@ class StoryRenderer:
                     raise RuntimeError(f"Provider 返回了无法识别的状态：{artifact.status}")
             except VideoTaskTerminalError as exc:
                 artifact = self._failed_artifact(
-                    shot,
+                    provider_shot,
                     attempt,
                     exc,
                     request_id=exc.request_id,
                 )
             except VideoSubmissionUncertainError as exc:
                 artifact = self._uncertain_artifact(
-                    shot,
+                    provider_shot,
                     attempt,
                     exc,
                     operation_id=exc.operation_id,
                 )
             except Exception as exc:
-                artifact = self._failed_artifact(shot, attempt, exc)
+                artifact = self._failed_artifact(provider_shot, attempt, exc)
             self._attach_evidence(
                 artifact,
-                shot,
+                provider_shot,
                 fingerprint,
                 diagnostics,
                 used_fallback=used_fallback,
@@ -551,6 +790,12 @@ class StoryRenderer:
                 provider_shot.initial_frame_path = fixed_start_path
                 provider_shot.initial_frame_url = ""
                 provider_shot.continuity_mode = "new_scene_reference"
+                provider_shot.transition_type = "scene_change"
+                provider_shot.transition_reason = (
+                    "上游末帧不可用，改用已确认 start_frame 重新建立镜头"
+                )
+                provider_shot.inherit_previous_frame = False
+                provider_shot.previous_shot_id = None
                 diagnostics.append(
                     "上游末帧不可用，已明确降级为已确认的 start_frame，不使用文本裸生成"
                 )
@@ -622,6 +867,12 @@ class StoryRenderer:
                     provider_shot.initial_frame_url = ""
                     provider_shot.reference_image_paths = []
                     provider_shot.continuity_mode = "independent"
+                    provider_shot.transition_type = "independent"
+                    provider_shot.transition_reason = (
+                        "Provider 不支持已确认的本地首帧，改为独立文本镜头"
+                    )
+                    provider_shot.inherit_previous_frame = False
+                    provider_shot.previous_shot_id = None
                     used_fallback = True
                     diagnostics.append(
                         "Provider 不能使用本地首帧，本镜头已显式标记为无参考文本回退"
@@ -790,6 +1041,8 @@ class StoryRenderer:
         *,
         used_fallback: bool,
     ) -> None:
+        artifact.prompt = shot.video_prompt
+        artifact.duration = shot.duration
         artifact.reference_image_paths = list(shot.reference_image_paths)
         artifact.confirmed_visual_inputs = deepcopy(shot.confirmed_visual_inputs)
         artifact.initial_frame_source_path = shot.initial_frame_source_path
@@ -1143,8 +1396,17 @@ def mux_audio_and_subtitles(
     if executable is None:
         raise RuntimeError("未找到 ffmpeg。")
     target = Path(output_path).expanduser().resolve()
-    has_audio = bool(audio_path and Path(audio_path).is_file())
-    has_subtitle = bool(subtitle_path and Path(subtitle_path).is_file())
+    def is_nonempty_file(candidate_path: str) -> bool:
+        if not candidate_path:
+            return False
+        candidate = Path(candidate_path)
+        try:
+            return candidate.is_file() and candidate.stat().st_size > 0
+        except OSError:
+            return False
+
+    has_audio = is_nonempty_file(audio_path)
+    has_subtitle = is_nonempty_file(subtitle_path)
     command = [executable, "-y", "-i", video_path]
     audio_index: int | None = None
     subtitle_index: int | None = None

@@ -5,6 +5,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .models import ArtifactReview, StoryDraft, StoryScript, StoryboardPlan
+from .timing import count_sequential_action_phases
 
 
 _GENERIC_BIGRAMS = {
@@ -95,7 +96,11 @@ def review_script_against_story(
         )
         if name.strip()
     ]
-    missing_names = [name for name in required_names if name not in script_text]
+    missing_names = [
+        name
+        for name in required_names
+        if name not in script_text and semantic_coverage(name, script_text) < 0.45
+    ]
     if missing_names:
         review.hard_errors.append(
             "剧本遗漏已确认的关键人物：" + "、".join(missing_names)
@@ -264,10 +269,4 @@ def _normalize_action(value: str) -> str:
 
 
 def _action_clause_count(value: str) -> int:
-    return len(
-        [
-            item
-            for item in re.split(r"[。！？；;，,]|然后|随后|接着|同时", str(value or ""))
-            if item.strip()
-        ]
-    )
+    return count_sequential_action_phases(value)

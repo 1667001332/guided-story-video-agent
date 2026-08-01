@@ -13,6 +13,7 @@ from .models import (
     IdeationTurnResult,
     RenderManifest,
     ProviderCapabilities,
+    VideoJob,
     Stage,
     StoryCharacter,
     StoryDraft,
@@ -27,6 +28,8 @@ from .models import (
     VisualReference,
 )
 from .session import GuidedStorySession
+from .rendering import VideoJobRenderer
+from .video_job import build_video_job
 
 __all__ = [
     "CreativeBrief",
@@ -36,11 +39,13 @@ __all__ = [
     "ElementPalette",
     "GuideTurnResult",
     "GuidedStorySession",
+    "VideoJobRenderer",
     "IdeaBatch",
     "IdeaCard",
     "IdeationTurnResult",
     "OpenAIStoryAgent",
     "ProviderCapabilities",
+    "VideoJob",
     "RenderManifest",
     "RuleBasedStoryAgent",
     "SelectionState",
@@ -55,4 +60,5 @@ __all__ = [
     "VisualAsset",
     "VisualBible",
     "VisualReference",
+    "build_video_job",
 ]

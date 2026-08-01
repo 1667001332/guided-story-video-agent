@@ -12,7 +12,7 @@ from .quality import (
     evaluate_storyboard_quality,
     review_script_against_story,
 )
-from .rendering import StoryRenderer
+from .rendering import VideoJobRenderer
 from .session import GuidedStorySession
 from .video_provider import AgnesVideoProvider
 
@@ -107,7 +107,7 @@ def run_selfplay(
     else:
         text_api_mode = "fallback-allowed"
     bench = {
-        "schema_version": 4,
+        "schema_version": GuidedStorySession.schema_version,
         "idea_count": len(ideas.cards),
         "idea_diversity": diversity,
         "duplicate_rate": duplicate_rate,
@@ -145,21 +145,33 @@ def run_selfplay(
     target.mkdir(parents=True, exist_ok=True)
     artifacts = {
         "transcript.json": {
-            "schema_version": 4,
+            "schema_version": GuidedStorySession.schema_version,
             "direction": active_direction,
             "chat": to_plain_data(session.chat_history),
         },
-        "ideas.json": {"schema_version": 4, "batches": to_plain_data(session.idea_batches)},
+        "ideas.json": {
+            "schema_version": GuidedStorySession.schema_version,
+            "batches": to_plain_data(session.idea_batches),
+        },
         "selection.json": {
-            "schema_version": 4,
+            "schema_version": GuidedStorySession.schema_version,
             "ideas": selected_snapshot,
             "elements": to_plain_data(session.selected_elements),
         },
-        "story.json": {"schema_version": 4, **to_plain_data(story)},
-        "script.json": {"schema_version": 4, **to_plain_data(script)},
-        "storyboard.json": {"schema_version": 4, **to_plain_data(storyboard)},
+        "story.json": {
+            "schema_version": GuidedStorySession.schema_version,
+            **to_plain_data(story),
+        },
+        "script.json": {
+            "schema_version": GuidedStorySession.schema_version,
+            **to_plain_data(script),
+        },
+        "storyboard.json": {
+            "schema_version": GuidedStorySession.schema_version,
+            **to_plain_data(storyboard),
+        },
         "prompt_log.json": {
-            "schema_version": 4,
+            "schema_version": GuidedStorySession.schema_version,
             "prompts": [
                 {
                     "shot_id": shot.shot_id,
@@ -188,9 +200,24 @@ def run_selfplay(
     session.save(target / "session.json")
 
     if render:
-        active_renderer = renderer or StoryRenderer(AgnesVideoProvider.from_env())
+        # Keep the legacy storyboard in the benchmark artifacts, but exercise
+        # the production path with one complete VideoJob.
+        if session.video_job is None:
+            session.build_video_job()
+        active_provider = (
+            renderer.provider
+            if renderer is not None and hasattr(renderer, "provider")
+            else renderer
+            if renderer is not None
+            else AgnesVideoProvider.from_env()
+        )
+        active_renderer = (
+            renderer
+            if isinstance(renderer, VideoJobRenderer)
+            else VideoJobRenderer(active_provider)
+        )
         try:
-            manifest = session.render_confirmed_plan(active_renderer, target / "video")
+            manifest = session.render_confirmed_video(active_renderer, target / "video")
             bench["render_status"] = manifest.status
             bench["render_warning"] = manifest.error
             bench["failed_shots"] = manifest.failed_shots

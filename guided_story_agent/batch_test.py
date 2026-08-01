@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
-from .rendering import StoryRenderer
+from .rendering import StoryRenderer, VideoJobRenderer
 from .selfplay import run_selfplay
 from .session import GuidedStorySession
 from .video_provider import AgnesVideoProvider, sanitize_remote_url
@@ -343,8 +343,15 @@ def run_batch(
                             )
                         )
                         render_output_dir = render_output_dir or artifact_dir / "video"
-                        manifest = active_session.render_confirmed_plan(
-                            renderer,
+                        if active_session.video_job is None:
+                            active_session.build_video_job()
+                        active_provider = (
+                            renderer.provider
+                            if hasattr(renderer, "provider")
+                            else renderer
+                        )
+                        manifest = active_session.render_confirmed_video(
+                            VideoJobRenderer(active_provider),
                             render_output_dir,
                         )
                         render_status = str(manifest.status or "unknown")
@@ -996,7 +1003,7 @@ def _progress(callback: ProgressCallback | None, message: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="批量测试故事、剧本、分镜和可选视频链路")
+    parser = argparse.ArgumentParser(description="批量测试故事、剧本、完整视频任务和可选视频链路")
     parser.add_argument(
         "--input",
         default="",

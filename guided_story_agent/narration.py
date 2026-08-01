@@ -50,8 +50,7 @@ class EdgeNarrationSynthesizer:
     def synthesize(self, plan: StoryboardPlan, output_dir: str | Path) -> NarrationArtifact:
         target = Path(output_dir).expanduser().resolve()
         target.mkdir(parents=True, exist_ok=True)
-        normalize_narration_timeline(plan)
-        cues = narration_timeline(plan)
+        cues = spoken_timeline(plan)
         timeline_text = "\n".join(cue.text for cue in cues)
         subtitle_path = target / "narration.srt"
         subtitle_path.write_text(build_srt(plan), encoding="utf-8")
@@ -107,7 +106,7 @@ class EdgeNarrationSynthesizer:
 
 def build_srt(plan: StoryboardPlan) -> str:
     lines: list[str] = []
-    for index, cue in enumerate(narration_timeline(plan), start=1):
+    for index, cue in enumerate(spoken_timeline(plan), start=1):
         lines.extend(
             [
                 str(index),
@@ -119,14 +118,19 @@ def build_srt(plan: StoryboardPlan) -> str:
     return "\n".join(lines)
 
 
-def normalize_narration_timeline(plan: StoryboardPlan) -> None:
-    """Migrate duplicate scene narration into one canonical shot timeline."""
+def normalize_narration_timeline(
+    plan: StoryboardPlan,
+    *,
+    deduplicate_legacy: bool = False,
+) -> None:
+    """Clean narration, with opt-in deduplication only for legacy migration."""
+
     seen_by_scene: dict[int, set[str]] = {}
     has_shot_narration = False
     for shot in plan.shots:
         text = _clean_text(shot.narration)
         seen = seen_by_scene.setdefault(shot.scene_id, set())
-        if text and text in seen:
+        if deduplicate_legacy and text and text in seen:
             shot.narration = ""
             continue
         shot.narration = text
@@ -143,15 +147,12 @@ def normalize_narration_timeline(plan: StoryboardPlan) -> None:
 def narration_timeline(plan: StoryboardPlan) -> list[NarrationCue]:
     cues: list[NarrationCue] = []
     cursor = 0
-    seen_by_scene: dict[int, set[str]] = {}
     for shot in plan.shots:
         start = cursor
         cursor += shot.duration
         text = _clean_text(shot.narration)
-        seen = seen_by_scene.setdefault(shot.scene_id, set())
-        if not text or text in seen:
+        if not text:
             continue
-        seen.add(text)
         cues.append(
             NarrationCue(
                 shot_id=shot.shot_id,
@@ -160,6 +161,34 @@ def narration_timeline(plan: StoryboardPlan) -> list[NarrationCue]:
                 text=text,
             )
         )
+    return cues
+
+
+def spoken_timeline(plan: StoryboardPlan) -> list[NarrationCue]:
+    """Return every confirmed narration/dialogue cue on its shot window."""
+
+    cues: list[NarrationCue] = []
+    cursor = 0
+    for shot in plan.shots:
+        start = cursor
+        cursor += shot.duration
+        text = "\n".join(
+            value
+            for value in (
+                _clean_text(shot.narration),
+                _clean_text(shot.dialogue),
+            )
+            if value
+        )
+        if text:
+            cues.append(
+                NarrationCue(
+                    shot_id=shot.shot_id,
+                    start_seconds=start,
+                    end_seconds=cursor,
+                    text=text,
+                )
+            )
     return cues
 
 
