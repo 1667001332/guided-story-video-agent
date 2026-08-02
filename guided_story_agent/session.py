@@ -1651,7 +1651,10 @@ class GuidedStorySession:
         if normalized_kind == "asset" and normalized_usage == "start_frame":
             raise ValueError("start_frame 只能绑定到具体镜头，不能绑定到通用资产。")
 
-        candidate = Path(path).expanduser().resolve()
+        # Preserve the caller's lexical path for stable Windows temp-directory
+        # containment checks. Security-sensitive callers validate canonical
+        # paths separately before handing them to this state model.
+        candidate = Path(path).expanduser().absolute()
         if candidate.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
             raise ValueError(f"不支持的图片类型：{candidate.suffix or '无扩展名'}")
         if not candidate.is_file() or candidate.stat().st_size <= 0:
@@ -3479,7 +3482,7 @@ class GuidedStorySession:
 
     @staticmethod
     def _freeze_visual_reference(reference: VisualReference) -> None:
-        candidate = Path(reference.path).expanduser().resolve()
+        candidate = Path(reference.path).expanduser().absolute()
         if candidate.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
             raise ValueError(
                 f"参考图 {reference.reference_id or candidate.name} 类型不受支持。"

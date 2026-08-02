@@ -2061,15 +2061,15 @@ def _persist_visual_upload(source_path: str | Path) -> Path:
     with source.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    root = (
-        Path(os.getenv("VISUAL_INPUT_DIR", "outputs/visual_inputs"))
-        .expanduser()
-        .resolve()
-    )
+    # Keep the configured lexical root in persisted references. Canonical
+    # paths are still used for the traversal check below, but returning a
+    # fully resolved path can expand Windows 8.3 aliases and break containment
+    # checks against the caller's original temp directory.
+    root = Path(os.getenv("VISUAL_INPUT_DIR", "outputs/visual_inputs")).expanduser().absolute()
     root.mkdir(parents=True, exist_ok=True)
-    target = (root / f"{digest.hexdigest()[:24]}{suffix}").resolve()
+    target = root / f"{digest.hexdigest()[:24]}{suffix}"
     try:
-        target.relative_to(root)
+        target.resolve().relative_to(root.resolve())
     except ValueError as exc:
         raise ValueError("视觉输入目录配置无效。") from exc
     if not target.is_file():

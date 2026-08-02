@@ -98,7 +98,12 @@ class VideoJobRenderer:
             or job.target_seconds <= 0
         ):
             raise ValueError("视频任务目标时长必须是正整数。")
-        target = Path(output_dir).expanduser().resolve()
+        # Keep the caller's lexical path for persisted artifacts. ``resolve``
+        # can expand Windows 8.3 aliases (for example ``RUNNER~1``) on CI,
+        # which makes a path look outside the caller-provided temp directory
+        # even though it points to the same directory. Input validation still
+        # resolves paths where canonicalization is semantically required.
+        target = Path(output_dir).expanduser().absolute()
         target.mkdir(parents=True, exist_ok=True)
         run_id = f"video-job-{uuid4().hex[:16]}"
         manifest = RenderManifest(
@@ -314,7 +319,9 @@ class StoryRenderer:
     def render(self, plan: StoryboardPlan, output_dir: str | Path) -> RenderManifest:
         if not plan.confirmed:
             raise RuntimeError("分镜尚未确认，禁止调用视频生成。")
-        target = Path(output_dir).expanduser().resolve()
+        # See the VideoJobRenderer note above: artifact paths must remain
+        # relative to the exact output root supplied by the caller.
+        target = Path(output_dir).expanduser().absolute()
         target.mkdir(parents=True, exist_ok=True)
         run_id = self._render_run_id(plan, target)
         manifest = RenderManifest(
@@ -936,7 +943,9 @@ class StoryRenderer:
                 extracted = self.frame_extractor(artifact.local_path, output)
                 if not self._is_ready_file(extracted):
                     raise RuntimeError("末帧文件不存在或为空")
-                shot.generated_last_frame_path = str(Path(extracted).resolve())
+                shot.generated_last_frame_path = str(
+                    Path(extracted).expanduser().absolute()
+                )
                 artifact.generated_last_frame_path = shot.generated_last_frame_path
             except Exception as exc:
                 message = f"末帧提取失败：{exc}"
@@ -1277,7 +1286,7 @@ def extract_last_frame(
     executable = ffmpeg_path or shutil.which("ffmpeg")
     if executable is None:
         raise RuntimeError("未找到 ffmpeg，无法提取镜头末帧。")
-    target = Path(output_path).expanduser().resolve()
+    target = Path(output_path).expanduser().absolute()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.unlink(missing_ok=True)
     completed = runner(
