@@ -61,7 +61,12 @@ class LocalPublicImagePublisher:
     """Atomically stage a single visual input inside an explicitly public root."""
 
     def __init__(self, reference_root: str | Path, reference_base_url: str) -> None:
-        self.root = Path(reference_root).expanduser().resolve()
+        # Keep the lexical root for persisted publication paths. On Windows,
+        # ``resolve`` may expand a short-name temp path (for example
+        # ``RUNNER~1``), which makes the returned path fail containment checks
+        # against the caller's original root even though it names the same
+        # directory. Canonical paths are still used for traversal validation.
+        self.root = Path(reference_root).expanduser().absolute()
         self.resolver = build_public_image_url_resolver(
             self.root,
             reference_base_url,
@@ -80,16 +85,16 @@ class LocalPublicImagePublisher:
         digest = _sha256_file(source)
         safe_run = _safe_component(run_id, "render")
         safe_label = _safe_component(label, "frame")
-        run_dir = (self.root / safe_run).resolve()
+        run_dir = self.root / safe_run
         try:
-            run_dir.relative_to(self.root)
+            run_dir.resolve().relative_to(self.root.resolve())
         except ValueError as exc:
             raise ValueError("视觉输入暂存目录越过 VIDEO_REFERENCE_ROOT。") from exc
         run_dir.mkdir(parents=True, exist_ok=True)
         suffix = source.suffix.lower() or ".png"
-        target = (run_dir / f"{safe_label}_{digest[:16]}{suffix}").resolve()
+        target = run_dir / f"{safe_label}_{digest[:16]}{suffix}"
         try:
-            target.relative_to(self.root)
+            target.resolve().relative_to(self.root.resolve())
         except ValueError as exc:
             raise ValueError("视觉输入暂存文件越过 VIDEO_REFERENCE_ROOT。") from exc
         if not target.is_file() or _sha256_file(target) != digest:
