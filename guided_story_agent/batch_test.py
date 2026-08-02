@@ -12,10 +12,14 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import resources
-from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from uuid import uuid4
+
+try:
+    from importlib.resources.abc import Traversable
+except ModuleNotFoundError:  # Python 3.10 exposes resources as a module.
+    Traversable = Any
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .rendering import StoryRenderer, VideoJobRenderer
@@ -343,17 +347,20 @@ def run_batch(
                             )
                         )
                         render_output_dir = render_output_dir or artifact_dir / "video"
-                        if active_session.video_job is None:
-                            active_session.build_video_job()
-                        active_provider = (
-                            renderer.provider
-                            if hasattr(renderer, "provider")
-                            else renderer
-                        )
-                        manifest = active_session.render_confirmed_video(
-                            VideoJobRenderer(active_provider),
-                            render_output_dir,
-                        )
+                        if isinstance(renderer, VideoJobRenderer):
+                            if active_session.video_job is None:
+                                active_session.build_video_job()
+                            manifest = active_session.render_confirmed_video(
+                                renderer,
+                                render_output_dir,
+                            )
+                        else:
+                            # Keep custom/legacy renderer factories working for
+                            # the retained Storyboard compatibility path.
+                            manifest = active_session.render_confirmed_plan(
+                                renderer,
+                                render_output_dir,
+                            )
                         render_status = str(manifest.status or "unknown")
                         active_bench["render_status"] = render_status
                         active_bench["failed_shots"] = list(manifest.failed_shots)
@@ -474,7 +481,7 @@ def _make_renderer(
         return None
     if renderer_factory is not None:
         return renderer_factory()
-    return StoryRenderer(AgnesVideoProvider.from_env())
+    return VideoJobRenderer(AgnesVideoProvider.from_env())
 
 
 def _build_run_identity(

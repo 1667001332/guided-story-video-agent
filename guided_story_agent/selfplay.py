@@ -202,22 +202,21 @@ def run_selfplay(
     if render:
         # Keep the legacy storyboard in the benchmark artifacts, but exercise
         # the production path with one complete VideoJob.
-        if session.video_job is None:
-            session.build_video_job()
-        active_provider = (
-            renderer.provider
-            if renderer is not None and hasattr(renderer, "provider")
-            else renderer
-            if renderer is not None
-            else AgnesVideoProvider.from_env()
-        )
-        active_renderer = (
-            renderer
-            if isinstance(renderer, VideoJobRenderer)
-            else VideoJobRenderer(active_provider)
-        )
         try:
-            manifest = session.render_confirmed_video(active_renderer, target / "video")
+            if isinstance(renderer, VideoJobRenderer):
+                if session.video_job is None:
+                    session.build_video_job()
+                manifest = session.render_confirmed_video(renderer, target / "video")
+            elif renderer is not None:
+                # Preserve the legacy Storyboard renderer seam for offline
+                # tests and callers that explicitly provide one.
+                manifest = session.render_confirmed_plan(renderer, target / "video")
+            else:
+                session.build_video_job()
+                manifest = session.render_confirmed_video(
+                    VideoJobRenderer(AgnesVideoProvider.from_env()),
+                    target / "video",
+                )
             bench["render_status"] = manifest.status
             bench["render_warning"] = manifest.error
             bench["failed_shots"] = manifest.failed_shots

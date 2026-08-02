@@ -35,6 +35,30 @@ def render_ready_session(seconds: int = 30) -> GuidedStorySession:
 
 
 class CoreStateRegressionTests(unittest.TestCase):
+    def test_short_offline_script_preserves_confirmed_conflict(self) -> None:
+        session = GuidedStorySession(
+            CreativeBrief(target_seconds=15),
+            RuleBasedStoryAgent(),
+        )
+        session.start_ideation("雨夜车站")
+        session.generate_story()
+        session.confirm_story()
+
+        script = session.generate_script()
+
+        script_text = "\n".join(
+            " ".join(
+                (
+                    scene.visible_action,
+                    scene.action,
+                    scene.dialogue,
+                    scene.narration,
+                )
+            )
+            for scene in script.scenes
+        )
+        self.assertIn(session.story.core_conflict, script_text)
+
     def test_storyboard_patch_is_atomic_and_valid_patch_invalidates_render(self) -> None:
         session = render_ready_session()
         original_prompt = session.storyboard.shots[0].video_prompt

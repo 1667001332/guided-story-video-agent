@@ -708,7 +708,14 @@ class RuleBasedStoryAgent:
             ("阻力逼近", 0, f"外部阻力进入现场，{protagonist}抢在证据失效前完成下一步。", "", selected[3], "行动代价变得具体"),
             ("线索反转", 0, f"{protagonist}重新排列已有证据，发现此前忽略的对应关系。", "", selected[4], "旧线索获得相反含义"),
             ("正面选择", 0, f"{protagonist}面对阻止者，当场执行无法撤回的决定。", "", conflict, "主角承担选择后果"),
-            ("结果落地", 0, f"{protagonist}完成最后一个可见动作，关键证据留在画面中央。", "", selected[5], ending),
+            (
+                "结果落地",
+                0,
+                f"{protagonist}完成最后一个可见动作，关键证据留在画面中央。",
+                "",
+                f"{conflict}；{selected[5]}",
+                ending,
+            ),
         ]
         return locations, props, beats
 

@@ -828,8 +828,6 @@ def render_video_with_progress(
 
     def work() -> None:
         try:
-            active_provider = provider or AgnesVideoProvider.from_env()
-            renderer = VideoJobRenderer(active_provider, progress_callback=progress)
             base = (
                 Path(output_dir or os.getenv("VIDEO_OUTPUT_DIR", "outputs/videos"))
                 .expanduser()
@@ -840,7 +838,15 @@ def render_video_with_progress(
             result["output_dir"] = target
             session.save(target / "session_before_render.json")
             try:
-                result["manifest"] = session.render_confirmed_video(renderer, target)
+                if provider is not None and not hasattr(provider, "generate_video"):
+                    # Explicit shot providers remain supported for the legacy
+                    # Storyboard compatibility path and test doubles.
+                    renderer = StoryRenderer(provider, progress_callback=progress)
+                    result["manifest"] = session.render_confirmed_plan(renderer, target)
+                else:
+                    active_provider = provider or AgnesVideoProvider.from_env()
+                    renderer = VideoJobRenderer(active_provider, progress_callback=progress)
+                    result["manifest"] = session.render_confirmed_video(renderer, target)
             finally:
                 session.save(target / "session.json")
         except Exception as exc:
@@ -2199,6 +2205,9 @@ def _video_job_markdown(job) -> str:
         "场景只作为叙事上下文，不会在本地被切成等长镜头。\n\n"
         f"**场景上下文：** {scene_count} 个\n\n"
         f"**视觉风格：** {job.visual_style or '由剧本与 Provider 默认能力决定'}\n\n"
+        "**视觉圣经：** 已并入完整视频任务的视觉与连续性约束。\n\n"
+        "**首帧：** 由完整叙事和已确认视觉输入共同决定。\n\n"
+        "**引用资产：** 已确认的视觉输入随任务元数据传递；无则由 Provider 自行生成。\n\n"
         f"**提示词摘要：** {job.prompt[:800]}"
     )
 
