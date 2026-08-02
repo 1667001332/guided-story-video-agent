@@ -22,6 +22,7 @@ from .revision_history import (
 )
 from .revision_invalidation import invalidate_downstream_after_movie_plan_change
 from .validation import validate_movie_plan
+from .fingerprint import ensure_movie_plan_provenance, movie_plan_fingerprint
 
 
 _FORBIDDEN_KEYS = {
@@ -75,6 +76,8 @@ class ApplyRevisionCommand:
     require_revalidation: bool = True
     invalidate_downstream: bool = True
     metadata: dict[str, object] = field(default_factory=dict)
+    source_movie_plan_version: int | None = None
+    source_movie_plan_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("command_id", "candidate_id", "source_movie_plan_id", "apply_reason", "confirmed_by"):
@@ -103,6 +106,9 @@ class RevisionApplyResult:
     stop_reason: str | None = None
     diagnostics: tuple[dict[str, object], ...] = ()
     succeeded: bool = False
+    previous_movie_plan_version: int | None = None
+    new_movie_plan_version: int | None = None
+    new_movie_plan_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(asdict(self))
@@ -117,6 +123,8 @@ class RollbackRevisionCommand:
     require_revalidation: bool = True
     invalidate_downstream: bool = True
     metadata: dict[str, object] = field(default_factory=dict)
+    rollback_to_movie_plan_version: int | None = None
+    rollback_to_movie_plan_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("command_id", "rollback_to_movie_plan_id", "rollback_reason", "confirmed_by"):
@@ -143,6 +151,9 @@ class RevisionRollbackResult:
     stop_reason: str | None = None
     diagnostics: tuple[dict[str, object], ...] = ()
     succeeded: bool = False
+    previous_movie_plan_version: int | None = None
+    restored_movie_plan_version: int | None = None
+    restored_movie_plan_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(asdict(self))
@@ -272,6 +283,29 @@ class RevisionApplyService:
                 candidate_id=candidate.candidate_id,
                 previous_id=current_movie_plan.plan_id,
             )
+        current_provenance = ensure_movie_plan_provenance(current_movie_plan)
+        if (
+            command.source_movie_plan_version is not None
+            and command.source_movie_plan_version != current_provenance.movie_plan_version
+        ):
+            return _apply_failure(
+                command,
+                "source_movie_plan_version_mismatch",
+                "ApplyRevisionCommand 来源 MoviePlan version 与当前计划不一致。",
+                candidate_id=candidate.candidate_id,
+                previous_id=current_movie_plan.plan_id,
+            )
+        if (
+            command.source_movie_plan_fingerprint
+            and command.source_movie_plan_fingerprint != current_provenance.movie_plan_fingerprint
+        ):
+            return _apply_failure(
+                command,
+                "source_movie_plan_fingerprint_mismatch",
+                "ApplyRevisionCommand 来源 MoviePlan fingerprint 与当前计划不一致。",
+                candidate_id=candidate.candidate_id,
+                previous_id=current_movie_plan.plan_id,
+            )
         if candidate.source_movie_plan_id != current_movie_plan.plan_id:
             return _apply_failure(
                 command,
@@ -393,6 +427,7 @@ def _next_version(history: list[dict[str, Any]]) -> int:
 
 
 def _ensure_version_record(session: Any, movie_plan: MoviePlan, *, reason: str) -> None:
+    movie_plan = ensure_movie_plan_provenance(movie_plan)
     history = session.movie_plan_version_history
     snapshot = as_plain_data(movie_plan)
     if any(item.get("movie_plan_id") == movie_plan.plan_id and item.get("snapshot") == snapshot for item in history):
@@ -400,11 +435,13 @@ def _ensure_version_record(session: Any, movie_plan: MoviePlan, *, reason: str) 
     history.append(
         MoviePlanVersionRecord(
             movie_plan_id=movie_plan.plan_id,
-            version=_next_version(history),
+            version=movie_plan.movie_plan_version,
             source="initial",
             created_by="system",
             reason=reason,
             snapshot=deepcopy(snapshot),
+            movie_plan_fingerprint=movie_plan.movie_plan_fingerprint,
+            movie_plan_lineage_token=movie_plan.movie_plan_lineage_token,
         ).to_dict()
     )
 
@@ -440,12 +477,19 @@ def apply_revision_to_session(
         return result
 
     old_id = current.plan_id
-    new_plan = deepcopy(candidate.revised_movie_plan)
+    current = ensure_movie_plan_provenance(current)
+    candidate_plan = ensure_movie_plan_provenance(candidate.revised_movie_plan)
+    candidate_fingerprint = movie_plan_fingerprint(candidate_plan)
+    new_version = current.movie_plan_version + (1 if candidate_fingerprint != current.movie_plan_fingerprint else 0)
+    new_plan = ensure_movie_plan_provenance(candidate_plan, version=new_version)
     _ensure_version_record(session, current, reason="archive before explicit Director revision apply")
     session.movie_plan = deepcopy(new_plan)
     session.confirmed_movie_plan = replace(deepcopy(new_plan), confirmed=True)
     session.movie_plan_revisions.append(deepcopy(new_plan))
     session.current_movie_plan_id = new_plan.plan_id
+    session.current_movie_plan_version = new_plan.movie_plan_version
+    session.current_movie_plan_fingerprint = new_plan.movie_plan_fingerprint
+    session.current_movie_plan_lineage_token = new_plan.movie_plan_lineage_token
     session.previous_movie_plan_id = old_id
     apply_record = RevisionApplyRecord(
         command_id=command.command_id,
@@ -460,7 +504,7 @@ def apply_revision_to_session(
     session.movie_plan_version_history.append(
         MoviePlanVersionRecord(
             movie_plan_id=new_plan.plan_id,
-            version=_next_version(session.movie_plan_version_history),
+            version=new_plan.movie_plan_version,
             source="director_revision_apply",
             parent_movie_plan_id=old_id,
             source_candidate_id=candidate.candidate_id,
@@ -469,6 +513,8 @@ def apply_revision_to_session(
             reason=command.apply_reason,
             snapshot=deepcopy(as_plain_data(new_plan)),
             metadata=deepcopy(command.metadata),
+            movie_plan_fingerprint=new_plan.movie_plan_fingerprint,
+            movie_plan_lineage_token=new_plan.movie_plan_lineage_token,
         ).to_dict()
     )
     invalidation = invalidate_downstream_after_movie_plan_change(
@@ -478,7 +524,13 @@ def apply_revision_to_session(
     )
     apply_record = replace(apply_record, invalidated_artifacts=invalidation.invalidated)
     session.revision_apply_history.append(apply_record.to_dict())
-    result = replace(result, invalidated_artifacts=invalidation.invalidated)
+    result = replace(
+        result,
+        invalidated_artifacts=invalidation.invalidated,
+        previous_movie_plan_version=current.movie_plan_version,
+        new_movie_plan_version=new_plan.movie_plan_version,
+        new_movie_plan_fingerprint=new_plan.movie_plan_fingerprint,
+    )
     session.revision_apply_results.append(result.to_dict())
     session.stage = session.stage.__class__.MOVIE_PLAN_REVISED
     session.user_action_count += 1
@@ -486,13 +538,24 @@ def apply_revision_to_session(
     return result
 
 
-def _find_snapshot(session: Any, target_id: str, current: MoviePlan) -> MoviePlan | None:
+def _find_snapshot(
+    session: Any,
+    target_id: str,
+    current: MoviePlan,
+    *,
+    target_version: int | None = None,
+    target_fingerprint: str | None = None,
+) -> MoviePlan | None:
     from .openai_director import movie_plan_from_data
 
     current_snapshot = as_plain_data(current)
     records = list(session.movie_plan_version_history)
     for item in reversed(records):
         if item.get("movie_plan_id") != target_id:
+            continue
+        if target_version is not None and int(item.get("version", 0) or 0) != target_version:
+            continue
+        if target_fingerprint and str(item.get("movie_plan_fingerprint", "")) != target_fingerprint:
             continue
         snapshot = item.get("snapshot")
         if not isinstance(snapshot, dict):
@@ -514,7 +577,13 @@ def rollback_revision_to_session(
         result = _rollback_failure(command, "target_not_found", "当前 Session 没有 MoviePlan。")
         session.revision_rollback_results.append(result.to_dict())
         return result
-    restored = _find_snapshot(session, command.rollback_to_movie_plan_id, current)
+    restored = _find_snapshot(
+        session,
+        command.rollback_to_movie_plan_id,
+        current,
+        target_version=command.rollback_to_movie_plan_version,
+        target_fingerprint=command.rollback_to_movie_plan_fingerprint,
+    )
     if restored is None:
         result = _rollback_failure(
             command,
@@ -538,20 +607,27 @@ def rollback_revision_to_session(
         return result
 
     old_id = current.plan_id
+    current = ensure_movie_plan_provenance(current)
+    restored = ensure_movie_plan_provenance(restored)
     session.movie_plan = deepcopy(restored)
     session.confirmed_movie_plan = replace(deepcopy(restored), confirmed=True)
     session.movie_plan_revisions.append(deepcopy(restored))
     session.current_movie_plan_id = restored.plan_id
+    session.current_movie_plan_version = restored.movie_plan_version
+    session.current_movie_plan_fingerprint = restored.movie_plan_fingerprint
+    session.current_movie_plan_lineage_token = restored.movie_plan_lineage_token
     session.previous_movie_plan_id = old_id
     version_record = MoviePlanVersionRecord(
         movie_plan_id=restored.plan_id,
-        version=_next_version(session.movie_plan_version_history),
+        version=restored.movie_plan_version,
         source="rollback",
         parent_movie_plan_id=old_id,
         created_by=command.confirmed_by,
         reason=command.rollback_reason,
         snapshot=deepcopy(as_plain_data(restored)),
         metadata=deepcopy(command.metadata),
+        movie_plan_fingerprint=restored.movie_plan_fingerprint,
+        movie_plan_lineage_token=restored.movie_plan_lineage_token,
     )
     session.movie_plan_version_history.append(version_record.to_dict())
     invalidation = invalidate_downstream_after_movie_plan_change(
@@ -578,6 +654,9 @@ def rollback_revision_to_session(
         invalidated_artifacts=invalidation.invalidated,
         stop_reason="rolled_back",
         succeeded=True,
+        previous_movie_plan_version=current.movie_plan_version,
+        restored_movie_plan_version=restored.movie_plan_version,
+        restored_movie_plan_fingerprint=restored.movie_plan_fingerprint,
     )
     session.revision_rollback_results.append(result.to_dict())
     session.stage = session.stage.__class__.MOVIE_PLAN_ROLLED_BACK

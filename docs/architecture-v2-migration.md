@@ -628,3 +628,206 @@ Provider，但会先确认 VideoJob 的三条来源链；不匹配时拒绝并�
 本阶段没有实现 Provider Runtime、submit/poll/download、Agnes/Veo/Sora/Kling 接入或
 MP4 生成。`VideoJob` 仍然是未来 Provider Runtime 的唯一输入边界；只有后续 Phase 5
 才允许进入 Provider 执行。
+
+### Phase 4F：Immutable MoviePlan Version & Content Fingerprint（本阶段）
+
+Phase 4F 在 ID lineage 之上增加不可变的 MoviePlan 内容身份：
+
+```text
+MoviePlan
+  ├─ movie_plan_version
+  ├─ movie_plan_fingerprint (SHA-256)
+  └─ movie_plan_lineage_token
+        │
+        ▼
+FilmIR → MovieIR → VideoJob
+```
+
+`CanonicalSerializer` / `FingerprintBuilder` 只对创作内容做规范化 JSON 和 SHA-256。
+序列化会排除 plan identity、revision/confirmed、版本和 token，以及 metadata、诊断、
+cache、runtime、provider、artifact、task、endpoint、时间戳等会变化的状态；因此同一
+创作内容不会因为 Session 保存时间或运行环境变化而得到不同 fingerprint。fingerprint
+不是安全签名，也不包含 API key 或 Provider payload。
+
+`MoviePlan` 初始版本为 1。显式 Apply 时先重新计算 candidate fingerprint：内容发生
+变化才递增 version，并用新的 plan id、version、fingerprint 生成 lineage token；旧
+快照连同 fingerprint/token 进入 `MoviePlanVersionRecord`。显式 Rollback 使用历史快照
+中原有的 version/fingerprint/token，不把恢复动作伪装成新的创作版本；Apply/Rollback
+都继续执行完整 MoviePlan revalidation，并清空下游 active IR/VideoJob。
+
+FilmIR 保存 `source_movie_plan_version`、`source_movie_plan_fingerprint` 和
+`source_movie_plan_lineage_token`；MovieIR 继续保存这三项并增加
+`source_film_ir_fingerprint`；VideoJob 继续作为 Provider Runtime 的唯一输入边界，
+同时携带 MoviePlan、FilmIR、MovieIR 的 provenance。旧 IR/VideoJob 缺字段时仍可反
+序列化加载，但 `SourceLineageGuard` 会输出 `unknown_lineage`，不会静默复用旧产物。
+
+旧 Session 迁移只为当前 MoviePlan 计算缺失 provenance，并默认填充三个 current
+字段；不会重新调用 DirectorAgent、不会重写历史快照。`/diagnostics` 显示当前
+MoviePlan 的 ID、version、fingerprint、lineage token，以及各级 artifact 的
+fresh/stale/unknown 状态。
+
+本阶段没有改变 Revision Guard 的决策语义，没有自动 Apply，没有 Creative Analysis /
+Creative Graph / Creative Optimizer，也没有实现 Provider Runtime、submit/poll/download、
+Agnes/Veo/Sora/Kling 接入或 MP4 生成。
+
+### Phase 4G：Immutable ExecutionPlan Contract（本阶段）
+
+Phase 4G 在 MovieIR 之后增加不可变的执行编译后端，但不改变 MoviePlan、FilmIR 或
+MovieIR 的创作语义：
+
+```text
+MovieIR
+  ↓
+ExecutionPlanCompiler
+  ↓
+ExecutionBundle
+  ├── ExecutionPlan
+  └── VideoJobs[]
+```
+
+`ExecutionPlan` 描述静态执行单元、显式 DAG、ProviderAssignment、runtime policy、
+reference-frame strategy、artifact policy 和 capability snapshot。每个 `ExecutionUnit`
+同时保存 `video_job_id` 与 `video_job_fingerprint`；`DependencyEdge` 是唯一的显式依赖
+图来源，`depends_on` 由同一 lowering 规则生成并由校验器强制一致。ExecutionPlan 不保存
+Provider task ID、runtime status、retry count、last error、download path、API key、endpoint
+或 HTTP payload。
+
+`ExecutionBundle` 将一个 ExecutionPlan 与其引用的 VideoJob 集合绑定。校验器 fail-closed
+检查 dangling/duplicate VideoJob、unit fingerprint、DAG 自引用与环、reference-frame 边、
+capability snapshot、ExecutionPlan fingerprint 和 Bundle fingerprint。VideoJob 的稳定
+fingerprint 覆盖 Provider 输入及来源 provenance，排除 job ID、创建时间和 runtime 状态；
+Bundle fingerprint 对排序后的 `{video_job_id, video_job_fingerprint}` 计算。
+
+Session 新增 `execution_plan`、`execution_bundle`、current fingerprint 指针、诊断和
+`stale_execution_artifacts`。MoviePlan Apply/Rollback 或 MovieIR rebuild 会使旧
+ExecutionPlan/Bundle 失效，但不会自动 Apply、rebuild 或运行。旧 Session 缺少这些字段时
+仍可加载；新 Bundle 恢复时会执行完整结构和 fingerprint 校验。
+
+CLI 新增 `/build-execution-plan`、`/show-execution-plan` 和 `/validate-execution-plan`。
+旧 `/compile` 继续生成兼容的 V2 VideoJob，不被新入口替换；`/render` 在本阶段只做离线
+边界提示。Phase 4G 没有调用 Agnes、Veo、Sora、Kling，没有实现 submit/poll/download，
+没有实现真实 ExecutionRuntime 或 ProviderRuntime，没有生成 ProviderJob、Artifact 或 MP4。
+
+### Phase 5A：Offline Durable Execution Runtime（本阶段）
+
+Phase 5A 只接受已经校验的 `ExecutionBundle`，不重新编译 MovieIR、ExecutionPlan
+或 VideoJob：
+
+```text
+ExecutionBundle
+    ↓
+ExecutionRuntime
+    ├── Runtime State Store + append-only Event Store
+    ├── Checkpoint Store
+    ├── DependencyResolver / Lease / TransitionService
+    ├── ProviderRuntimeRegistry
+    │       └── FakeProviderRuntime
+    └── FakeArtifactVerifier
+```
+
+`ExecutionPlan`、`ExecutionUnit`、`ExecutionBundle` 和 `VideoJob` 仍是不可变编译产物；
+`ExecutionRun`、`ExecutionUnitState`、`ProviderJob`、`SubmissionIntent`、Retry、Lease、
+Artifact 和 Event 都保存在独立 Runtime 状态中。所有状态变更必须经过
+`RuntimeTransitionService`，并写入单调递增的 append-only Event；关键转换生成带
+SHA-256 checksum 的不可覆盖 Checkpoint。Checkpoint、Run 和 Artifact 都绑定
+ExecutionBundle / ExecutionPlan fingerprint 及 MoviePlan provenance。
+
+提交顺序固定为：生成确定性 idempotency key → 持久化 `SubmissionIntent` → checkpoint →
+`PREPARED → SUBMITTING` → ProviderRuntime submit → 保存 ProviderJob →
+`SUBMITTED`。如果 submit 响应丢失，状态变为一等的 `SUBMISSION_UNCERTAIN`；它保留
+intent，不增加普通 retry，也不自动重提，必须人工对账。Retry 按错误分类、静态
+`RetryPolicy`、attempt 和 backoff 限制；poll/download retry 复用已有 ProviderJob，
+不会重新 submit。
+
+Scheduler 只读 ExecutionPlan 的显式 `dependency_graph`、Unit 状态和 RuntimePolicy。
+它不会理解电影内容，也不会跳过 reference-frame 依赖；依赖失败的下游进入
+`BLOCKED`，`max_parallel_units` 控制 Ready Unit 的并发租用。崩溃恢复先校验 Bundle
+fingerprint，再从最新有效 Checkpoint 恢复 PREPARED、SUBMITTED/RUNNING、DOWNLOADING
+或 VERIFIED 状态；已完成 Unit 不重复提交，过期 Lease 会清理。
+
+Phase 5A 的 Provider Registry 只注册显式 `FakeProviderRuntime`。它模拟 success、
+queue/running、可重试错误、不可重试错误、never-complete、download interruption、
+corrupted artifact、cancel 和 submission uncertainty；所有 Fake ProviderJob 使用
+`fake-task-*` 标识并遵守 idempotency。Fake Artifact 是普通 `fake-video.bin` 等离线
+文件，不使用 FFmpeg、不生成 MP4；`FakeArtifactVerifier` 检查文件存在、非空、size、
+SHA-256、artifact type 以及完整 MoviePlan/ExecutionPlan/VideoJob/ProviderJob provenance。
+
+Session 只保存 Runtime 引用和摘要，详细运行状态放在独立 runtime 目录；旧 Session 缺少
+这些字段时按空状态加载。CLI 增加 `/start-execution`、`/step-execution`、
+`/run-execution`、`/resume-execution`、`/cancel-execution`、`/execution-status`、
+`/execution-events` 和 `/execution-checkpoint`。旧 `/compile` 和 `/render` 兼容路径仍
+保持原语义，`/render` 不会偷偷转入 Runtime。
+
+本阶段明确没有调用 Agnes、Veo、Sora、Kling，没有读取真实 API Key，没有发送真实网络
+Provider 请求，没有创建真实 Provider 任务，没有下载真实视频，没有生成 MP4，没有修改
+MovieIR、ExecutionPlan 或 VideoJob，没有自动 Apply、rebuild 或处理
+`SUBMISSION_UNCERTAIN`，也没有接入真实 Artifact Pipeline。
+
+### Phase 5B-1：Provider Runtime Plugin Contract（当前阶段）
+
+Phase 5B-1 将 Provider 接入边界收敛为统一插件契约：
+
+```text
+ExecutionRuntime
+    ↓ ProviderRuntime Protocol
+ProviderRuntimeRegistry
+    ├── FakeProviderRuntime
+    └── MockHttpProviderRuntime
+```
+
+`ProviderRuntime` 只接收 `VideoJob` 和不可变的 `ProviderRequestContext`，不接收
+ExecutionBundle、Session、Story、Scene、MoviePlan、FilmIR 或 MovieIR。Adapter 只做
+协议转换、状态映射、错误归一化和下载/Provider verify，不能修改 Runtime State、执行
+Transition、重建 Prompt 或修改 Compiler IR。
+
+统一契约包括 `ProviderCapabilities`、`ProviderJob`、`ProviderJobStatus`、
+`ProviderSubmitResult`、`ProviderPollResult`、`ProviderCancelResult`、
+`ProviderDownloadResult` 和 `ProviderVerificationResult`。Provider 特定的
+`task_id`、`video_id`、`operation_id` 只在 Adapter 内部使用，持久化的通用句柄统一使用
+`remote_job_id`。Provider 能力指纹只覆盖稳定能力语义，不覆盖 endpoint、API key、
+队列、余额、健康状态或临时限流；与 ExecutionPlan snapshot 不匹配时 fail-closed，
+不会自动重编译 Plan 或切换 Provider。
+
+Provider 错误在 Adapter 边界归一化为 `ProviderErrorCategory` 和脱敏的
+`ProviderRuntimeError`。`SUBMISSION_UNCERTAIN` 与已有 ProviderJob 的
+`ProviderJobStatus.UNKNOWN` 保持分离。Event、Checkpoint、Session、ProviderJob 和
+诊断只能保存递归脱敏后的响应；Authorization、token、cookie、secret、signature 和
+signed URL query 均不得长期明文保存。
+
+`MockHttpTransport` 是唯一的 HTTP 测试入口，不访问外网，可脚本化 202、429、503、断线、
+超时、malformed JSON、签名 URL 和二进制下载。`MockHttpProviderRuntime` 验证 HTTP
+字段到通用契约的映射；下载先写 `.part`，目标路径由 Runtime 提供并在完成后原子 rename。
+Fake Adapter 只做纯内存/文件场景模拟。两者均不生成 MP4。
+
+CLI 新增 `/providers`、`/provider-capabilities <provider_key>` 和
+`/provider-contract-check <fake|mock-http>`；`/execution-status` 会显示 ProviderJob
+通用状态、能力匹配和契约 schema，`/diagnostics` 会显示 Provider 缺失、能力漂移和
+响应脱敏边界。
+
+Phase 5B-1 仍不调用 Agnes、Veo、Kling 或 Sora，不读取真实 API Key，不访问真实
+Provider endpoint，不创建真实 ProviderJob，不下载真实视频，不生成 MP4，不自动处理
+`SUBMISSION_UNCERTAIN`，不自动切换 Provider，不自动 rebuild ExecutionPlan，也不接入
+完整真实 Artifact Pipeline。Agnes Adapter 属于 Phase 5B-2，单镜头真实 API smoke 属于
+Phase 5B-3。
+
+### Phase P1：Low-Risk Architecture Pruning（已完成）
+
+P1 只处理静态审计确认的低风险冗余，不改变运行时语义。删除项为：没有生产、测试、
+文档或序列化引用的 `ReadinessReport`、V2 旧的 `execution.Artifact`、未使用的
+`ProviderErrorMapper` 和 `legacy_capability_fingerprint`。它们没有参与 MoviePlan、IR、
+VideoJob、ExecutionBundle、Session 或 Provider Runtime 的持久化/恢复。
+
+`RetakeRequest`、`OpenAIDirectorRevisionAdapter` 和 `allocate_durations` 保留：前两者仍有
+文档/合约承诺，后者仍属于 legacy timing 测试和生产链。三个历史兼容包装函数保留为薄
+兼容入口并发出 `DeprecationWarning`，不再列入 V2 主 Facade 的声明式 `__all__`。
+
+V2 Facade 从 292 个声明式名称收窄到当前核心边界；stores、checkpoint/event 实现、Fake/Mock
+实现、HTTP test doubles、scheduler transitions、低层 provider result、creative graph 和
+revision history records 不再作为主 Facade 导出，但其源模块和当前 CLI/Session 依赖仍保留。
+这不是删除 Runtime durable state，也不是合并 legacy/V2 VideoJob；现有显式兼容导入暂时继续
+可用，后续再按发布策略迁移。
+
+P1 没有删除或修改 FilmIR、ExecutionPlan、ExecutionBundle、ExecutionRuntime、durable
+state/checkpoint/submission intent、Session persistence schema、`/render`、legacy Agnes
+chain，也没有调用真实 Provider、网络、API key 或生成 MP4。Fake/Mock 仍明确是 offline/test
+support，下一阶段才讨论更深的 core merge 或真实 Provider Adapter。

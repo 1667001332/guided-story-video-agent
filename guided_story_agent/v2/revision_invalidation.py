@@ -11,6 +11,9 @@ _NONE_FIELDS = {
     "movie_ir",
     "v2_video_job",
     "render_manifest",
+    "execution_plan",
+    "execution_bundle",
+    "execution_run",
 }
 _LIST_FIELDS = {
     "film_ir_revisions",
@@ -42,6 +45,9 @@ _LIST_FIELDS = {
     "director_revision_history",
     "source_lineage_diagnostics",
     "stale_lineage_diagnostics",
+    "execution_runtime_diagnostics",
+    "provider_jobs",
+    "runtime_artifacts",
 }
 _DICT_FIELDS = {
     "film_ir_build_metadata",
@@ -61,9 +67,16 @@ _SCALAR_FIELDS = {
     "current_film_ir_id",
     "current_movie_ir_id",
     "current_video_job_id",
+    "current_execution_plan_id",
+    "current_execution_plan_fingerprint",
+    "current_execution_bundle_fingerprint",
+    "current_execution_run_id",
+    "execution_runtime_status",
+    "latest_execution_checkpoint_id",
 }
 _DIAGNOSTIC_FIELDS = {
     "v2_compile_diagnostics",
+    "execution_plan_diagnostics",
 }
 
 
@@ -86,7 +99,7 @@ class DownstreamInvalidationResult:
 def _artifact_identifier(value: Any, field_name: str) -> str:
     if value is None:
         return field_name
-    for key in ("ir_id", "job_id", "artifact_id", "manifest_id", "id"):
+    for key in ("ir_id", "job_id", "artifact_id", "manifest_id", "execution_run_id", "bundle_fingerprint", "id"):
         item = getattr(value, key, None)
         if item:
             return str(item)
@@ -114,6 +127,26 @@ def _mark_stale(session: Any, field_name: str, value: Any, reason: str, source_i
     )
 
 
+def _mark_execution_stale(session: Any, field_name: str, value: Any, reason: str, source_id: str | None) -> None:
+    if value is None or value == [] or value == {}:
+        return
+    stale = getattr(session, "stale_execution_artifacts", None)
+    if stale is None:
+        stale = []
+        setattr(session, "stale_execution_artifacts", stale)
+    identifier = _artifact_identifier(value, field_name)
+    if isinstance(value, dict):
+        identifier = str(value.get("execution_plan_id") or value.get("bundle_fingerprint") or identifier)
+    stale.append(
+        {
+            "artifact_type": field_name,
+            "artifact_id": identifier,
+            "reason": reason,
+            "source_movie_plan_id": source_id,
+        }
+    )
+
+
 def invalidate_downstream_after_movie_plan_change(
     session: Any,
     reason: str,
@@ -129,6 +162,8 @@ def invalidate_downstream_after_movie_plan_change(
             preserved.append(field_name)
             continue
         value = getattr(session, field_name)
+        if field_name in {"execution_plan", "execution_bundle", "execution_run"}:
+            _mark_execution_stale(session, field_name, value, reason, source_movie_plan_id)
         if field_name not in _SCALAR_FIELDS and field_name not in {
             "source_lineage_diagnostics",
             "stale_lineage_diagnostics",

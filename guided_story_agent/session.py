@@ -10,7 +10,7 @@ from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 
 from .agent import IDEA_COUNT, RuleBasedStoryAgent, StoryAgent
@@ -114,6 +114,18 @@ from .v2.revision_apply import (
     rollback_revision_to_session,
 )
 from .v2.lineage import LineageCheckResult, SourceLineageGuard
+from .v2.fingerprint import ensure_movie_plan_provenance, content_fingerprint
+from .v2.execution_plan import ExecutionPlan
+from .v2.execution_bundle import ExecutionBundle
+from .v2.execution_plan_builder import (
+    ExecutionPlanCompileResult,
+    ExecutionPlanCompiler,
+)
+from .v2.execution_plan_validation import validate_execution_bundle
+from .v2.execution_state import ExecutionRun, ExecutionRunStatus, ExecutionState
+from .v2.execution_runtime import ExecutionRuntime, ExecutionRuntimeError
+from .v2.fake_provider_runtime import FakeProviderScenario
+from .v2.provider_registry import ProviderRuntimeRegistry
 from .v2.models import (
     CreativeBrief as V2CreativeBrief,
     MoviePlan as V2MoviePlan,
@@ -141,6 +153,12 @@ CURRENT_STAGES = {
     Stage.FILM_IR_BUILT,
     Stage.MOVIE_IR_BUILT,
     Stage.VIDEO_JOB_COMPILED,
+    Stage.EXECUTION_PLAN_BUILT,
+    Stage.EXECUTION_READY,
+    Stage.EXECUTION_RUNNING,
+    Stage.EXECUTION_BLOCKED,
+    Stage.EXECUTION_COMPLETED,
+    Stage.EXECUTION_FAILED,
     Stage.RENDER_READY,
     Stage.COMPLETED,
 }
@@ -174,7 +192,7 @@ def _state_mutation(method):
 class GuidedStorySession:
     """Single source of truth for the low-pressure idea garden."""
 
-    schema_version = 5
+    schema_version = 7
 
     def __init__(
         self,
@@ -246,6 +264,9 @@ class GuidedStorySession:
         self.revision_apply_results: list[dict[str, Any]] = []
         self.revision_rollback_results: list[dict[str, Any]] = []
         self.current_movie_plan_id: str | None = None
+        self.current_movie_plan_version: int | None = None
+        self.current_movie_plan_fingerprint: str | None = None
+        self.current_movie_plan_lineage_token: str | None = None
         self.previous_movie_plan_id: str | None = None
         self.stale_artifacts: list[dict[str, Any]] = []
         self.source_lineage_diagnostics: list[dict[str, Any]] = []
@@ -266,6 +287,21 @@ class GuidedStorySession:
         self.v2_video_job: V2VideoJob | None = None
         self.v2_compile_diagnostics: list[dict[str, Any]] = []
         self.v2_compile_metadata: dict[str, Any] = {}
+        self.execution_plan: ExecutionPlan | None = None
+        self.execution_bundle: ExecutionBundle | None = None
+        self.current_execution_plan_id: str | None = None
+        self.current_execution_plan_fingerprint: str | None = None
+        self.current_execution_bundle_fingerprint: str | None = None
+        self.execution_plan_diagnostics: list[dict[str, Any]] = []
+        self.stale_execution_artifacts: list[dict[str, Any]] = []
+        self.execution_run: ExecutionRun | None = None
+        self.current_execution_run_id: str | None = None
+        self.execution_runtime_status: str | None = None
+        self.latest_execution_checkpoint_id: str | None = None
+        self.execution_runtime_diagnostics: list[dict[str, Any]] = []
+        self.provider_jobs: list[dict[str, Any]] = []
+        self.runtime_artifacts: list[dict[str, Any]] = []
+        self._execution_runtime: ExecutionRuntime | None = None
         self.render_manifest: RenderManifest | None = None
         self._confirmed_storyboard_signature = ""
         self.legacy_facts = StoryFacts(genre=self.brief.genre)
@@ -274,6 +310,44 @@ class GuidedStorySession:
         self.user_action_count = 0
         self.free_text_count = 0
         self.text_generation_events: list[dict[str, Any]] = []
+
+    def _clear_execution_state(self) -> None:
+        """Clear only the active Phase 4G artifacts; history remains external."""
+
+        if self.execution_run is not None:
+            self.stale_execution_artifacts.append(
+                {
+                    "artifact_type": "execution_run",
+                    "artifact_id": self.execution_run.execution_run_id,
+                    "reason": "upstream MoviePlan/IR changed; runtime invalidated",
+                    "execution_bundle_fingerprint": self.execution_run.execution_bundle_fingerprint,
+                }
+            )
+            if self._execution_runtime is not None:
+                try:
+                    self._execution_runtime.transition_service.mark_run_stale(
+                        self.execution_run,
+                        "upstream MoviePlan/IR changed; runtime invalidated",
+                    )
+                except Exception:
+                    # The Session still records the stale audit entry even if
+                    # an old external runtime store is unavailable.
+                    pass
+
+        self.execution_plan = None
+        self.execution_bundle = None
+        self.current_execution_plan_id = None
+        self.current_execution_plan_fingerprint = None
+        self.current_execution_bundle_fingerprint = None
+        self.execution_plan_diagnostics = []
+        self.execution_run = None
+        self.current_execution_run_id = None
+        self.execution_runtime_status = None
+        self.latest_execution_checkpoint_id = None
+        self.execution_runtime_diagnostics = []
+        self.provider_jobs = []
+        self.runtime_artifacts = []
+        self._execution_runtime = None
 
     def _run_text_operation(
         self,
@@ -421,6 +495,7 @@ class GuidedStorySession:
         self.v2_video_job = None
         self.v2_compile_diagnostics = []
         self.v2_compile_metadata = {}
+        self._clear_execution_state()
         self.film_ir = None
         self.film_ir_revisions = []
         self.film_ir_build_diagnostics = []
@@ -661,11 +736,15 @@ class GuidedStorySession:
             revision=len(self.movie_plan_revisions) + 1,
             confirmed=False,
         )
+        plan = ensure_movie_plan_provenance(plan, version=1)
         self.direction = cleaned_direction
         self.brief.resolved_target_seconds = brief.target_duration_seconds
         self.previous_movie_plan_id = self.current_movie_plan_id
         self.movie_plan = plan
         self.current_movie_plan_id = plan.plan_id
+        self.current_movie_plan_version = plan.movie_plan_version
+        self.current_movie_plan_fingerprint = plan.movie_plan_fingerprint
+        self.current_movie_plan_lineage_token = plan.movie_plan_lineage_token
         self.current_film_ir_id = None
         self.current_movie_ir_id = None
         self.current_video_job_id = None
@@ -676,6 +755,7 @@ class GuidedStorySession:
         self.v2_video_job = None
         self.v2_compile_diagnostics = []
         self.v2_compile_metadata = {}
+        self._clear_execution_state()
         self.film_ir = None
         self.film_ir_revisions = []
         self.film_ir_build_diagnostics = []
@@ -741,6 +821,7 @@ class GuidedStorySession:
             Stage.FILM_IR_BUILT,
             Stage.MOVIE_IR_BUILT,
             Stage.VIDEO_JOB_COMPILED,
+            Stage.EXECUTION_PLAN_BUILT,
         }:
             raise RuntimeError("当前阶段不是 V2 MoviePlan 已确认阶段。")
         self.creative_pass_diagnostics = []
@@ -765,6 +846,7 @@ class GuidedStorySession:
         self.current_film_ir_id = None
         self.current_movie_ir_id = None
         self.current_video_job_id = None
+        self._clear_execution_state()
         self.stage = Stage.MOVIE_PLAN_CONFIRMED
         result = FilmIRBuilder().build(deepcopy(self.confirmed_movie_plan))
         self.film_ir_build_diagnostics = [
@@ -776,6 +858,8 @@ class GuidedStorySession:
         ]
         self.film_ir_build_metadata = {
             "source_movie_plan_id": self.confirmed_movie_plan.plan_id,
+            "source_movie_plan_version": self.confirmed_movie_plan.movie_plan_version,
+            "source_movie_plan_fingerprint": self.confirmed_movie_plan.movie_plan_fingerprint,
             "error_count": len(result.errors),
         }
         if not result.ok or result.film_ir is None:
@@ -837,6 +921,7 @@ class GuidedStorySession:
         self.v2_video_job = None
         self.v2_compile_diagnostics = []
         self.v2_compile_metadata = {}
+        self._clear_execution_state()
         self.stage = Stage.FILM_IR_BUILT
         self._snapshot("film_ir", optimizer_result.after_ir.to_dict(), confirmed=True)
         self.refresh_source_lineage_diagnostics()
@@ -1158,6 +1243,7 @@ class GuidedStorySession:
             Stage.FILM_IR_BUILT,
             Stage.MOVIE_IR_BUILT,
             Stage.VIDEO_JOB_COMPILED,
+            Stage.EXECUTION_PLAN_BUILT,
         }:
             raise RuntimeError("当前阶段不是 V2 FilmIR 已构建阶段。")
         self.movie_ir_optimizer_diagnostics = []
@@ -1165,6 +1251,7 @@ class GuidedStorySession:
         self.v2_video_job = None
         self.current_movie_ir_id = None
         self.current_video_job_id = None
+        self._clear_execution_state()
         self.stage = Stage.FILM_IR_BUILT
         result = MovieIRBuilder().build(deepcopy(self.film_ir))
         self.movie_ir_build_diagnostics = [
@@ -1176,7 +1263,10 @@ class GuidedStorySession:
         ]
         self.movie_ir_build_metadata = {
             "source_movie_plan_id": self.film_ir.source_movie_plan_id,
+            "source_movie_plan_version": self.film_ir.source_movie_plan_version,
+            "source_movie_plan_fingerprint": self.film_ir.source_movie_plan_fingerprint,
             "source_film_ir_id": self.film_ir.ir_id,
+            "source_film_ir_fingerprint": result.movie_ir.source_film_ir_fingerprint if result.movie_ir else "",
             "error_count": len(result.errors),
         }
         if not result.ok or result.movie_ir is None:
@@ -1206,6 +1296,7 @@ class GuidedStorySession:
         self.v2_video_job = None
         self.v2_compile_diagnostics = []
         self.v2_compile_metadata = {}
+        self._clear_execution_state()
         self.stage = Stage.MOVIE_IR_BUILT
         self._snapshot("movie_ir", optimizer_result.after_ir.to_dict(), confirmed=True)
         self.refresh_source_lineage_diagnostics()
@@ -1267,11 +1358,344 @@ class GuidedStorySession:
         self.refresh_source_lineage_diagnostics()
         return result
 
+    @_state_mutation
+    def build_execution_plan(
+        self,
+        capabilities: V2ProviderCapabilities | None = None,
+        options: CompilationOptions | None = None,
+    ) -> ExecutionPlanCompileResult:
+        """Lower MovieIR into an immutable ExecutionBundle only.
+
+        This method never submits, polls, downloads, creates ProviderJob, or
+        generates an artifact.  The historical ``/compile`` path remains a
+        separate VideoJob compatibility entrypoint.
+        """
+
+        if not self.v2_enabled:
+            raise RuntimeError("V2 DirectorAgent 未启用，请使用 --v2。")
+        if self.confirmed_movie_plan is None:
+            raise RuntimeError("必须先确认 MoviePlan，才能构建 ExecutionPlan。")
+        if self.film_ir is None:
+            raise RuntimeError("必须先执行 /build-film-ir，才能构建 ExecutionPlan。")
+        if self.movie_ir is None:
+            raise RuntimeError("必须先执行 /build-ir，才能构建 ExecutionPlan。")
+        self._require_movie_ir_lineage()
+        if self.stage not in {Stage.MOVIE_IR_BUILT, Stage.EXECUTION_PLAN_BUILT}:
+            raise RuntimeError("当前阶段不是 V2 MovieIR 已构建阶段。")
+        provider_capabilities = capabilities or V2ProviderCapabilities(
+            provider_key="offline-v2",
+            provider_profile="offline",
+            supports_long_video=True,
+            supports_multi_scene_prompt=True,
+            supports_reference_images=True,
+            supports_character_reference=True,
+            supports_audio=True,
+        )
+        result = ExecutionPlanCompiler().compile(
+            deepcopy(self.movie_ir),
+            provider_capabilities,
+            options,
+        )
+        self.execution_plan_diagnostics = [
+            {"kind": "error", "code": item.code, "message": item.message, "path": item.path}
+            for item in result.errors
+        ] + [
+            {"kind": "warning", "code": item.code, "message": item.message, "path": item.path}
+            for item in result.warnings
+        ]
+        self.execution_plan = None
+        self.execution_bundle = None
+        self.current_execution_plan_id = None
+        self.current_execution_plan_fingerprint = None
+        self.current_execution_bundle_fingerprint = None
+        if not result.success or result.bundle is None:
+            self.refresh_source_lineage_diagnostics()
+            return result
+        self.execution_plan = result.bundle.execution_plan
+        self.execution_bundle = result.bundle
+        self.current_execution_plan_id = result.bundle.execution_plan.execution_plan_id
+        self.current_execution_plan_fingerprint = result.bundle.execution_plan.execution_plan_fingerprint
+        self.current_execution_bundle_fingerprint = result.bundle.bundle_fingerprint
+        self.stage = Stage.EXECUTION_PLAN_BUILT
+        self._snapshot("execution_bundle", result.bundle.to_dict(), confirmed=True)
+        self.refresh_source_lineage_diagnostics()
+        return result
+
+    def validate_current_execution_plan(self):
+        """Validate the active bundle without rebuilding or running it."""
+
+        return validate_execution_bundle(self.execution_bundle)
+
+    def _execution_runtime_for(
+        self,
+        *,
+        runtime: ExecutionRuntime | None = None,
+        runtime_root: str | Path | None = None,
+        provider_registry: ProviderRuntimeRegistry | None = None,
+        scenario: FakeProviderScenario | str | None = None,
+    ) -> ExecutionRuntime:
+        if runtime is not None:
+            self._execution_runtime = runtime
+            return runtime
+        if self.execution_bundle is None:
+            raise RuntimeError("必须先执行 /build-execution-plan，才能启动 ExecutionRuntime。")
+        if self._execution_runtime is not None:
+            if provider_registry is not None:
+                self._execution_runtime.provider_registry = provider_registry
+            return self._execution_runtime
+        keys = tuple(
+            assignment.provider_key
+            for assignment in self.execution_bundle.execution_plan.provider_assignments
+        )
+        registry = provider_registry or ProviderRuntimeRegistry.with_fake(
+            provider_keys=keys or ("fake",),
+            scenario=scenario,
+        )
+        self._execution_runtime = ExecutionRuntime(
+            self.execution_bundle,
+            provider_registry=registry,
+            artifact_root=runtime_root or Path(".guided-story-runtime"),
+        )
+        # A loaded Session may contain a summary while the independent JSON
+        # store is unavailable.  Seed only that exact run; never rebuild it.
+        if self.execution_run is not None:
+            try:
+                self._execution_runtime.state_store.load_run(self.execution_run.execution_run_id)
+            except FileNotFoundError:
+                self._execution_runtime.state_store.create_run(self.execution_run)
+        return self._execution_runtime
+
+    def _sync_execution_runtime(self, run: ExecutionRun) -> ExecutionRun:
+        self.execution_run = run
+        self.current_execution_run_id = run.execution_run_id
+        self.execution_runtime_status = run.status.value
+        self.latest_execution_checkpoint_id = run.latest_checkpoint_id
+        self.provider_jobs = [job.to_dict() for job in run.provider_jobs.values()]
+        self.runtime_artifacts = [dict(item) for item in run.artifacts.values()]
+        self.execution_runtime_diagnostics = [
+            {"code": "runtime_diagnostic", "message": item} for item in run.diagnostics
+        ]
+        if self._execution_runtime is not None:
+            self.execution_runtime_diagnostics.extend(self._execution_runtime.capability_diagnostics)
+        if any(state.state is ExecutionState.SUBMISSION_UNCERTAIN for state in run.unit_states.values()):
+            self.execution_runtime_diagnostics.append(
+                {
+                    "code": "submission_uncertain",
+                    "message": "Provider 是否受理无法确认；禁止自动重提，需要人工对账。",
+                }
+            )
+        if run.status == ExecutionRunStatus.COMPLETED:
+            self.stage = Stage.EXECUTION_COMPLETED
+        elif run.status == ExecutionRunStatus.BLOCKED:
+            self.stage = Stage.EXECUTION_BLOCKED
+        elif run.status == ExecutionRunStatus.FAILED:
+            self.stage = Stage.EXECUTION_FAILED
+        elif run.status == ExecutionRunStatus.RUNNING:
+            self.stage = Stage.EXECUTION_RUNNING
+        elif run.status == ExecutionRunStatus.CANCELLED:
+            self.stage = Stage.EXECUTION_BLOCKED
+        else:
+            self.stage = Stage.EXECUTION_READY
+        return run
+
+    @_state_mutation
+    def start_execution(
+        self,
+        *,
+        runtime: ExecutionRuntime | None = None,
+        runtime_root: str | Path | None = None,
+        provider_registry: ProviderRuntimeRegistry | None = None,
+        scenario: FakeProviderScenario | str | None = None,
+    ) -> ExecutionRun:
+        """Create a durable offline run without submitting any Provider job."""
+
+        validation = self.validate_current_execution_plan()
+        if not validation.valid or self.execution_bundle is None:
+            raise RuntimeError("ExecutionBundle 无效；请先重新执行 /build-execution-plan。")
+        self.refresh_source_lineage_diagnostics()
+        execution_lineage = SourceLineageGuard().check_execution_bundle(
+            self.execution_bundle,
+            current_movie_plan_id=self.current_movie_plan_id or "",
+            current_movie_plan_version=self.current_movie_plan_version,
+            current_movie_plan_fingerprint=self.current_movie_plan_fingerprint,
+            current_movie_plan_lineage_token=self.current_movie_plan_lineage_token,
+            current_film_ir_id=self.current_film_ir_id or "",
+            current_film_ir_fingerprint=content_fingerprint(self.film_ir.to_dict()) if self.film_ir else None,
+            current_movie_ir_id=self.current_movie_ir_id or "",
+            current_movie_ir_fingerprint=content_fingerprint(self.movie_ir.to_dict()) if self.movie_ir else None,
+        )
+        if not execution_lineage.valid:
+            raise RuntimeError("ExecutionBundle stale；请先重新执行 /build-execution-plan。")
+        runner = self._execution_runtime_for(
+            runtime=runtime,
+            runtime_root=runtime_root,
+            provider_registry=provider_registry,
+            scenario=scenario,
+        )
+        try:
+            run = runner.create_run(self.execution_bundle)
+        except ExecutionRuntimeError as exc:
+            self.execution_runtime_diagnostics = list(runner.capability_diagnostics) or [
+                {"code": "execution_runtime_start_failed", "message": str(exc)}
+            ]
+            raise
+        return self._sync_execution_runtime(run)
+
+    @_state_mutation
+    def step_execution(
+        self,
+        *,
+        runtime: ExecutionRuntime | None = None,
+        runtime_root: str | Path | None = None,
+        provider_registry: ProviderRuntimeRegistry | None = None,
+        scenario: FakeProviderScenario | str | None = None,
+    ) -> ExecutionRun:
+        if self.current_execution_run_id is None:
+            raise RuntimeError("当前没有 ExecutionRun；请先执行 /start-execution。")
+        runner = self._execution_runtime_for(
+            runtime=runtime,
+            runtime_root=runtime_root,
+            provider_registry=provider_registry,
+            scenario=scenario,
+        )
+        run = runner.step(self.current_execution_run_id)
+        return self._sync_execution_runtime(run)
+
+    @_state_mutation
+    def run_execution(
+        self,
+        *,
+        max_steps: int = 100,
+        runtime: ExecutionRuntime | None = None,
+        runtime_root: str | Path | None = None,
+        provider_registry: ProviderRuntimeRegistry | None = None,
+        scenario: FakeProviderScenario | str | None = None,
+    ) -> ExecutionRun:
+        if self.current_execution_run_id is None:
+            raise RuntimeError("当前没有 ExecutionRun；请先执行 /start-execution。")
+        runner = self._execution_runtime_for(
+            runtime=runtime,
+            runtime_root=runtime_root,
+            provider_registry=provider_registry,
+            scenario=scenario,
+        )
+        run = runner.run_until_blocked_or_complete(self.current_execution_run_id, max_steps=max_steps)
+        return self._sync_execution_runtime(run)
+
+    @_state_mutation
+    def resume_execution(
+        self,
+        *,
+        runtime: ExecutionRuntime | None = None,
+        runtime_root: str | Path | None = None,
+        provider_registry: ProviderRuntimeRegistry | None = None,
+        scenario: FakeProviderScenario | str | None = None,
+    ) -> ExecutionRun:
+        if self.current_execution_run_id is None:
+            raise RuntimeError("当前没有 ExecutionRun；请先执行 /start-execution。")
+        runner = self._execution_runtime_for(
+            runtime=runtime,
+            runtime_root=runtime_root,
+            provider_registry=provider_registry,
+            scenario=scenario,
+        )
+        run = runner.resume(self.current_execution_run_id)
+        return self._sync_execution_runtime(run)
+
+    @_state_mutation
+    def cancel_execution(
+        self,
+        *,
+        unit_id: str | None = None,
+        runtime: ExecutionRuntime | None = None,
+        runtime_root: str | Path | None = None,
+        provider_registry: ProviderRuntimeRegistry | None = None,
+        scenario: FakeProviderScenario | str | None = None,
+    ) -> ExecutionRun:
+        if self.current_execution_run_id is None:
+            raise RuntimeError("当前没有可取消的 ExecutionRun。")
+        runner = self._execution_runtime_for(
+            runtime=runtime,
+            runtime_root=runtime_root,
+            provider_registry=provider_registry,
+            scenario=scenario,
+        )
+        if unit_id:
+            run = runner.cancel_unit(self.current_execution_run_id, unit_id)
+        else:
+            run = runner.cancel(self.current_execution_run_id)
+        return self._sync_execution_runtime(run)
+
+    def execution_status(self, *, runtime_root: str | Path | None = None) -> dict[str, Any]:
+        if self.current_execution_run_id is None:
+            return {
+                "execution_run_id": None,
+                "status": None,
+                "execution_bundle_fingerprint": self.current_execution_bundle_fingerprint,
+            }
+        runner = self._execution_runtime
+        if runner is None and runtime_root is not None:
+            runner = self._execution_runtime_for(runtime_root=runtime_root)
+        if runner is not None:
+            return runner.inspect(self.current_execution_run_id)
+        run = self.execution_run
+        counts: dict[str, int] = {}
+        if run is not None:
+            for state in run.unit_states.values():
+                counts[state.state.value] = counts.get(state.state.value, 0) + 1
+        return {
+            "execution_run_id": self.current_execution_run_id,
+            "execution_bundle_fingerprint": self.current_execution_bundle_fingerprint,
+            "status": self.execution_runtime_status,
+            "unit_state_counts": counts,
+            "ready_units": [],
+            "running_units": [],
+            "blocked_units": [],
+            "failed_units": [],
+            "submission_uncertain_units": [],
+            "latest_checkpoint_id": self.latest_execution_checkpoint_id,
+            "provider_submit_counts": {},
+            "provider_poll_counts": {},
+            "artifact_count": len(self.runtime_artifacts),
+            "diagnostics": list(self.execution_runtime_diagnostics),
+        }
+
+    def execution_events(
+        self,
+        *,
+        limit: int | None = None,
+        runtime_root: str | Path | None = None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if self.current_execution_run_id is None:
+            return ()
+        runner = self._execution_runtime
+        if runner is None and runtime_root is not None:
+            runner = self._execution_runtime_for(runtime_root=runtime_root)
+        return runner.events(self.current_execution_run_id, limit=limit) if runner is not None else ()
+
     def refresh_source_lineage_diagnostics(self) -> LineageCheckResult:
         """Recompute persisted source/stale diagnostics without rebuilding anything."""
 
         result = SourceLineageGuard().check_session(self)
         records = [item.to_dict() for item in result.diagnostics]
+        if self.execution_bundle is not None:
+            plan_id, _, _ = self._lineage_ids()
+            execution_result = SourceLineageGuard().check_execution_bundle(
+                self.execution_bundle,
+                current_movie_plan_id=plan_id or "",
+                current_movie_plan_version=self.current_movie_plan_version,
+                current_movie_plan_fingerprint=self.current_movie_plan_fingerprint,
+                current_movie_plan_lineage_token=self.current_movie_plan_lineage_token,
+                current_film_ir_id=self.current_film_ir_id or "",
+                current_film_ir_fingerprint=(
+                    content_fingerprint(self.film_ir.to_dict()) if self.film_ir is not None else None
+                ),
+                current_movie_ir_id=self.current_movie_ir_id or "",
+                current_movie_ir_fingerprint=(
+                    content_fingerprint(self.movie_ir.to_dict()) if self.movie_ir is not None else None
+                ),
+            )
+            records.extend(item.to_dict() for item in execution_result.diagnostics)
         self.source_lineage_diagnostics = records
         self.stale_lineage_diagnostics = [
             item for item in records if item.get("severity") in {"error", "warning"}
@@ -1321,6 +1745,9 @@ class GuidedStorySession:
             current_story_plan_id=story_id or "",
             current_director_plan_id=director_id or "",
             current_film_ir_id=self.current_film_ir_id or "",
+            current_movie_plan_version=self.current_movie_plan_version,
+            current_movie_plan_fingerprint=self.current_movie_plan_fingerprint,
+            current_movie_plan_lineage_token=self.current_movie_plan_lineage_token,
         )
         self._store_lineage_result((result,))
         if not result.valid:
@@ -1335,12 +1762,19 @@ class GuidedStorySession:
             current_story_plan_id=story_id or "",
             current_director_plan_id=director_id or "",
             current_film_ir_id=self.current_film_ir_id or "",
+            current_movie_plan_version=self.current_movie_plan_version,
+            current_movie_plan_fingerprint=self.current_movie_plan_fingerprint,
+            current_movie_plan_lineage_token=self.current_movie_plan_lineage_token,
         )
         movie_result = guard.check_movie_ir(
             self.movie_ir,
             current_movie_plan_id=plan_id or "",
             current_film_ir_id=self.current_film_ir_id or "",
             current_movie_ir_id=self.current_movie_ir_id or "",
+            current_movie_plan_version=self.current_movie_plan_version,
+            current_movie_plan_fingerprint=self.current_movie_plan_fingerprint,
+            current_movie_plan_lineage_token=self.current_movie_plan_lineage_token,
+            current_film_ir_fingerprint=content_fingerprint(self.film_ir.to_dict()) if self.film_ir else None,
         )
         results = (film_result, movie_result)
         self._store_lineage_result(results)
@@ -1355,6 +1789,11 @@ class GuidedStorySession:
             current_film_ir_id=self.current_film_ir_id or "",
             current_movie_ir_id=self.current_movie_ir_id or "",
             current_video_job_id=self.current_video_job_id or "",
+            current_movie_plan_version=self.current_movie_plan_version,
+            current_movie_plan_fingerprint=self.current_movie_plan_fingerprint,
+            current_movie_plan_lineage_token=self.current_movie_plan_lineage_token,
+            current_film_ir_fingerprint=content_fingerprint(self.film_ir.to_dict()) if self.film_ir else None,
+            current_movie_ir_fingerprint=content_fingerprint(self.movie_ir.to_dict()) if self.movie_ir else None,
         )
         self._store_lineage_result((result,))
         if not result.valid:
@@ -2616,6 +3055,9 @@ class GuidedStorySession:
                 "revision_apply_results": deepcopy(self.revision_apply_results),
                 "revision_rollback_results": deepcopy(self.revision_rollback_results),
                 "current_movie_plan_id": self.current_movie_plan_id,
+                "current_movie_plan_version": self.current_movie_plan_version,
+                "current_movie_plan_fingerprint": self.current_movie_plan_fingerprint,
+                "current_movie_plan_lineage_token": self.current_movie_plan_lineage_token,
                 "previous_movie_plan_id": self.previous_movie_plan_id,
                 "stale_artifacts": deepcopy(self.stale_artifacts),
                 "source_lineage_diagnostics": deepcopy(self.source_lineage_diagnostics),
@@ -2640,6 +3082,20 @@ class GuidedStorySession:
                 "v2_video_job": v2_plain_data(self.v2_video_job) if self.v2_video_job else None,
                 "v2_compile_diagnostics": deepcopy(self.v2_compile_diagnostics),
                 "v2_compile_metadata": deepcopy(self.v2_compile_metadata),
+                "execution_plan": self.execution_plan.to_dict() if self.execution_plan else None,
+                "execution_bundle": self.execution_bundle.to_dict() if self.execution_bundle else None,
+                "current_execution_plan_id": self.current_execution_plan_id,
+                "current_execution_plan_fingerprint": self.current_execution_plan_fingerprint,
+                "current_execution_bundle_fingerprint": self.current_execution_bundle_fingerprint,
+                "execution_plan_diagnostics": deepcopy(self.execution_plan_diagnostics),
+                "stale_execution_artifacts": deepcopy(self.stale_execution_artifacts),
+                "execution_run": self.execution_run.to_dict() if self.execution_run else None,
+                "current_execution_run_id": self.current_execution_run_id,
+                "execution_runtime_status": self.execution_runtime_status,
+                "latest_execution_checkpoint_id": self.latest_execution_checkpoint_id,
+                "execution_runtime_diagnostics": deepcopy(self.execution_runtime_diagnostics),
+                "provider_jobs": deepcopy(self.provider_jobs),
+                "runtime_artifacts": deepcopy(self.runtime_artifacts),
                 "render_manifest": to_plain_data(self.render_manifest)
                 if self.render_manifest
                 else None,
@@ -2763,9 +3219,40 @@ class GuidedStorySession:
             if raw_id is not None and not isinstance(raw_id, str):
                 raise ValueError(f"{field_name} 必须是字符串或 null。")
             setattr(session, field_name, raw_id)
+        raw_version = data.get("current_movie_plan_version")
+        if raw_version is not None and (isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 1):
+            raise ValueError("current_movie_plan_version 必须是正整数或 null。")
+        session.current_movie_plan_version = raw_version
+        for field_name in ("current_movie_plan_fingerprint", "current_movie_plan_lineage_token"):
+            raw_value = data.get(field_name)
+            if raw_value is not None and not isinstance(raw_value, str):
+                raise ValueError(f"{field_name} 必须是字符串或 null。")
+            setattr(session, field_name, raw_value)
         if session.current_movie_plan_id is None:
             current_plan = session.confirmed_movie_plan or session.movie_plan
             session.current_movie_plan_id = current_plan.plan_id if current_plan else None
+        current_plan = session.confirmed_movie_plan or session.movie_plan
+        if current_plan is not None:
+            # Phase 4F migration is deterministic and does not regenerate the
+            # plan or rewrite historical snapshots.
+            migrated_plan = ensure_movie_plan_provenance(current_plan)
+            if session.confirmed_movie_plan is not None:
+                session.confirmed_movie_plan = replace(
+                    session.confirmed_movie_plan,
+                    movie_plan_version=migrated_plan.movie_plan_version,
+                    movie_plan_fingerprint=migrated_plan.movie_plan_fingerprint,
+                    movie_plan_lineage_token=migrated_plan.movie_plan_lineage_token,
+                )
+            if session.movie_plan is not None:
+                session.movie_plan = replace(
+                    session.movie_plan,
+                    movie_plan_version=migrated_plan.movie_plan_version,
+                    movie_plan_fingerprint=migrated_plan.movie_plan_fingerprint,
+                    movie_plan_lineage_token=migrated_plan.movie_plan_lineage_token,
+                )
+            session.current_movie_plan_version = session.current_movie_plan_version or migrated_plan.movie_plan_version
+            session.current_movie_plan_fingerprint = session.current_movie_plan_fingerprint or migrated_plan.movie_plan_fingerprint
+            session.current_movie_plan_lineage_token = session.current_movie_plan_lineage_token or migrated_plan.movie_plan_lineage_token
         if data.get("film_ir"):
             session.film_ir = FilmIR.from_dict(data["film_ir"])
         session.film_ir_revisions = [
@@ -2971,6 +3458,67 @@ class GuidedStorySession:
         if not isinstance(raw_compile_metadata, dict):
             raise ValueError("v2_compile_metadata 必须是 JSON 对象。")
         session.v2_compile_metadata = deepcopy(raw_compile_metadata)
+        if data.get("execution_plan"):
+            session.execution_plan = ExecutionPlan.from_dict(data["execution_plan"])
+        if data.get("execution_bundle"):
+            session.execution_bundle = ExecutionBundle.from_dict(data["execution_bundle"])
+            if session.execution_plan is None:
+                session.execution_plan = session.execution_bundle.execution_plan
+        for field_name in (
+            "current_execution_plan_id",
+            "current_execution_plan_fingerprint",
+            "current_execution_bundle_fingerprint",
+        ):
+            raw_value = data.get(field_name)
+            if raw_value is not None and not isinstance(raw_value, str):
+                raise ValueError(f"{field_name} 必须是字符串或 null。")
+            setattr(session, field_name, raw_value)
+        raw_execution_diagnostics = data.get("execution_plan_diagnostics", [])
+        if not isinstance(raw_execution_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_execution_diagnostics
+        ):
+            raise ValueError("execution_plan_diagnostics 必须是 JSON 对象数组。")
+        session.execution_plan_diagnostics = deepcopy(raw_execution_diagnostics)
+        raw_stale_execution = data.get("stale_execution_artifacts", [])
+        if not isinstance(raw_stale_execution, list) or any(
+            not isinstance(item, dict) for item in raw_stale_execution
+        ):
+            raise ValueError("stale_execution_artifacts 必须是 JSON 对象数组。")
+        session.stale_execution_artifacts = deepcopy(raw_stale_execution)
+        if data.get("execution_run"):
+            if not isinstance(data["execution_run"], dict):
+                raise ValueError("execution_run 必须是 JSON 对象或 null。")
+            session.execution_run = ExecutionRun.from_dict(data["execution_run"])
+        raw_run_id = data.get("current_execution_run_id")
+        if raw_run_id is not None and not isinstance(raw_run_id, str):
+            raise ValueError("current_execution_run_id 必须是字符串或 null。")
+        session.current_execution_run_id = raw_run_id
+        raw_runtime_status = data.get("execution_runtime_status")
+        if raw_runtime_status is not None and not isinstance(raw_runtime_status, str):
+            raise ValueError("execution_runtime_status 必须是字符串或 null。")
+        session.execution_runtime_status = raw_runtime_status
+        raw_checkpoint_id = data.get("latest_execution_checkpoint_id")
+        if raw_checkpoint_id is not None and not isinstance(raw_checkpoint_id, str):
+            raise ValueError("latest_execution_checkpoint_id 必须是字符串或 null。")
+        session.latest_execution_checkpoint_id = raw_checkpoint_id
+        raw_runtime_diagnostics = data.get("execution_runtime_diagnostics", [])
+        if not isinstance(raw_runtime_diagnostics, list) or any(
+            not isinstance(item, dict) for item in raw_runtime_diagnostics
+        ):
+            raise ValueError("execution_runtime_diagnostics 必须是 JSON 对象数组。")
+        session.execution_runtime_diagnostics = deepcopy(raw_runtime_diagnostics)
+        raw_provider_jobs = data.get("provider_jobs", [])
+        if not isinstance(raw_provider_jobs, list) or any(
+            not isinstance(item, dict) for item in raw_provider_jobs
+        ):
+            raise ValueError("provider_jobs 必须是 JSON 对象数组。")
+        session.provider_jobs = deepcopy(raw_provider_jobs)
+        raw_runtime_artifacts = data.get("runtime_artifacts", [])
+        if not isinstance(raw_runtime_artifacts, list) or any(
+            not isinstance(item, dict) for item in raw_runtime_artifacts
+        ):
+            raise ValueError("runtime_artifacts 必须是 JSON 对象数组。")
+        session.runtime_artifacts = deepcopy(raw_runtime_artifacts)
         if data.get("render_manifest"):
             session.render_manifest = session._manifest_from(data["render_manifest"])
         session.legacy_facts = session._facts_from(data.get("legacy_facts", {}))
@@ -2990,6 +3538,26 @@ class GuidedStorySession:
             session.current_movie_ir_id = session.movie_ir.ir_id
         if session.current_video_job_id is None and session.v2_video_job is not None:
             session.current_video_job_id = session.v2_video_job.job_id
+        if session.execution_bundle is not None:
+            if session.execution_plan is None:
+                session.execution_plan = session.execution_bundle.execution_plan
+            if session.current_execution_plan_id is None:
+                session.current_execution_plan_id = session.execution_bundle.execution_plan.execution_plan_id
+            if session.current_execution_plan_fingerprint is None:
+                session.current_execution_plan_fingerprint = session.execution_bundle.execution_plan.execution_plan_fingerprint
+            if session.current_execution_bundle_fingerprint is None:
+                session.current_execution_bundle_fingerprint = session.execution_bundle.bundle_fingerprint
+        if session.execution_run is not None:
+            if session.current_execution_run_id is None:
+                session.current_execution_run_id = session.execution_run.execution_run_id
+            if session.execution_runtime_status is None:
+                session.execution_runtime_status = session.execution_run.status.value
+            if session.latest_execution_checkpoint_id is None:
+                session.latest_execution_checkpoint_id = session.execution_run.latest_checkpoint_id
+            if not session.provider_jobs:
+                session.provider_jobs = [job.to_dict() for job in session.execution_run.provider_jobs.values()]
+            if not session.runtime_artifacts:
+                session.runtime_artifacts = [dict(item) for item in session.execution_run.artifacts.values()]
         session._validate_loaded_state(schema_version=schema_version)
         session.refresh_source_lineage_diagnostics()
         return session
@@ -3106,6 +3674,12 @@ class GuidedStorySession:
                 raise ValueError("保存的 V2 MoviePlan 无效：" + "；".join(report.errors))
             if self.current_movie_plan_id not in {None, self.movie_plan.plan_id}:
                 raise ValueError("current_movie_plan_id 与当前 MoviePlan 不一致。")
+            if self.current_movie_plan_version not in {None, self.movie_plan.movie_plan_version}:
+                raise ValueError("current_movie_plan_version 与当前 MoviePlan 不一致。")
+            if self.current_movie_plan_fingerprint not in {None, self.movie_plan.movie_plan_fingerprint}:
+                raise ValueError("current_movie_plan_fingerprint 与当前 MoviePlan 不一致。")
+            if self.current_movie_plan_lineage_token not in {None, self.movie_plan.movie_plan_lineage_token}:
+                raise ValueError("current_movie_plan_lineage_token 与当前 MoviePlan 不一致。")
         if any(not isinstance(item, V2MoviePlan) for item in self.movie_plan_revisions):
             raise ValueError("保存的 V2 MoviePlan revisions 无效。")
         if self.confirmed_movie_plan is not None:
@@ -3126,6 +3700,39 @@ class GuidedStorySession:
             report = validate_video_job(self.v2_video_job)
             if not report.valid or not self.v2_video_job.confirmed:
                 raise ValueError("保存的 V2 VideoJob 无效。")
+        if self.execution_plan is not None and self.execution_bundle is None:
+            raise ValueError("保存的 ExecutionPlan 缺少 ExecutionBundle。")
+        if self.execution_bundle is not None:
+            report = validate_execution_bundle(self.execution_bundle)
+            if not report.valid:
+                raise ValueError(
+                    "保存的 ExecutionBundle 无效："
+                    + "；".join(item.message for item in report.diagnostics)
+                )
+            if self.execution_plan is not None and self.execution_plan != self.execution_bundle.execution_plan:
+                raise ValueError("ExecutionPlan 与 ExecutionBundle 中的计划不一致。")
+            if self.current_execution_plan_id not in {None, self.execution_bundle.execution_plan.execution_plan_id}:
+                raise ValueError("current_execution_plan_id 与当前 ExecutionPlan 不一致。")
+            if self.current_execution_plan_fingerprint not in {None, self.execution_bundle.execution_plan.execution_plan_fingerprint}:
+                raise ValueError("current_execution_plan_fingerprint 与当前 ExecutionPlan 不一致。")
+            if self.current_execution_bundle_fingerprint not in {None, self.execution_bundle.bundle_fingerprint}:
+                raise ValueError("current_execution_bundle_fingerprint 与当前 ExecutionBundle 不一致。")
+        if self.execution_run is not None:
+            if self.execution_bundle is None:
+                raise ValueError("保存的 ExecutionRun 缺少 ExecutionBundle。")
+            if self.current_execution_run_id not in {None, self.execution_run.execution_run_id}:
+                raise ValueError("current_execution_run_id 与 ExecutionRun 不一致。")
+            if self.execution_runtime_status not in {None, self.execution_run.status.value}:
+                raise ValueError("execution_runtime_status 与 ExecutionRun 不一致。")
+            # A stale run is retained as audit history.  It is not allowed to
+            # silently become the active input for a newer Bundle.
+            if self.execution_run.execution_bundle_fingerprint != self.execution_bundle.bundle_fingerprint:
+                self.execution_runtime_diagnostics.append(
+                    {
+                        "code": "stale_execution_run",
+                        "message": "ExecutionRun 与当前 ExecutionBundle fingerprint 不一致；禁止 resume/step/run。",
+                    }
+                )
 
         if self.stage == Stage.STORY_REVIEW and self.story is None:
             raise ValueError("故事审查阶段缺少故事。")
@@ -3195,6 +3802,23 @@ class GuidedStorySession:
             or (self.v2_video_job.source_film_ir_id and self.film_ir is None)
         ):
             raise ValueError("V2 VideoJob 已编译阶段缺少 confirmed_movie_plan、film_ir 或 v2_video_job。")
+        if self.stage == Stage.EXECUTION_PLAN_BUILT and (
+            self.confirmed_movie_plan is None
+            or not self.confirmed_movie_plan.confirmed
+            or self.film_ir is None
+            or self.movie_ir is None
+            or self.execution_plan is None
+            or self.execution_bundle is None
+        ):
+            raise ValueError("V2 ExecutionPlan 已构建阶段缺少完整 MoviePlan/FilmIR/MovieIR/ExecutionBundle。")
+        if self.stage in {
+            Stage.EXECUTION_READY,
+            Stage.EXECUTION_RUNNING,
+            Stage.EXECUTION_BLOCKED,
+            Stage.EXECUTION_COMPLETED,
+            Stage.EXECUTION_FAILED,
+        } and self.execution_bundle is None:
+            raise ValueError("Execution Runtime 阶段缺少 ExecutionBundle。")
 
         for kind, cursor in self.revision_cursor.items():
             history = self.revisions.get(kind)
@@ -4142,6 +4766,11 @@ class GuidedStorySession:
             if candidate.source_movie_plan_id != self.confirmed_movie_plan.plan_id:
                 raise ValueError("恢复的 FilmIR 来源 MoviePlan 不一致。")
             return candidate
+        if revision.artifact_type == "execution_bundle":
+            candidate = ExecutionBundle.from_dict(deepcopy(revision.payload))
+            if not validate_execution_bundle(candidate).valid:
+                raise ValueError("恢复的 ExecutionBundle 版本无效。")
+            return candidate
         raise ValueError("未知版本类型。")
 
     def _commit_revision_candidate(self, artifact_type: str, candidate: Any) -> Any:
@@ -4190,13 +4819,23 @@ class GuidedStorySession:
             self.movie_ir = candidate
             self.stage = Stage.MOVIE_IR_BUILT
             self.v2_video_job = None
+            self._clear_execution_state()
             return self.movie_ir
         if artifact_type == "film_ir":
             self.film_ir = candidate
             self.stage = Stage.FILM_IR_BUILT
             self.movie_ir = None
             self.v2_video_job = None
+            self._clear_execution_state()
             return self.film_ir
+        if artifact_type == "execution_bundle":
+            self.execution_bundle = candidate
+            self.execution_plan = candidate.execution_plan
+            self.current_execution_plan_id = candidate.execution_plan.execution_plan_id
+            self.current_execution_plan_fingerprint = candidate.execution_plan.execution_plan_fingerprint
+            self.current_execution_bundle_fingerprint = candidate.bundle_fingerprint
+            self.stage = Stage.EXECUTION_PLAN_BUILT
+            return self.execution_bundle
         raise ValueError("未知版本类型。")
 
     def _load_revisions(self, data: dict[str, Any]) -> None:
@@ -4214,6 +4853,7 @@ class GuidedStorySession:
             "film_ir",
             "movie_ir",
             "v2_video_job",
+            "execution_bundle",
         }
         for raw_kind, entries in raw_revisions.items():
             kind = str(raw_kind)
@@ -4435,6 +5075,13 @@ class GuidedStorySession:
             "source_movie_plan_id",
             "source_movie_ir_id",
             "source_film_ir_id",
+            "source_movie_plan_version",
+            "source_movie_plan_fingerprint",
+            "source_movie_plan_lineage_token",
+            "source_film_ir_fingerprint",
+            "source_movie_ir_fingerprint",
+            "video_job_fingerprint",
+            "schema_version",
             "compiler_version",
             "provider_profile",
             "execution_units",
@@ -4462,6 +5109,13 @@ class GuidedStorySession:
         payload["source_movie_plan_id"] = str(payload.get("source_movie_plan_id", ""))
         payload["source_movie_ir_id"] = str(payload.get("source_movie_ir_id", ""))
         payload["source_film_ir_id"] = str(payload.get("source_film_ir_id", ""))
+        payload["source_movie_plan_version"] = int(payload.get("source_movie_plan_version", 0) or 0)
+        payload["source_movie_plan_fingerprint"] = str(payload.get("source_movie_plan_fingerprint", ""))
+        payload["source_movie_plan_lineage_token"] = str(payload.get("source_movie_plan_lineage_token", ""))
+        payload["source_film_ir_fingerprint"] = str(payload.get("source_film_ir_fingerprint", ""))
+        payload["source_movie_ir_fingerprint"] = str(payload.get("source_movie_ir_fingerprint", ""))
+        payload["video_job_fingerprint"] = str(payload.get("video_job_fingerprint", ""))
+        payload["schema_version"] = str(payload.get("schema_version", "v2-video-job/1"))
         payload["compiler_version"] = str(payload.get("compiler_version", ""))
         payload["provider_profile"] = str(payload.get("provider_profile", ""))
         payload["execution_units"] = tuple(

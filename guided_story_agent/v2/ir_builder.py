@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import warnings
 
 from .film_ir import FilmIR
 from .ir import (
@@ -19,6 +20,7 @@ from .ir import (
     TransitionCue,
 )
 from .validation import MovieIRValidator
+from .fingerprint import content_fingerprint
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,10 +222,16 @@ class MovieIRBuilder:
             transition_cues=tuple(transition_cues),
             acceptance_criteria=tuple(acceptance_criteria),
             source_film_ir_id=film_ir.ir_id,
+            source_movie_plan_version=film_ir.source_movie_plan_version,
+            source_movie_plan_fingerprint=film_ir.source_movie_plan_fingerprint,
+            source_movie_plan_lineage_token=film_ir.source_movie_plan_lineage_token,
+            source_film_ir_fingerprint=content_fingerprint(film_ir.to_dict()),
             metadata={
                 "source": "film_ir",
                 "source_movie_plan_id": film_ir.source_movie_plan_id,
                 "source_film_ir_id": film_ir.ir_id,
+                "source_movie_plan_version": film_ir.source_movie_plan_version,
+                "source_movie_plan_fingerprint": film_ir.source_movie_plan_fingerprint,
                 "built_at": datetime.now(timezone.utc).isoformat(),
                 "scene_ids": sorted({shot.scene_id for shot in film_ir.shots}),
                 "shot_ids": [shot.shot_id for shot in sorted(film_ir.shots, key=lambda item: item.order)],
@@ -268,6 +276,11 @@ class MovieIRBuilder:
 
 
 def build_movie_ir(film_ir: FilmIR, *, aspect_ratio: str = "16:9") -> IRBuildResult:
+    warnings.warn(
+        "build_movie_ir() is deprecated; use MovieIRBuilder(...).build()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return MovieIRBuilder(aspect_ratio=aspect_ratio).build(film_ir)
 
 

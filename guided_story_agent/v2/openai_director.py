@@ -64,6 +64,9 @@ _PLAN_KEYS = {
     "confirmed",
     "story_plan",
     "director_plan",
+    "movie_plan_version",
+    "movie_plan_fingerprint",
+    "movie_plan_lineage_token",
 }
 
 _STORY_PLAN_KEYS = {
@@ -492,6 +495,9 @@ def movie_plan_from_data(data: dict[str, Any]) -> MoviePlan:
                 if data.get("director_plan") is not None
                 else None
             ),
+            movie_plan_version=int(data.get("movie_plan_version", 0) or 0),
+            movie_plan_fingerprint=str(data.get("movie_plan_fingerprint", "") or ""),
+            movie_plan_lineage_token=str(data.get("movie_plan_lineage_token", "") or ""),
         )
     except (KeyError, TypeError, ValueError, DirectorGenerationError) as exc:
         if isinstance(exc, DirectorGenerationError):

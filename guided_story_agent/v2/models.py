@@ -448,6 +448,11 @@ class MoviePlan:
     # ``__post_init__``; callers may provide authored plans explicitly.
     story_plan: StoryPlan | None = None
     director_plan: DirectorPlan | None = None
+    # Immutable creative-content provenance.  These fields are appended to
+    # preserve positional construction compatibility with older callers.
+    movie_plan_version: int = 0
+    movie_plan_fingerprint: str = ""
+    movie_plan_lineage_token: str = ""
 
     def __post_init__(self) -> None:
         if self.story_plan is None:
@@ -467,6 +472,30 @@ class MoviePlan:
                     film_beats=self.film_beats,
                 ),
             )
+        # Old callers and old session payloads do not carry provenance yet.
+        # Compute it lazily here without importing fingerprint at module load
+        # time (fingerprint itself depends on ``as_plain_data`` below).
+        if not self.movie_plan_fingerprint or not self.movie_plan_lineage_token or not self.movie_plan_version:
+            from .fingerprint import ensure_movie_plan_provenance
+
+            migrated = ensure_movie_plan_provenance(self)
+            object.__setattr__(self, "movie_plan_version", migrated.movie_plan_version)
+            object.__setattr__(self, "movie_plan_fingerprint", migrated.movie_plan_fingerprint)
+            object.__setattr__(self, "movie_plan_lineage_token", migrated.movie_plan_lineage_token)
+
+    @property
+    def version(self) -> int:
+        """Short compatibility alias for the immutable plan version."""
+
+        return self.movie_plan_version
+
+    @property
+    def fingerprint(self) -> str:
+        return self.movie_plan_fingerprint
+
+    @property
+    def lineage_token(self) -> str:
+        return self.movie_plan_lineage_token
 
     @property
     def scene_ids(self) -> tuple[str, ...]:

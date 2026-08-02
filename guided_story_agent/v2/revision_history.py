@@ -57,6 +57,8 @@ class MoviePlanVersionRecord:
     reason: str = ""
     snapshot: dict[str, object] = field(default_factory=dict)
     metadata: dict[str, object] = field(default_factory=dict)
+    movie_plan_fingerprint: str = ""
+    movie_plan_lineage_token: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.movie_plan_id).strip():

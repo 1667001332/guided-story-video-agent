@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
+import warnings
 
 from .execution import (
     CompilationOptions,
@@ -28,6 +29,7 @@ from .ir import MovieIR, ShotIR
 from .ir_builder import IRBuildError, MovieIRBuilder
 from .models import MoviePlan
 from .validation import MovieIRValidator
+from .fingerprint import content_fingerprint
 
 
 class VideoJobCompiler:
@@ -94,6 +96,11 @@ class VideoJobCompiler:
             source_movie_plan_id=movie_ir.source_movie_plan_id,
             source_movie_ir_id=movie_ir.ir_id,
             source_film_ir_id=movie_ir.source_film_ir_id,
+            source_movie_plan_version=movie_ir.source_movie_plan_version,
+            source_movie_plan_fingerprint=movie_ir.source_movie_plan_fingerprint,
+            source_movie_plan_lineage_token=movie_ir.source_movie_plan_lineage_token,
+            source_film_ir_fingerprint=movie_ir.source_film_ir_fingerprint,
+            source_movie_ir_fingerprint=content_fingerprint(movie_ir.to_dict()),
             compiler_version=options.compiler_version.strip() or self.compiler_version,
             provider_profile=provider_profile,
             execution_units=tuple(self._execution_unit(shot) for shot in movie_ir.shots),
@@ -281,6 +288,11 @@ def compile_movie_plan_to_video_job(
     capabilities: ProviderCapabilities,
     options: CompilationOptions | None = None,
 ) -> CompileResult:
+    warnings.warn(
+        "compile_movie_plan_to_video_job() is deprecated; use MoviePlanCompiler().compile()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return MoviePlanCompiler().compile(movie_plan, capabilities, options)
 
 

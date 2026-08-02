@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .fingerprint import content_fingerprint
+
 
 @dataclass(frozen=True, slots=True)
 class SourceLineage:
@@ -22,6 +24,15 @@ class SourceLineage:
     source_director_plan_id: str = ""
     source_film_ir_id: str = ""
     source_movie_ir_id: str = ""
+    source_movie_plan_version: str = ""
+    source_movie_plan_fingerprint: str = ""
+    source_movie_plan_lineage_token: str = ""
+    source_film_ir_fingerprint: str = ""
+    source_movie_ir_fingerprint: str = ""
+    execution_plan_id: str = ""
+    execution_plan_version: str = ""
+    execution_plan_fingerprint: str = ""
+    execution_bundle_fingerprint: str = ""
 
     @property
     def movie_plan_id(self) -> str:
@@ -75,6 +86,8 @@ class LineageCheckResult:
     def status(self) -> str:
         if self.valid:
             return "fresh"
+        if any(item.code.startswith("invalid") or item.code.endswith("invalid") for item in self.diagnostics):
+            return "invalid"
         if any(item.code.endswith("unknown_lineage") for item in self.diagnostics):
             return "unknown"
         return "stale"
@@ -112,6 +125,9 @@ class SourceLineageGuard:
         current_story_plan_id: str | None = None,
         current_director_plan_id: str | None = None,
         current_film_ir_id: str | None = None,
+        current_movie_plan_version: int | str | None = None,
+        current_movie_plan_fingerprint: str | None = None,
+        current_movie_plan_lineage_token: str | None = None,
     ) -> LineageCheckResult:
         lineage = _lineage_from(film_ir, "film_ir")
         diagnostics: list[StaleArtifactDiagnostic] = []
@@ -140,6 +156,19 @@ class SourceLineageGuard:
             expected=current_film_ir_id,
             action="/build-film-ir",
         )
+        for field, expected in (
+            ("source_movie_plan_version", current_movie_plan_version),
+            ("source_movie_plan_fingerprint", current_movie_plan_fingerprint),
+            ("source_movie_plan_lineage_token", current_movie_plan_lineage_token),
+        ):
+            _compare_required(
+                diagnostics,
+                artifact_type="film_ir",
+                field=field,
+                actual=getattr(lineage, field),
+                expected=None if expected is None else str(expected),
+                action="/build-film-ir",
+            )
         _compare_required(
             diagnostics,
             artifact_type="film_ir",
@@ -164,6 +193,10 @@ class SourceLineageGuard:
         current_movie_plan_id: str | None = None,
         current_film_ir_id: str | None = "",
         current_movie_ir_id: str | None = "",
+        current_movie_plan_version: int | str | None = None,
+        current_movie_plan_fingerprint: str | None = None,
+        current_movie_plan_lineage_token: str | None = None,
+        current_film_ir_fingerprint: str | None = None,
     ) -> LineageCheckResult:
         lineage = _lineage_from(movie_ir, "movie_ir")
         diagnostics: list[StaleArtifactDiagnostic] = []
@@ -185,6 +218,20 @@ class SourceLineageGuard:
             expected=current_movie_plan_id,
             action="/build-ir",
         )
+        for field, expected in (
+            ("source_movie_plan_version", current_movie_plan_version),
+            ("source_movie_plan_fingerprint", current_movie_plan_fingerprint),
+            ("source_movie_plan_lineage_token", current_movie_plan_lineage_token),
+            ("source_film_ir_fingerprint", current_film_ir_fingerprint),
+        ):
+            _compare_required(
+                diagnostics,
+                artifact_type="movie_ir",
+                field=field,
+                actual=getattr(lineage, field),
+                expected=None if expected is None else str(expected),
+                action="/build-ir",
+            )
         _compare_artifact_identity(
             diagnostics,
             artifact_type="movie_ir",
@@ -209,6 +256,11 @@ class SourceLineageGuard:
         current_film_ir_id: str | None = "",
         current_movie_ir_id: str | None = "",
         current_video_job_id: str | None = "",
+        current_movie_plan_version: int | str | None = None,
+        current_movie_plan_fingerprint: str | None = None,
+        current_movie_plan_lineage_token: str | None = None,
+        current_film_ir_fingerprint: str | None = None,
+        current_movie_ir_fingerprint: str | None = None,
     ) -> LineageCheckResult:
         lineage = _lineage_from(video_job, "video_job")
         diagnostics: list[StaleArtifactDiagnostic] = []
@@ -233,6 +285,21 @@ class SourceLineageGuard:
                 field=field,
                 actual=getattr(lineage, field),
                 expected=expected,
+                action="/compile",
+            )
+        for field, expected in (
+            ("source_movie_plan_version", current_movie_plan_version),
+            ("source_movie_plan_fingerprint", current_movie_plan_fingerprint),
+            ("source_movie_plan_lineage_token", current_movie_plan_lineage_token),
+            ("source_film_ir_fingerprint", current_film_ir_fingerprint),
+            ("source_movie_ir_fingerprint", current_movie_ir_fingerprint),
+        ):
+            _compare_required(
+                diagnostics,
+                artifact_type="video_job",
+                field=field,
+                actual=getattr(lineage, field),
+                expected=None if expected is None else str(expected),
                 action="/compile",
             )
         _compare_artifact_identity(
@@ -296,9 +363,133 @@ class SourceLineageGuard:
             lineage,
         )
 
+    def check_execution_plan(
+        self,
+        execution_plan: Any,
+        *,
+        current_movie_plan_id: str | None = None,
+        current_movie_plan_version: int | str | None = None,
+        current_movie_plan_fingerprint: str | None = None,
+        current_movie_plan_lineage_token: str | None = None,
+        current_film_ir_id: str | None = None,
+        current_film_ir_fingerprint: str | None = None,
+        current_movie_ir_id: str | None = None,
+        current_movie_ir_fingerprint: str | None = None,
+    ) -> LineageCheckResult:
+        from .execution_plan_validation import validate_execution_plan
+
+        lineage = _lineage_from(execution_plan, "execution_plan")
+        diagnostics: list[StaleArtifactDiagnostic] = []
+        if execution_plan is None:
+            diagnostics.append(_diag("missing_execution_plan", "当前没有 ExecutionPlan；请先执行 /build-execution-plan。", "execution_plan", action="/build-execution-plan"))
+            return LineageCheckResult("execution_plan", False, tuple(diagnostics), lineage)
+        validation = validate_execution_plan(execution_plan)
+        diagnostics.extend(
+            _diag(item.code, item.message, "execution_plan", path=item.path, action="/build-execution-plan", expected=item.expected, actual=item.actual)
+            for item in validation.diagnostics
+        )
+        for field, expected in (
+            ("source_movie_plan_id", current_movie_plan_id),
+            ("source_movie_plan_version", None if current_movie_plan_version is None else str(current_movie_plan_version)),
+            ("source_movie_plan_fingerprint", current_movie_plan_fingerprint),
+            ("source_movie_plan_lineage_token", current_movie_plan_lineage_token),
+            ("source_film_ir_id", current_film_ir_id),
+            ("source_film_ir_fingerprint", current_film_ir_fingerprint),
+            ("source_movie_ir_id", current_movie_ir_id),
+            ("source_movie_ir_fingerprint", current_movie_ir_fingerprint),
+        ):
+            _compare_required(
+                diagnostics,
+                artifact_type="execution_plan",
+                field=field,
+                actual=getattr(lineage, field),
+                expected=expected,
+                action="/build-execution-plan",
+            )
+        return LineageCheckResult("execution_plan", not diagnostics, tuple(diagnostics), lineage)
+
+    def check_execution_bundle(
+        self,
+        execution_bundle: Any,
+        **kwargs: Any,
+    ) -> LineageCheckResult:
+        from .execution_plan_validation import validate_execution_bundle
+
+        if execution_bundle is None:
+            return LineageCheckResult(
+                "execution_bundle",
+                False,
+                (_diag("missing_execution_bundle", "当前没有 ExecutionBundle；请先执行 /build-execution-plan。", "execution_bundle", action="/build-execution-plan"),),
+                _lineage_from(None, "execution_bundle"),
+            )
+        plan_result = self.check_execution_plan(execution_bundle.execution_plan, **kwargs)
+        validation = validate_execution_bundle(execution_bundle)
+        diagnostics = list(plan_result.diagnostics)
+        diagnostics.extend(
+            _diag(item.code, item.message, "execution_bundle", path=item.path, action="/build-execution-plan", expected=item.expected, actual=item.actual)
+            for item in validation.diagnostics
+        )
+        lineage = _lineage_from(execution_bundle, "execution_bundle")
+        return LineageCheckResult("execution_bundle", not diagnostics, tuple(diagnostics), lineage)
+
+    def check_execution_run(self, execution_run: Any, execution_bundle: Any) -> LineageCheckResult:
+        """Validate durable runtime provenance without touching provider state."""
+
+        diagnostics: list[StaleArtifactDiagnostic] = []
+        if execution_run is None:
+            diagnostics.append(
+                _diag(
+                    "missing_execution_run",
+                    "当前没有 ExecutionRun；请先执行 /start-execution。",
+                    "execution_run",
+                    action="/start-execution",
+                )
+            )
+            return LineageCheckResult("execution_run", False, tuple(diagnostics), _lineage_from(None, "execution_run"))
+        if execution_bundle is None:
+            diagnostics.append(
+                _diag(
+                    "missing_execution_bundle",
+                    "ExecutionRun 缺少当前 ExecutionBundle，禁止恢复。",
+                    "execution_run",
+                    action="/build-execution-plan",
+                )
+            )
+            return LineageCheckResult("execution_run", False, tuple(diagnostics), _lineage_from(execution_run, "execution_run"))
+        plan = execution_bundle.execution_plan
+        for field, actual, expected in (
+            ("execution_bundle_fingerprint", getattr(execution_run, "execution_bundle_fingerprint", ""), getattr(execution_bundle, "bundle_fingerprint", "")),
+            ("execution_plan_id", getattr(execution_run, "execution_plan_id", ""), getattr(plan, "execution_plan_id", "")),
+            ("execution_plan_fingerprint", getattr(execution_run, "execution_plan_fingerprint", ""), getattr(plan, "execution_plan_fingerprint", "")),
+            ("source_movie_plan_id", getattr(execution_run, "source_movie_plan_id", ""), getattr(plan, "source_movie_plan_id", "")),
+            ("source_movie_plan_version", str(getattr(execution_run, "source_movie_plan_version", "")), str(getattr(plan, "source_movie_plan_version", ""))),
+            ("source_movie_plan_fingerprint", getattr(execution_run, "source_movie_plan_fingerprint", ""), getattr(plan, "source_movie_plan_fingerprint", "")),
+            ("source_movie_plan_lineage_token", getattr(execution_run, "source_movie_plan_lineage_token", ""), getattr(plan, "source_movie_plan_lineage_token", "")),
+        ):
+            _compare_required(
+                diagnostics,
+                artifact_type="execution_run",
+                field=field,
+                actual=str(actual),
+                expected=str(expected),
+                action="/build-execution-plan",
+            )
+        jobs = getattr(execution_bundle, "video_job_map", {})
+        for unit in plan.execution_units:
+            state = getattr(execution_run, "unit_states", {}).get(unit.execution_unit_id)
+            job = jobs.get(unit.video_job_id)
+            if state is None:
+                diagnostics.append(_diag("execution_run_missing_unit", "ExecutionRun 缺少 ExecutionUnit 状态。", "execution_run", action="/start-execution"))
+            elif job is None or state.video_job_fingerprint != job.video_job_fingerprint:
+                diagnostics.append(_diag("execution_run_video_job_mismatch", "ExecutionRun 的 VideoJob fingerprint 与当前 Bundle 不一致。", "execution_run", action="/build-execution-plan"))
+        return LineageCheckResult("execution_run", not diagnostics, tuple(diagnostics), _lineage_from(execution_run, "execution_run"))
+
     def check_session(self, session: Any) -> LineageCheckResult:
         plan = getattr(session, "confirmed_movie_plan", None) or getattr(session, "movie_plan", None)
         current_plan_id = getattr(session, "current_movie_plan_id", None) or getattr(plan, "plan_id", None)
+        current_plan_version = getattr(session, "current_movie_plan_version", None) or getattr(plan, "movie_plan_version", None)
+        current_plan_fingerprint = getattr(session, "current_movie_plan_fingerprint", None) or getattr(plan, "movie_plan_fingerprint", None)
+        current_plan_token = getattr(session, "current_movie_plan_lineage_token", None) or getattr(plan, "movie_plan_lineage_token", None)
         story_id = f"{current_plan_id}:story_plan" if plan is not None and getattr(plan, "story_plan", None) else None
         director_id = f"{current_plan_id}:director_plan" if plan is not None and getattr(plan, "director_plan", None) else None
         diagnostics: list[StaleArtifactDiagnostic] = []
@@ -309,12 +500,23 @@ class SourceLineageGuard:
                 current_story_plan_id=story_id or "",
                 current_director_plan_id=director_id or "",
                 current_film_ir_id=getattr(session, "current_film_ir_id", None) or "",
+                current_movie_plan_version=current_plan_version,
+                current_movie_plan_fingerprint=current_plan_fingerprint,
+                current_movie_plan_lineage_token=current_plan_token,
             ),
             self.check_movie_ir(
                 getattr(session, "movie_ir", None),
                 current_movie_plan_id=current_plan_id or "",
                 current_film_ir_id=getattr(session, "current_film_ir_id", None) or "",
                 current_movie_ir_id=getattr(session, "current_movie_ir_id", None) or "",
+                current_movie_plan_version=current_plan_version,
+                current_movie_plan_fingerprint=current_plan_fingerprint,
+                current_movie_plan_lineage_token=current_plan_token,
+                current_film_ir_fingerprint=(
+                    content_fingerprint(getattr(session, "film_ir").to_dict())
+                    if getattr(session, "film_ir", None) is not None
+                    else None
+                ),
             ),
             self.check_video_job(
                 getattr(session, "v2_video_job", None),
@@ -322,6 +524,19 @@ class SourceLineageGuard:
                 current_film_ir_id=getattr(session, "current_film_ir_id", None) or "",
                 current_movie_ir_id=getattr(session, "current_movie_ir_id", None) or "",
                 current_video_job_id=getattr(session, "current_video_job_id", None) or "",
+                current_movie_plan_version=current_plan_version,
+                current_movie_plan_fingerprint=current_plan_fingerprint,
+                current_movie_plan_lineage_token=current_plan_token,
+                current_film_ir_fingerprint=(
+                    content_fingerprint(getattr(session, "film_ir").to_dict())
+                    if getattr(session, "film_ir", None) is not None
+                    else None
+                ),
+                current_movie_ir_fingerprint=(
+                    content_fingerprint(getattr(session, "movie_ir").to_dict())
+                    if getattr(session, "movie_ir", None) is not None
+                    else None
+                ),
             ),
         ):
             if getattr(session, _session_artifact_field(result.artifact_type), None) is not None:
@@ -332,11 +547,23 @@ class SourceLineageGuard:
             current_video_job_id=getattr(session, "current_video_job_id", None),
         )
         diagnostics.extend(provider_result.diagnostics)
+        if getattr(session, "execution_run", None) is not None:
+            diagnostics.extend(
+                self.check_execution_run(
+                    getattr(session, "execution_run"),
+                    getattr(session, "execution_bundle", None),
+                ).diagnostics
+            )
         return LineageCheckResult(
             "session",
             not diagnostics,
             tuple(diagnostics),
-            SourceLineage(source_movie_plan_id=str(current_plan_id or "")),
+            SourceLineage(
+                source_movie_plan_id=str(current_plan_id or ""),
+                source_movie_plan_version=str(current_plan_version or ""),
+                source_movie_plan_fingerprint=str(current_plan_fingerprint or ""),
+                source_movie_plan_lineage_token=str(current_plan_token or ""),
+            ),
         )
 
 
@@ -345,20 +572,33 @@ def _session_artifact_field(artifact_type: str) -> str:
         "film_ir": "film_ir",
         "movie_ir": "movie_ir",
         "video_job": "v2_video_job",
+        "execution_run": "execution_run",
     }.get(artifact_type, artifact_type)
 
 
 def _lineage_from(value: Any, artifact_type: str) -> SourceLineage:
     if value is None:
         return SourceLineage(artifact_type=artifact_type)
+    source_value = value
+    if artifact_type == "execution_bundle" and getattr(value, "execution_plan", None) is not None:
+        source_value = value.execution_plan
     return SourceLineage(
         artifact_type=artifact_type,
-        artifact_id=str(_value(value, "ir_id", "job_id", "id") or ""),
-        source_movie_plan_id=str(_value(value, "source_movie_plan_id") or "").strip(),
-        source_story_plan_id=str(_value(value, "source_story_plan_id") or "").strip(),
-        source_director_plan_id=str(_value(value, "source_director_plan_id") or "").strip(),
-        source_film_ir_id=str(_value(value, "source_film_ir_id") or "").strip(),
-        source_movie_ir_id=str(_value(value, "source_movie_ir_id") or "").strip(),
+        artifact_id=str(_value(source_value, "ir_id", "job_id", "execution_plan_id", "bundle_fingerprint", "id") or ""),
+        source_movie_plan_id=str(_value(source_value, "source_movie_plan_id") or "").strip(),
+        source_story_plan_id=str(_value(source_value, "source_story_plan_id") or "").strip(),
+        source_director_plan_id=str(_value(source_value, "source_director_plan_id") or "").strip(),
+        source_film_ir_id=str(_value(source_value, "source_film_ir_id") or "").strip(),
+        source_movie_ir_id=str(_value(source_value, "source_movie_ir_id") or "").strip(),
+        source_movie_plan_version=str(_value(source_value, "source_movie_plan_version") or "").strip(),
+        source_movie_plan_fingerprint=str(_value(source_value, "source_movie_plan_fingerprint") or "").strip(),
+        source_movie_plan_lineage_token=str(_value(source_value, "source_movie_plan_lineage_token") or "").strip(),
+        source_film_ir_fingerprint=str(_value(source_value, "source_film_ir_fingerprint") or "").strip(),
+        source_movie_ir_fingerprint=str(_value(source_value, "source_movie_ir_fingerprint") or "").strip(),
+        execution_plan_id=str(_value(source_value, "execution_plan_id") or "").strip(),
+        execution_plan_version=str(_value(source_value, "execution_plan_version") or "").strip(),
+        execution_plan_fingerprint=str(_value(source_value, "execution_plan_fingerprint") or "").strip(),
+        execution_bundle_fingerprint=str(_value(value, "bundle_fingerprint") or "").strip(),
     )
 
 
@@ -389,7 +629,14 @@ def _compare_required(
         code = f"{artifact_type}_unknown_lineage"
         message = f"{artifact_type} 缺少 {field} 或当前来源 ID，无法证明来源。"
     elif actual != expected:
-        code = f"{artifact_type}_source_mismatch"
+        if "fingerprint" in field:
+            code = f"{artifact_type}_source_fingerprint_mismatch"
+        elif "lineage_token" in field:
+            code = f"{artifact_type}_lineage_token_mismatch"
+        elif "version" in field:
+            code = f"{artifact_type}_source_version_mismatch"
+        else:
+            code = f"{artifact_type}_source_mismatch"
         message = f"{artifact_type}.{field} 与当前来源不一致。"
     else:
         return

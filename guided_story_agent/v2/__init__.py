@@ -5,6 +5,10 @@ the production session is migrated.  New code should depend on these contracts
 through the V2 ports instead of importing Storyboard types.
 """
 
+# These compatibility-only aliases remain importable for existing in-repository
+# callers while staying out of the supported ``__all__`` facade.
+# ruff: noqa: F401
+
 from .models import (
     CameraInstruction,
     CameraPlan,
@@ -35,7 +39,6 @@ from .models import (
     as_plain_data,
 )
 from .execution import (
-    Artifact,
     CompilationOptions,
     CompileDiagnostic,
     CompileError,
@@ -44,6 +47,98 @@ from .execution import (
     ProviderJob,
     RetakeRequest,
     VideoJob,
+)
+from .provider_contracts import CapabilitySnapshot, ProviderAssignment
+from .artifact_contracts import ExpectedArtifact, ReferenceInput, RetryPolicy, TimeoutPolicy
+from .execution_plan import (
+    ArtifactPolicy,
+    DependencyEdge,
+    ExecutionPlan,
+    ExecutionUnit,
+    ReferenceFrameStrategy,
+    RuntimePolicy,
+)
+from .execution_bundle import ExecutionBundle
+from .execution_fingerprint import (
+    execution_bundle_fingerprint,
+    execution_plan_fingerprint,
+    execution_unit_fingerprint,
+    video_job_fingerprint,
+)
+from .execution_plan_builder import (
+    ExecutionPlanCompileDiagnostic,
+    ExecutionPlanCompileError,
+    ExecutionPlanCompileResult,
+    ExecutionPlanCompiler,
+    compile_movie_ir_to_execution_bundle,
+)
+from .execution_plan_validation import (
+    ExecutionValidationDiagnostic,
+    ExecutionValidationResult,
+    validate_execution_bundle,
+    validate_execution_plan,
+)
+from .execution_state import (
+    ExecutionRun,
+    ExecutionRunStatus,
+    ExecutionState,
+    ExecutionUnitState,
+    ProviderJob as RuntimeProviderJob,
+    RuntimeErrorRecord,
+)
+from .execution_events import (
+    InMemoryExecutionEventStore,
+    JsonExecutionEventStore,
+    RuntimeEvent,
+)
+from .runtime_state_store import (
+    ExecutionLease,
+    InMemoryRuntimeStateStore,
+    JsonRuntimeStateStore,
+    RetryRecord,
+    SubmissionIntent,
+)
+from .execution_checkpoint import (
+    ExecutionCheckpoint,
+    InMemoryCheckpointStore,
+    JsonCheckpointStore,
+)
+from .provider_runtime import (
+    FakeClock,
+    ProviderRequestContext,
+    ProviderRuntime,
+    ProviderDownloadResult,
+    ProviderPollResult,
+    ProviderRuntimeError,
+    SystemClock,
+)
+from .provider_capabilities import DurationRange, ProviderCapabilities as RuntimeProviderCapabilities
+from .provider_errors import ProviderErrorCategory
+from .provider_results import (
+    DownloadDestination,
+    ProviderCancelResult,
+    ProviderJobStatus,
+    ProviderSubmitResult,
+    ProviderVerificationResult,
+    SanitizedOutputLocator,
+)
+from .fake_provider_runtime import FakeProviderRuntime, FakeProviderScenario
+from .http_transport import HttpResponse, HttpTransport
+from .mock_http_transport import MockHttpRequest, MockHttpTransport
+from .mock_http_provider_runtime import MockHttpProviderRuntime
+from .fake_artifact_verifier import ArtifactRecord, ArtifactVerificationResult, FakeArtifactVerifier
+from .provider_registry import ProviderNotRegisteredError, ProviderRegistrationError, ProviderRuntimeRegistry
+from .execution_scheduler import (
+    DependencyResolver,
+    RuntimeTransition,
+    RuntimeTransitionService,
+    TransitionRejectedError,
+)
+from .execution_runtime import (
+    ExecutionRuntime,
+    ExecutionRuntimeError,
+    RuntimeNotFoundError,
+    StaleExecutionRuntimeError,
 )
 from .compiler import MoviePlanCompiler, VideoJobCompiler, compile_movie_plan_to_video_job
 from .film_ir import (
@@ -228,9 +323,22 @@ from .lineage import (
     SourceLineageGuard,
     StaleArtifactDiagnostic,
 )
+from .fingerprint import (
+    CanonicalSerializer,
+    ContentFingerprint,
+    FingerprintBuilder,
+    canonicalize_movie_plan,
+    content_fingerprint,
+    ensure_movie_plan_provenance,
+    movie_plan_fingerprint,
+    movie_plan_lineage_token,
+)
 
+# ``__all__`` is the supported V2 facade.  The module still imports a small
+# set of compatibility-only implementation names for existing in-repository
+# callers, but stores, fakes, HTTP test doubles, scheduler internals, and
+# graph/history records are intentionally not part of the public surface.
 __all__ = [
-    "Artifact",
     "AcceptanceCriterion",
     "CompilationOptions",
     "CompileDiagnostic",
@@ -328,10 +436,55 @@ __all__ = [
     "ContinuityDiagnosticsPass",
     "PromptLeakageDiagnosticsPass",
     "VideoJob",
+    "CapabilitySnapshot",
+    "ProviderAssignment",
+    "ExpectedArtifact",
+    "ReferenceInput",
+    "RetryPolicy",
+    "TimeoutPolicy",
+    "ArtifactPolicy",
+    "DependencyEdge",
+    "ExecutionPlan",
+    "ExecutionUnit",
+    "ReferenceFrameStrategy",
+    "RuntimePolicy",
+    "ExecutionBundle",
+    "execution_bundle_fingerprint",
+    "execution_plan_fingerprint",
+    "execution_unit_fingerprint",
+    "video_job_fingerprint",
+    "ExecutionPlanCompileDiagnostic",
+    "ExecutionPlanCompileError",
+    "ExecutionPlanCompileResult",
+    "ExecutionPlanCompiler",
+    "ExecutionValidationDiagnostic",
+    "ExecutionValidationResult",
+    "validate_execution_bundle",
+    "validate_execution_plan",
+    "ExecutionRun",
+    "ExecutionRunStatus",
+    "ExecutionState",
+    "ExecutionUnitState",
+    "RuntimeProviderJob",
+    "FakeClock",
+    "ProviderRuntimeError",
+    "ProviderRuntime",
+    "ProviderRequestContext",
+    "RuntimeProviderCapabilities",
+    "DurationRange",
+    "ProviderErrorCategory",
+    "ProviderJobStatus",
+    "SystemClock",
+    "ProviderNotRegisteredError",
+    "ProviderRegistrationError",
+    "ProviderRuntimeRegistry",
+    "ExecutionRuntime",
+    "ExecutionRuntimeError",
+    "RuntimeNotFoundError",
+    "StaleExecutionRuntimeError",
     "OpenAIDirectorAgent",
     "RuleBasedDirectorAgent",
     "as_plain_data",
-    "compile_movie_plan_to_video_job",
     "build_film_ir",
     "build_cinematic_ir",
     "film_ir_pass_pipeline",
@@ -362,18 +515,9 @@ __all__ = [
     "DirectorRevisionRequest",
     "DirectorRevisionResult",
     "RuleBasedDirectorRevisionLoop",
-    "build_movie_ir",
     "validate_movie_plan",
     "validate_video_job",
     "movie_plan_from_data",
-    "CreativeGraphNode",
-    "CreativeGraphEdge",
-    "CreativeGraph",
-    "EmotionGraph",
-    "AudienceKnowledgeGraph",
-    "ConflictGraph",
-    "CharacterArcGraph",
-    "PlanLayerConsistencyGraph",
     "CreativeAnalysis",
     "CreativeAnalysisDiagnostic",
     "CreativeAnalysisArtifact",
@@ -416,11 +560,6 @@ __all__ = [
     "OpenAIDirectorRevisionAdapter",
     "build_director_revision_prompt",
     "run_director_revision_guarded",
-    "MoviePlanVersionRecord",
-    "RevisionApplyRecord",
-    "RevisionRollbackRecord",
-    "DownstreamInvalidationResult",
-    "invalidate_downstream_after_movie_plan_change",
     "ApplyRevisionCommand",
     "RevisionApplyResult",
     "RevisionApplyService",
@@ -433,4 +572,9 @@ __all__ = [
     "SourceLineage",
     "SourceLineageGuard",
     "StaleArtifactDiagnostic",
+    "canonicalize_movie_plan",
+    "content_fingerprint",
+    "ensure_movie_plan_provenance",
+    "movie_plan_fingerprint",
+    "movie_plan_lineage_token",
 ]

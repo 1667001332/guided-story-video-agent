@@ -152,6 +152,30 @@ class VideoJob:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     confirmed: bool = False
     source_film_ir_id: str = ""
+    source_movie_plan_version: int = 0
+    source_movie_plan_fingerprint: str = ""
+    source_movie_plan_lineage_token: str = ""
+    source_film_ir_fingerprint: str = ""
+    source_movie_ir_fingerprint: str = ""
+    video_job_fingerprint: str = ""
+    schema_version: str = "v2-video-job/1"
+
+    def __post_init__(self) -> None:
+        if not self.video_job_fingerprint:
+            # Import lazily to keep the historical execution module usable as
+            # a leaf contract and to avoid a module cycle.
+            from .execution_fingerprint import video_job_fingerprint
+
+            object.__setattr__(self, "video_job_fingerprint", video_job_fingerprint(self))
+
+    @property
+    def fingerprint(self) -> str:
+        return self.video_job_fingerprint
+
+    def to_dict(self) -> dict[str, Any]:
+        from .models import as_plain_data
+
+        return as_plain_data(self)
 
     @property
     def prompt(self) -> str:
@@ -176,15 +200,3 @@ class ProviderJob:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     last_error: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class Artifact:
-    artifact_id: str
-    provider_key: str
-    status: str
-    local_path: str = ""
-    remote_url: str = ""
-    duration_seconds: float = 0.0
-    request_id: str = ""
-    error: str = ""

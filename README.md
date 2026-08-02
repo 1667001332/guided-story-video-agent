@@ -250,3 +250,14 @@ docs/                  测试指南、研究依据和版本说明
   测试者自己的账号单独验收
 
 研究与设计说明见 [研究与设计依据](docs/research-basis.md)，代码来源和迁移边界见 [来源说明](docs/provenance.md)。
+
+## Phase P1：Architecture Pruning
+
+Phase P1 是低风险架构瘦身：只移除已确认没有生产引用的死代码，并收窄
+`guided_story_agent.v2` 的声明式公共 Facade。MoviePlan、FilmIR、MovieIR、VideoJob、
+ExecutionPlan、ExecutionBundle、ExecutionRuntime、持久化 checkpoint/event/state、
+`SUBMISSION_UNCERTAIN` 语义以及 legacy Agnes 链保持不变。
+
+Fake/Mock Provider 仍只用于离线 Runtime、Provider 合约检查和测试，不代表真实 Provider
+或 MP4 生成；`/render` 仍不会把 V2 离线 Runtime 偷换成真实渲染。真实 Agnes 链和 V2
+离线链仍是两条明确的交付边界，后续阶段再单独评估真实 Provider 接入。

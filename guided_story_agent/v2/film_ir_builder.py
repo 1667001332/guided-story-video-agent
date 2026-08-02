@@ -22,6 +22,7 @@ from .film_ir import (
     TensionCurvePoint,
 )
 from .models import CreativeBrief, MoviePlan
+from .fingerprint import ensure_movie_plan_provenance
 from .validation import FilmIRValidator, validate_movie_plan
 
 
@@ -62,6 +63,7 @@ class FilmIRBuilder:
             return self._failure(
                 FilmIRBuildError("invalid_movie_plan_state", "输入不是 MoviePlan。")
             )
+        movie_plan = ensure_movie_plan_provenance(movie_plan)
         errors = self._preflight(movie_plan)
         if errors:
             return self._failure(*errors)
@@ -228,7 +230,7 @@ class FilmIRBuilder:
         film_ir = FilmIR(
             ir_id=f"film-ir-{uuid4().hex}",
             source_movie_plan_id=movie_plan.plan_id,
-            version=movie_plan.revision,
+            version=movie_plan.movie_plan_version,
             title=movie_plan.story.title,
             target_duration_seconds=float(movie_plan.timing_plan.target_duration_seconds),
             visual_style=movie_plan.visual_style,
@@ -254,9 +256,14 @@ class FilmIRBuilder:
                 if movie_plan.director_plan is not None
                 else ""
             ),
+            source_movie_plan_version=movie_plan.movie_plan_version,
+            source_movie_plan_fingerprint=movie_plan.movie_plan_fingerprint,
+            source_movie_plan_lineage_token=movie_plan.movie_plan_lineage_token,
             metadata={
                 "source": "movie_plan",
                 "source_movie_plan_id": movie_plan.plan_id,
+                "source_movie_plan_version": movie_plan.movie_plan_version,
+                "source_movie_plan_fingerprint": movie_plan.movie_plan_fingerprint,
                 "source_story_plan_id": (
                     f"{movie_plan.plan_id}:story_plan"
                     if movie_plan.story_plan is not None

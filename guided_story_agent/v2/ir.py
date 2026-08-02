@@ -130,6 +130,10 @@ class MovieIR:
     acceptance_criteria: tuple[AcceptanceCriterion, ...]
     metadata: dict[str, Any] = field(default_factory=dict)
     source_film_ir_id: str = ""
+    source_movie_plan_version: int = 0
+    source_movie_plan_fingerprint: str = ""
+    source_movie_plan_lineage_token: str = ""
+    source_film_ir_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self)
@@ -151,6 +155,10 @@ class MovieIR:
                 # reuse without making load itself fail.
                 source_movie_plan_id=str(data.get("source_movie_plan_id", "")).strip(),
                 source_film_ir_id=str(data.get("source_film_ir_id", "")).strip(),
+                source_movie_plan_version=int(data.get("source_movie_plan_version", 0) or 0),
+                source_movie_plan_fingerprint=str(data.get("source_movie_plan_fingerprint", "")).strip(),
+                source_movie_plan_lineage_token=str(data.get("source_movie_plan_lineage_token", "")).strip(),
+                source_film_ir_fingerprint=str(data.get("source_film_ir_fingerprint", "")).strip(),
                 version=_positive_int(data, "version"),
                 title=_string(data, "title"),
                 target_duration_seconds=_number(data, "target_duration_seconds"),

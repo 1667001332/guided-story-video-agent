@@ -186,6 +186,9 @@ class FilmIR:
     # SourceLineageGuard marks them unknown/stale before reuse.
     source_story_plan_id: str = ""
     source_director_plan_id: str = ""
+    source_movie_plan_version: int = 0
+    source_movie_plan_fingerprint: str = ""
+    source_movie_plan_lineage_token: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self)
@@ -246,6 +249,9 @@ class FilmIR:
                 ),
                 source_story_plan_id=str(data.get("source_story_plan_id", "")).strip(),
                 source_director_plan_id=str(data.get("source_director_plan_id", "")).strip(),
+                source_movie_plan_version=int(data.get("source_movie_plan_version", 0) or 0),
+                source_movie_plan_fingerprint=str(data.get("source_movie_plan_fingerprint", "")).strip(),
+                source_movie_plan_lineage_token=str(data.get("source_movie_plan_lineage_token", "")).strip(),
                 metadata=dict(data.get("metadata", {})),
             )
         except (KeyError, TypeError, ValueError) as exc:

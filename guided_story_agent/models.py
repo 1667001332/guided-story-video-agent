@@ -22,6 +22,12 @@ class Stage(str, Enum):
     FILM_IR_BUILT = "film_ir_built"
     MOVIE_IR_BUILT = "movie_ir_built"
     VIDEO_JOB_COMPILED = "video_job_compiled"
+    EXECUTION_PLAN_BUILT = "execution_plan_built"
+    EXECUTION_READY = "execution_ready"
+    EXECUTION_RUNNING = "execution_running"
+    EXECUTION_BLOCKED = "execution_blocked"
+    EXECUTION_COMPLETED = "execution_completed"
+    EXECUTION_FAILED = "execution_failed"
     RENDER_READY = "render_ready"
     COMPLETED = "completed"
 
@@ -239,14 +245,6 @@ class IdeationTurnResult:
     selection: SelectionState
     available_actions: list[str] = field(default_factory=list)
     used_fallback: bool = False
-
-
-@dataclass(slots=True)
-class ReadinessReport:
-    score: float
-    missing_critical_fields: list[str] = field(default_factory=list)
-    unresolved_conflicts: list[StoryConflict] = field(default_factory=list)
-    recommended_action: str = "continue"
 
 
 @dataclass(slots=True)

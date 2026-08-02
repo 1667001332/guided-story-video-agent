@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 from uuid import uuid4
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
@@ -16,11 +18,19 @@ from .v2.director import DirectorAgent as V2DirectorAgent
 from .v2.execution import CompilationOptions, ProviderCapabilities as V2ProviderCapabilities
 from .v2.revision_apply import ApplyRevisionCommand, RollbackRevisionCommand
 from .v2.lineage import SourceLineageGuard
+from .v2.fingerprint import content_fingerprint
 from .v2.openai_director import (
     DirectorGenerationError,
     OpenAIDirectorAgent,
     RuleBasedDirectorAgent,
 )
+from .v2.fake_provider_runtime import FakeProviderRuntime
+from .v2.http_transport import HttpResponse
+from .v2.mock_http_provider_runtime import MockHttpProviderRuntime
+from .v2.mock_http_transport import MockHttpTransport
+from .v2.provider_registry import ProviderRuntimeRegistry
+from .v2.provider_results import DownloadDestination, ProviderJobStatus
+from .v2.provider_runtime import ProviderRequestContext
 
 
 HELP = """可用命令：
@@ -41,6 +51,20 @@ V2_HELP = """V2 可用命令：
 /build-film-ir  将 confirmed MoviePlan 构建为 FilmIR（电影语言层）
 /analysis       分析 StoryPlan / DirectorPlan / FilmIR 的创意结构
 /build-ir       将 FilmIR 降级为 Provider-neutral MovieIR
+/build-execution-plan  将 MovieIR 编译为不可变 ExecutionBundle（离线）
+/show-execution-plan   查看当前 ExecutionPlan / ExecutionBundle 摘要
+/validate-execution-plan 校验当前 ExecutionPlan / ExecutionBundle
+/start-execution 创建离线 ExecutionRun（Fake Provider，不自动提交）
+/step-execution 执行一个可控离线 Runtime step
+/run-execution 运行到完成/阻塞/失败或 max steps
+/resume-execution 从最新 Checkpoint 恢复，不重复提交
+/cancel-execution 取消当前离线 ExecutionRun
+/execution-status 查看 Runtime 状态、Ready Units、Provider/Artifact 统计
+/execution-events 查看 append-only Runtime 事件
+/execution-checkpoint 显式创建 Checkpoint
+/providers       查看已装配的 Provider Runtime（离线）
+/provider-capabilities <provider_key> 查看标准能力快照
+/provider-contract-check <provider_key> 运行 Fake/Mock HTTP 离线契约 smoke
 /optimize       创建 Creative Optimizer 建议与不可执行候选
 /revision       查看 Director-facing Revision Request（离线，不调用 LLM）
 /revise         调用 Revision Adapter，生成 candidate 并运行 validate / diff / guard
@@ -51,7 +75,7 @@ V2_HELP = """V2 可用命令：
 /diagnostics    查看 Validator / Pass / Optimizer / Revision 诊断
 /render         当前阶段不执行 Provider
 /quit           保存并退出
-当前阶段只构建 FilmIR/MovieIR/VideoJob，不调用真实视频 Provider。"""
+Phase 5B-1 只使用 Fake/Mock HTTP，不调用真实视频 Provider、不生成 MP4。"""
 
 
 class LiveTextRequiredError(RuntimeError):
@@ -277,6 +301,8 @@ def run_v2_interactive(
         provider_profile="offline",
         supports_long_video=True,
         supports_multi_scene_prompt=True,
+        supports_reference_images=True,
+        supports_character_reference=True,
         supports_audio=True,
     )
     output_fn("V2 电影导演模式：DirectorAgent 将一次性生成完整 MoviePlan。")
@@ -478,9 +504,108 @@ def run_v2_interactive(
                                 f"{item.code}: {item.message}" for item in result.errors
                             )
                         )
+            elif raw == "/build-execution-plan":
+                try:
+                    result = session.build_execution_plan(
+                        capabilities=compile_capabilities,
+                        options=compilation_options,
+                    )
+                except RuntimeError as exc:
+                    output_fn(f"ExecutionPlan 构建未执行：{exc}")
+                else:
+                    if result.success and result.bundle is not None:
+                        output_fn(
+                            "ExecutionBundle 已生成："
+                            f"plan={result.bundle.execution_plan.execution_plan_id}；"
+                            f"units={len(result.bundle.execution_plan.execution_units)}；"
+                            f"video_jobs={len(result.bundle.video_jobs)}；"
+                            f"fingerprint={result.bundle.bundle_fingerprint}"
+                        )
+                    else:
+                        output_fn(
+                            "ExecutionPlan 构建被拒绝："
+                            + "；".join(
+                                f"{item.code}: {item.message}" for item in result.errors
+                            )
+                        )
+            elif raw == "/show-execution-plan":
+                _print_execution_plan_summary(session, output_fn)
+            elif raw == "/validate-execution-plan":
+                result = session.validate_current_execution_plan()
+                output_fn(
+                    f"ExecutionBundle validation: status={result.status}；valid={result.valid}"
+                )
+                for item in result.diagnostics:
+                    output_fn(f"  {item.code}: {item.message}")
+            elif raw == "/start-execution":
+                run = session.start_execution(runtime_root=target / "runtime")
+                output_fn(
+                    f"离线 ExecutionRun 已创建：{run.execution_run_id}；"
+                    f"status={run.status.value}；checkpoint={run.latest_checkpoint_id}；"
+                    "未提交 Provider。"
+                )
+            elif raw == "/step-execution":
+                run = session.step_execution(runtime_root=target / "runtime")
+                output_fn(
+                    f"离线 Runtime step 完成：run={run.execution_run_id}；"
+                    f"status={run.status.value}；"
+                    f"states={[state.state.value for state in run.unit_states.values()]}"
+                )
+            elif raw == "/run-execution":
+                run = session.run_execution(max_steps=100, runtime_root=target / "runtime")
+                output_fn(
+                    f"离线 ExecutionRun 运行结束：run={run.execution_run_id}；"
+                    f"status={run.status.value}；checkpoint={run.latest_checkpoint_id}；"
+                    f"artifacts={len(run.artifacts)}；MP4=null"
+                )
+            elif raw == "/resume-execution":
+                run = session.resume_execution(runtime_root=target / "runtime")
+                output_fn(
+                    f"离线 ExecutionRun 已从 Checkpoint 恢复：run={run.execution_run_id}；"
+                    f"status={run.status.value}；submit 不会重复。"
+                )
+            elif raw == "/cancel-execution":
+                run = session.cancel_execution(runtime_root=target / "runtime")
+                output_fn(f"离线 ExecutionRun 已取消：run={run.execution_run_id}；status={run.status.value}")
+            elif raw == "/execution-status":
+                _print_execution_status(session, output_fn, runtime_root=target / "runtime")
+            elif raw == "/execution-events":
+                _print_execution_events(session, output_fn, runtime_root=target / "runtime")
+            elif raw == "/execution-checkpoint":
+                if session.current_execution_run_id is None:
+                    raise RuntimeError("当前没有可 checkpoint 的 ExecutionRun；请先执行 /start-execution。")
+                runner = session._execution_runtime_for(runtime_root=target / "runtime")
+                run = runner.checkpoint(session.current_execution_run_id)
+                session._sync_execution_runtime(run)
+                output_fn(f"Checkpoint 已创建：{run.latest_checkpoint_id}")
+            elif raw == "/providers":
+                _print_provider_list(session, output_fn)
+            elif raw.startswith("/provider-capabilities"):
+                parts = raw.split(maxsplit=1)
+                if len(parts) != 2:
+                    raise ValueError("用法：/provider-capabilities <provider_key>")
+                _print_provider_capabilities(parts[1].strip(), output_fn)
+            elif raw.startswith("/provider-contract-check"):
+                parts = raw.split(maxsplit=1)
+                if len(parts) != 2:
+                    raise ValueError("用法：/provider-contract-check <fake|mock-http>")
+                result = _run_provider_contract_smoke(parts[1].strip(), target / "provider-contract-check")
+                output_fn(f"Provider contract smoke: {result}")
             elif raw == "/diagnostics":
                 _print_v2_diagnostics(session, output_fn)
             elif raw == "/render":
+                if session.execution_bundle is not None:
+                    validation = session.validate_current_execution_plan()
+                    if not validation.valid:
+                        output_fn(
+                            "V2 render 被拒绝：ExecutionBundle 无效；请先执行 /build-execution-plan。"
+                        )
+                        continue
+                    output_fn(
+                        "V2 render is not connected in Phase 4G. ExecutionBundle 只作为未来 "
+                        "ExecutionRuntime 输入；未调用 Provider、未生成 ProviderJob、Artifact 或 MP4。"
+                    )
+                    continue
                 try:
                     session._require_video_job_lineage()
                 except RuntimeError as exc:
@@ -491,13 +616,186 @@ def run_v2_interactive(
                         "Provider execution belongs to the later Provider Runtime phase."
                     )
             else:
-                output_fn("V2 当前支持 /confirm-plan、/plan、/build-film-ir、/analysis、/optimize、/revision、/revise、/revision-guard、/revision-apply、/revision-rollback、/build-ir、/compile、/diagnostics、/render、/help、/quit。")
+                output_fn("V2 当前支持 /confirm-plan、/plan、/build-film-ir、/analysis、/optimize、/revision、/revise、/revision-guard、/revision-apply、/revision-rollback、/build-ir、/compile、/build-execution-plan、/show-execution-plan、/validate-execution-plan、/start-execution、/step-execution、/run-execution、/resume-execution、/cancel-execution、/execution-status、/execution-events、/execution-checkpoint、/providers、/provider-capabilities、/provider-contract-check、/diagnostics、/render、/help、/quit。")
         except (RuntimeError, ValueError, IndexError) as exc:
             output_fn(f"未执行：{exc}")
     target.mkdir(parents=True, exist_ok=True)
     session.save(target / "session.json")
     output_fn(f"V2 会话已保存：{target / 'session.json'}")
     return session
+
+
+def _print_execution_plan_summary(
+    session: GuidedStorySession,
+    output_fn: Callable[[str], None],
+) -> None:
+    bundle = session.execution_bundle
+    if bundle is None:
+        output_fn("当前没有 ExecutionBundle；请先执行 /build-execution-plan。")
+        return
+    plan = bundle.execution_plan
+    validation = session.validate_current_execution_plan()
+    output_fn(f"ExecutionPlan ID: {plan.execution_plan_id}")
+    output_fn(f"ExecutionPlan version: {plan.execution_plan_version}")
+    output_fn(f"ExecutionPlan fingerprint: {plan.execution_plan_fingerprint}")
+    output_fn(f"ExecutionBundle fingerprint: {bundle.bundle_fingerprint}")
+    output_fn(f"ExecutionUnit 数量: {len(plan.execution_units)}")
+    output_fn(f"VideoJob 数量: {len(bundle.video_jobs)}")
+    output_fn(
+        "Provider assignments: "
+        + ", ".join(item.provider_key for item in plan.provider_assignments)
+    )
+    output_fn(f"DAG 状态: {validation.status}")
+    if session.execution_bundle is not None:
+        output_fn("provider_job: null")
+        output_fn("artifact: null")
+    output_fn("MP4: null（本阶段不生成）")
+    if not validation.valid:
+        output_fn("推荐下一步命令：/build-execution-plan")
+
+
+def _print_execution_status(
+    session: GuidedStorySession,
+    output_fn: Callable[[str], None],
+    *,
+    runtime_root: str | Path | None = None,
+) -> None:
+    status = session.execution_status(runtime_root=runtime_root)
+    output_fn(f"ExecutionRun ID: {status.get('execution_run_id') or 'none'}")
+    output_fn(f"Bundle fingerprint: {status.get('execution_bundle_fingerprint') or 'none'}")
+    output_fn(f"总体状态: {status.get('status') or 'none'}")
+    output_fn(f"Unit 状态统计: {status.get('unit_state_counts', {})}")
+    output_fn(f"Ready Units: {status.get('ready_units', [])}")
+    output_fn(f"Running Units: {status.get('running_units', [])}")
+    output_fn(f"Blocked Units: {status.get('blocked_units', [])}")
+    output_fn(f"Failed Units: {status.get('failed_units', [])}")
+    output_fn(f"Submission Uncertain Units: {status.get('submission_uncertain_units', [])}")
+    output_fn(f"最新 Checkpoint: {status.get('latest_checkpoint_id') or 'none'}")
+    output_fn(f"Provider submit counts: {status.get('provider_submit_counts', {})}")
+    output_fn(f"Provider poll counts: {status.get('provider_poll_counts', {})}")
+    output_fn(f"Artifact counts: {status.get('artifact_count', 0)}；MP4=null")
+    for key, job in status.get("provider_jobs", {}).items():
+        output_fn(
+            f"ProviderJob {key}: provider={job.get('provider_key')}; "
+            f"status={job.get('status')}; capability={job.get('capability_match_status')}; "
+            "contract=provider-job/1"
+        )
+    for item in status.get("provider_capability_diagnostics", []):
+        output_fn(f"Provider capability: {item}")
+    for item in status.get("diagnostics", []):
+        output_fn(f"诊断: {item}")
+
+
+def _cli_provider_registry() -> ProviderRuntimeRegistry:
+    registry = ProviderRuntimeRegistry.with_fake(provider_keys=("fake", "offline-v2"))
+    registry.register(
+        MockHttpProviderRuntime(
+            MockHttpTransport(),
+            authorization="",
+        )
+    )
+    return registry
+
+
+def _print_provider_list(session: GuidedStorySession, output_fn: Callable[[str], None]) -> None:
+    del session
+    registry = _cli_provider_registry()
+    for key in registry.list_provider_keys():
+        provider = registry.get(key)
+        capabilities = provider.capabilities()
+        output_fn(
+            f"provider={key}; profile={capabilities.provider_profile}; registered=true; "
+            f"supports_idempotency={capabilities.supports_idempotency}; "
+            f"supports_cancel={capabilities.supports_cancel}; "
+            f"supports_resume_download={capabilities.supports_resume_download}; "
+            f"capability_fingerprint={capabilities.capability_fingerprint}"
+        )
+
+
+def _print_provider_capabilities(provider_key: str, output_fn: Callable[[str], None]) -> None:
+    provider = _cli_provider_registry().get(provider_key)
+    output_fn(f"Provider capabilities: {provider_key}")
+    for key, value in provider.capabilities().to_dict().items():
+        output_fn(f"  {key}: {value}")
+
+
+def _run_provider_contract_smoke(provider_key: str, root: Path) -> dict[str, Any]:
+    if provider_key not in {"fake", "mock-http"}:
+        raise ValueError("/provider-contract-check 只允许 fake 或 mock-http。")
+    root = root.resolve()
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    if provider_key == "fake":
+        provider = FakeProviderRuntime()
+        transport = None
+    else:
+        transport = MockHttpTransport(
+            [
+                HttpResponse(202, json_data={"task_id": "mock-contract-task", "status": "queued"}),
+                HttpResponse(200, json_data={"task_id": "mock-contract-task", "status": "completed", "output_url": "mock://artifact/mock-contract-task"}),
+                HttpResponse(200, headers={"Content-Type": "application/octet-stream"}, content=b"MOCK-CONTRACT-BINARY"),
+            ]
+        )
+        provider = MockHttpProviderRuntime(transport)
+    context = ProviderRequestContext(
+        request_id="contract-request",
+        execution_run_id="contract-run",
+        execution_unit_id="contract-unit",
+        idempotency_key="contract-idempotency",
+        attempt=1,
+        execution_plan_id="contract-plan",
+        execution_plan_fingerprint="contract-plan-fingerprint",
+        video_job_id="contract-job",
+        video_job_fingerprint="contract-job-fingerprint",
+        source_movie_plan_version=1,
+        source_movie_plan_fingerprint="contract-movie-fingerprint",
+        source_movie_plan_lineage_token="contract-lineage-token",
+        submit_timeout_seconds=10,
+        poll_timeout_seconds=10,
+        download_timeout_seconds=10,
+        trace_id="contract-trace",
+    )
+    video_job = SimpleNamespace(job_id="contract-job", provider_prompt="offline contract prompt", video_job_fingerprint="contract-job-fingerprint", duration_seconds=1.0, aspect_ratio="16:9")
+    try:
+        submit = provider.submit(video_job, context)
+        job = submit.provider_job
+        poll_count = 0
+        while True:
+            poll = provider.poll(job, context)
+            poll_count += 1
+            job = poll.provider_job
+            if poll.status is ProviderJobStatus.SUCCEEDED:
+                break
+        destination = DownloadDestination(str(root / "artifact.bin.part"), str(root / "artifact.bin"))
+        download = provider.download(job, destination, context)
+        verification = provider.verify(job, download, context)
+        return {
+            "provider_key": provider_key,
+            "submitted": True,
+            "poll_count": poll_count,
+            "verified": verification.valid,
+            "real_network_calls": int(getattr(transport, "real_network_calls", 0)) if transport else 0,
+            "mp4_generated": False,
+        }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _print_execution_events(
+    session: GuidedStorySession,
+    output_fn: Callable[[str], None],
+    *,
+    runtime_root: str | Path | None = None,
+) -> None:
+    events = session.execution_events(limit=30, runtime_root=runtime_root)
+    if not events:
+        output_fn("当前没有 Runtime 事件；请先执行 /start-execution。")
+        return
+    for event in events:
+        output_fn(
+            f"{event.get('sequence_number')}: {event.get('event_type')} "
+            f"unit={event.get('execution_unit_id') or '-'} payload={event.get('payload', {})}"
+        )
 
 
 def _print_v2_diagnostics(
@@ -531,6 +829,9 @@ def _print_v2_diagnostics(
         ("stale_artifacts", session.stale_artifacts),
         ("source_lineage_diagnostics", session.source_lineage_diagnostics),
         ("stale_lineage_diagnostics", session.stale_lineage_diagnostics),
+        ("execution_plan_diagnostics", session.execution_plan_diagnostics),
+        ("stale_execution_artifacts", session.stale_execution_artifacts),
+        ("execution_runtime_diagnostics", session.execution_runtime_diagnostics),
     )
     for name, items in groups:
         output_fn(f"{name}: {len(items)}")
@@ -540,8 +841,14 @@ def _print_v2_diagnostics(
             output_fn(
                 f"  {label}: {message}"
             )
+    if session._execution_runtime is not None:
+        output_fn(f"registered_provider_keys: {session._execution_runtime.provider_registry.list_provider_keys()}")
+        output_fn("provider_response_redaction_status: enforced at adapter result boundary")
     lineage = SourceLineageGuard()
     plan_id, story_id, director_id = session._lineage_ids()
+    plan_version = session.current_movie_plan_version
+    plan_fingerprint = session.current_movie_plan_fingerprint
+    plan_token = session.current_movie_plan_lineage_token
     lineage_results = (
         (
             "FilmIR",
@@ -551,6 +858,9 @@ def _print_v2_diagnostics(
                 current_story_plan_id=story_id or "",
                 current_director_plan_id=director_id or "",
                 current_film_ir_id=session.current_film_ir_id or "",
+                current_movie_plan_version=plan_version,
+                current_movie_plan_fingerprint=plan_fingerprint,
+                current_movie_plan_lineage_token=plan_token,
             ),
             "/build-film-ir",
         ),
@@ -561,6 +871,9 @@ def _print_v2_diagnostics(
                 current_movie_plan_id=plan_id or "",
                 current_film_ir_id=session.current_film_ir_id or "",
                 current_movie_ir_id=session.current_movie_ir_id or "",
+                current_movie_plan_version=plan_version,
+                current_movie_plan_fingerprint=plan_fingerprint,
+                current_movie_plan_lineage_token=plan_token,
             ),
             "/build-ir",
         ),
@@ -572,8 +885,30 @@ def _print_v2_diagnostics(
                 current_film_ir_id=session.current_film_ir_id or "",
                 current_movie_ir_id=session.current_movie_ir_id or "",
                 current_video_job_id=session.current_video_job_id or "",
+                current_movie_plan_version=plan_version,
+                current_movie_plan_fingerprint=plan_fingerprint,
+                current_movie_plan_lineage_token=plan_token,
             ),
             "/compile",
+        ),
+        (
+            "ExecutionBundle",
+            lineage.check_execution_bundle(
+                session.execution_bundle,
+                current_movie_plan_id=plan_id or "",
+                current_movie_plan_version=plan_version,
+                current_movie_plan_fingerprint=plan_fingerprint,
+                current_movie_plan_lineage_token=plan_token,
+                current_film_ir_id=session.current_film_ir_id or "",
+                current_film_ir_fingerprint=(
+                    content_fingerprint(session.film_ir.to_dict()) if session.film_ir else None
+                ),
+                current_movie_ir_id=session.current_movie_ir_id or "",
+                current_movie_ir_fingerprint=(
+                    content_fingerprint(session.movie_ir.to_dict()) if session.movie_ir else None
+                ),
+            ),
+            "/build-execution-plan",
         ),
     )
     for label, result, action in lineage_results:
@@ -581,6 +916,7 @@ def _print_v2_diagnostics(
             "FilmIR": "film_ir",
             "MovieIR": "movie_ir",
             "VideoJob": "v2_video_job",
+            "ExecutionBundle": "execution_bundle",
         }[label], None):
             status = "missing"
         else:
@@ -621,10 +957,38 @@ def _print_v2_diagnostics(
     output_fn(f"director_revision_contexts: {len(session.director_revision_contexts)}")
     output_fn(f"guarded_revision_results: {len(session.guarded_revision_results)}")
     output_fn(f"current_movie_plan_id: {session.current_movie_plan_id or 'none'}")
+    output_fn(f"current_movie_plan_version: {session.current_movie_plan_version or 'unknown'}")
+    output_fn(f"current_movie_plan_fingerprint: {session.current_movie_plan_fingerprint or 'unknown'}")
+    output_fn(f"current_movie_plan_lineage_token: {session.current_movie_plan_lineage_token or 'unknown'}")
     output_fn(f"previous_movie_plan_id: {session.previous_movie_plan_id or 'none'}")
     output_fn(f"current_film_ir_id: {session.current_film_ir_id or 'none'}")
     output_fn(f"current_movie_ir_id: {session.current_movie_ir_id or 'none'}")
     output_fn(f"current_video_job_id: {session.current_video_job_id or 'none'}")
+    output_fn(f"current_execution_plan_id: {session.current_execution_plan_id or 'none'}")
+    output_fn(
+        "current_execution_plan_fingerprint: "
+        f"{session.current_execution_plan_fingerprint or 'none'}"
+    )
+    output_fn(
+        "current_execution_bundle_fingerprint: "
+        f"{session.current_execution_bundle_fingerprint or 'none'}"
+    )
+    output_fn(f"current_execution_run_id: {session.current_execution_run_id or 'none'}")
+    output_fn(f"execution_runtime_status: {session.execution_runtime_status or 'none'}")
+    output_fn(
+        "latest_execution_checkpoint_id: "
+        f"{session.latest_execution_checkpoint_id or 'none'}"
+    )
+    output_fn(
+        f"execution_units: {len(session.execution_plan.execution_units) if session.execution_plan else 0}"
+    )
+    output_fn(
+        f"execution_video_jobs: {len(session.execution_bundle.video_jobs) if session.execution_bundle else 0}"
+    )
+    if session.execution_bundle is not None:
+        output_fn(f"provider_jobs: {len(session.provider_jobs)} (Fake Provider only)")
+        output_fn(f"runtime_artifacts: {len(session.runtime_artifacts)} (Fake Artifact only)")
+        output_fn("MP4: null")
     output_fn(f"movie_plan_version_history: {len(session.movie_plan_version_history)}")
     output_fn(f"revision_apply_history: {len(session.revision_apply_history)}")
     output_fn(f"revision_rollback_history: {len(session.revision_rollback_history)}")
