@@ -365,7 +365,7 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
         session.render_confirmed_plan(Renderer(), "outputs")
         self.assertEqual(Stage.COMPLETED, session.stage)
 
-    def test_schema_v5_roundtrip_and_legacy_read_only_migration(self) -> None:
+    def test_current_schema_roundtrip_and_legacy_read_only_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session = started()
             session.auto_choose()
@@ -376,7 +376,10 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
             storyboard = session.build_storyboard()
             path = session.save(Path(temp_dir) / "v5.json")
             loaded = GuidedStorySession.load(path, agent=RuleBasedStoryAgent())
-            self.assertEqual(5, json.loads(path.read_text(encoding="utf-8"))["schema_version"])
+            self.assertEqual(
+                GuidedStorySession.schema_version,
+                json.loads(path.read_text(encoding="utf-8"))["schema_version"],
+            )
             self.assertEqual(session.direction, loaded.direction)
             self.assertEqual(session.selected_idea_ids, loaded.selected_idea_ids)
             self.assertEqual(session.story.story_text, loaded.story.story_text)
