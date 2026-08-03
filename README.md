@@ -262,7 +262,7 @@ Fake/Mock Provider 仍只用于离线 Runtime、Provider 合约检查和测试�
 或 MP4 生成；`/render` 仍不会把 V2 离线 Runtime 偷换成真实渲染。真实 Agnes 链和 V2
 离线链仍是两条明确的交付边界，后续阶段再单独评估真实 Provider 接入。
 
-## v0.7：bounded and auditable Agentic Production Runtime
+## v1.0.0：bounded and auditable Agentic Production Runtime
 
 V2 现在具备结构化 Provider 失败状态、不可变修订候选、RevisionGuard、checkpoint、
 事件记录和幂等执行。`ProviderFailureReport` 会把失败路由为安全重试、停止告警、等待
