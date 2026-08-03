@@ -20,6 +20,14 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionCheckpoint:
     checkpoint_id: str
@@ -35,6 +43,8 @@ class ExecutionCheckpoint:
     retry_records: tuple[Mapping[str, Any], ...] = ()
     artifact_references: tuple[Mapping[str, Any], ...] = ()
     active_leases: tuple[Mapping[str, Any], ...] = ()
+    failure_reports: tuple[Mapping[str, Any], ...] = ()
+    revision_requests: tuple[Mapping[str, Any], ...] = ()
     scheduler_cursor: str | None = None
     last_event_id: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -50,6 +60,8 @@ class ExecutionCheckpoint:
             "retry_records",
             "artifact_references",
             "active_leases",
+            "failure_reports",
+            "revision_requests",
         ):
             object.__setattr__(self, name, tuple(dict(item) for item in getattr(self, name)))
         if not self.checkpoint_fingerprint:
@@ -75,12 +87,14 @@ class ExecutionCheckpoint:
             "execution_plan_id": self.execution_plan_id,
             "execution_plan_version": self.execution_plan_version,
             "execution_plan_fingerprint": self.execution_plan_fingerprint,
-            "unit_states": [dict(item) for item in self.unit_states],
-            "provider_jobs": [dict(item) for item in self.provider_jobs],
-            "submission_intents": [dict(item) for item in self.submission_intents],
-            "retry_records": [dict(item) for item in self.retry_records],
-            "artifact_references": [dict(item) for item in self.artifact_references],
-            "active_leases": [dict(item) for item in self.active_leases],
+            "unit_states": [_plain(item) for item in self.unit_states],
+            "provider_jobs": [_plain(item) for item in self.provider_jobs],
+            "submission_intents": [_plain(item) for item in self.submission_intents],
+            "retry_records": [_plain(item) for item in self.retry_records],
+            "artifact_references": [_plain(item) for item in self.artifact_references],
+            "active_leases": [_plain(item) for item in self.active_leases],
+            "failure_reports": [_plain(item) for item in self.failure_reports],
+            "revision_requests": [_plain(item) for item in self.revision_requests],
             "scheduler_cursor": self.scheduler_cursor,
             "last_event_id": self.last_event_id,
             "created_at": self.created_at,
@@ -103,6 +117,8 @@ class ExecutionCheckpoint:
             retry_records=tuple(dict(item) for item in run.retry_records),
             artifact_references=tuple(dict(item) for item in run.artifacts.values()),
             active_leases=tuple(dict(item) for item in run.leases.values()),
+            failure_reports=tuple(dict(item) for item in run.failure_reports),
+            revision_requests=tuple(dict(item) for item in run.revision_requests),
             scheduler_cursor=scheduler_cursor,
             last_event_id=run.last_event_id,
         )
@@ -123,6 +139,8 @@ class ExecutionCheckpoint:
             retry_records=tuple(dict(item) for item in data.get("retry_records", [])),
             artifact_references=tuple(dict(item) for item in data.get("artifact_references", [])),
             active_leases=tuple(dict(item) for item in data.get("active_leases", [])),
+            failure_reports=tuple(dict(item) for item in data.get("failure_reports", [])),
+            revision_requests=tuple(dict(item) for item in data.get("revision_requests", [])),
             scheduler_cursor=data.get("scheduler_cursor"),
             last_event_id=data.get("last_event_id"),
             created_at=str(data.get("created_at", utc_now())),

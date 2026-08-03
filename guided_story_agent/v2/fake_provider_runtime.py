@@ -214,10 +214,17 @@ class FakeProviderRuntime:
                 provider_code="poll_transient",
                 retryable=True,
             )
-        if self.scenario.name == "non_retryable_failure":
+        if self.scenario.name in {"non_retryable_failure", "policy_rejected", "unsupported_capability"}:
+            category = (
+                ProviderErrorCategory.POLICY_REJECTED
+                if self.scenario.name == "policy_rejected"
+                else ProviderErrorCategory.UNSUPPORTED_CAPABILITY
+                if self.scenario.name == "unsupported_capability"
+                else ProviderErrorCategory.INVALID_REQUEST
+            )
             raise ProviderRuntimeError(
                 "fake provider failed while polling",
-                category=ProviderErrorCategory.POLICY_REJECTED,
+                category=category,
                 provider_key=self.provider_key,
                 provider_code="poll_rejected",
             )

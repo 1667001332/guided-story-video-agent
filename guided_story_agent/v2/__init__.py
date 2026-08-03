@@ -114,6 +114,15 @@ from .provider_runtime import (
 )
 from .provider_capabilities import DurationRange, ProviderCapabilities as RuntimeProviderCapabilities
 from .provider_errors import ProviderErrorCategory
+from .failure_protocol import (
+    ExecutionRecompilePort,
+    FailureAction,
+    FailureProtocol,
+    FailureResolution,
+    ProviderFailureReport,
+    ProviderRevisionRequest,
+    RevisionRequest,
+)
 from .provider_results import (
     DownloadDestination,
     ProviderCancelResult,
@@ -473,6 +482,13 @@ __all__ = [
     "RuntimeProviderCapabilities",
     "DurationRange",
     "ProviderErrorCategory",
+    "FailureAction",
+    "FailureProtocol",
+    "FailureResolution",
+    "ProviderFailureReport",
+    "ProviderRevisionRequest",
+    "RevisionRequest",
+    "ExecutionRecompilePort",
     "ProviderJobStatus",
     "SystemClock",
     "ProviderNotRegisteredError",

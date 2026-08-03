@@ -261,3 +261,18 @@ ExecutionPlan、ExecutionBundle、ExecutionRuntime、持久化 checkpoint/event/
 Fake/Mock Provider 仍只用于离线 Runtime、Provider 合约检查和测试，不代表真实 Provider
 或 MP4 生成；`/render` 仍不会把 V2 离线 Runtime 偷换成真实渲染。真实 Agnes 链和 V2
 离线链仍是两条明确的交付边界，后续阶段再单独评估真实 Provider 接入。
+
+## v0.7：bounded and auditable Agentic Production Runtime
+
+V2 现在具备结构化 Provider 失败状态、不可变修订候选、RevisionGuard、checkpoint、
+事件记录和幂等执行。`ProviderFailureReport` 会把失败路由为安全重试、停止告警、等待
+显式修订或终止；Policy/Capability 失败只能生成 RevisionRequest，必须经过现有的
+RevisionCandidate、RevisionDiff 和 RevisionGuard，不能直接修改 MoviePlan 或自动 Apply。
+
+显式 Apply 后，旧的 FilmIR、MovieIR、VideoJob、ExecutionPlan、ExecutionBundle 和
+ExecutionRun 必须标记为 stale，并通过安全的重编译边界生成新的 ExecutionBundle 指纹；
+旧 ExecutionRun 不会被伪装成新计划继续运行。`SUBMISSION_UNCERTAIN` 会持久化提交意图、
+事件和 checkpoint，阻止自动 resume 与自动重新提交，必须先由用户到 Provider 后台核对。
+
+V2 Fake/Mock Runtime 只证明离线状态机、幂等、事件和安全边界成立，不等同于真实 Provider
+成功、真实视频生成或付费接口验收。

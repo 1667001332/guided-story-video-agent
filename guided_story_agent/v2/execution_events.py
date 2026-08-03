@@ -15,7 +15,23 @@ from .provider_sanitization import REDACTED, SENSITIVE_KEYS, sanitize_response
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
-_SECRET_WORDS = set(SENSITIVE_KEYS) | {"bearer"}
+_SECRET_WORDS = set(SENSITIVE_KEYS) | {
+    "bearer",
+    "endpoint",
+    "payload",
+    "provider_payload",
+    "request_payload",
+    "response_body",
+    "http_payload",
+}
+
+
+PROVIDER_FAILURE_CLASSIFIED = "PROVIDER_FAILURE_CLASSIFIED"
+EXECUTION_RETRY_SCHEDULED = "EXECUTION_RETRY_SCHEDULED"
+EXECUTION_BLOCKED_SUBMISSION_UNCERTAIN = "EXECUTION_BLOCKED_SUBMISSION_UNCERTAIN"
+REVISION_REQUESTED = "REVISION_REQUESTED"
+REVISION_APPLIED = "REVISION_APPLIED"
+EXECUTION_ARTIFACTS_INVALIDATED = "EXECUTION_ARTIFACTS_INVALIDATED"
 
 
 def _ensure_safe_payload(value: Any, path: str = "payload") -> None:
@@ -179,7 +195,13 @@ class JsonExecutionEventStore:
 
 __all__ = [
     "ExecutionEventStore",
+    "EXECUTION_ARTIFACTS_INVALIDATED",
+    "EXECUTION_BLOCKED_SUBMISSION_UNCERTAIN",
+    "EXECUTION_RETRY_SCHEDULED",
     "InMemoryExecutionEventStore",
     "JsonExecutionEventStore",
+    "PROVIDER_FAILURE_CLASSIFIED",
+    "REVISION_APPLIED",
+    "REVISION_REQUESTED",
     "RuntimeEvent",
 ]

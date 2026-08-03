@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Any
 
@@ -30,7 +31,18 @@ SENSITIVE_KEYS = frozenset(
         "signed_url",
         "credential",
         "password",
+        "endpoint",
+        "payload",
+        "provider_payload",
+        "request_payload",
+        "response_body",
+        "http_payload",
     }
+)
+
+_BEARER_PATTERN = re.compile(r"(?i)(\bbearer\s+)[^\s,;]+")
+_SECRET_TEXT_PATTERN = re.compile(
+    r"(?i)(\b(?:authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password|cookie|signature)\s*[:=]\s*)[^\s,;&]+"
 )
 
 
@@ -62,13 +74,24 @@ def sanitize_value(value: Any, *, _key: str | None = None) -> Any:
         return [sanitize_value(item) for item in value]
     if isinstance(value, tuple):
         return tuple(sanitize_value(item) for item in value)
-    if isinstance(value, str) and ("://" in value or value.startswith("?")):
-        return _sanitize_url(value)
+    if isinstance(value, str):
+        value = sanitize_text(value)
+        if "://" in value or value.startswith("?"):
+            return _sanitize_url(value)
+        return value
     return deepcopy(value)
 
 
 def sanitize_response(value: Any) -> Any:
     return sanitize_value(value)
+
+
+def sanitize_text(value: str) -> str:
+    """Redact credentials embedded in provider exception text or diagnostics."""
+
+    text = str(value)
+    text = _BEARER_PATTERN.sub(r"\1[REDACTED]", text)
+    return _SECRET_TEXT_PATTERN.sub(r"\1[REDACTED]", text)
 
 
 def sanitize_headers(headers: Mapping[str, Any]) -> dict[str, Any]:
@@ -91,5 +114,6 @@ __all__ = [
     "contains_sensitive_value",
     "sanitize_headers",
     "sanitize_response",
+    "sanitize_text",
     "sanitize_value",
 ]

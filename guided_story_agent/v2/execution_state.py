@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .provider_results import ProviderJobStatus
-from .provider_sanitization import sanitize_response
+from .provider_sanitization import sanitize_response, sanitize_text
 
 
 def utc_now() -> str:
@@ -93,6 +93,7 @@ class RuntimeErrorRecord:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "message", sanitize_text(self.message))
         object.__setattr__(self, "metadata", _freeze(sanitize_response(self.metadata)))
 
     def to_dict(self) -> dict[str, Any]:
@@ -311,6 +312,8 @@ class ExecutionRun:
     latest_checkpoint_id: str | None = None
     last_event_id: str | None = None
     diagnostics: tuple[str, ...] = ()
+    failure_reports: tuple[Mapping[str, Any], ...] = ()
+    revision_requests: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "unit_states", MappingProxyType(dict(self.unit_states)))
@@ -320,6 +323,8 @@ class ExecutionRun:
         object.__setattr__(self, "leases", _freeze(self.leases))
         object.__setattr__(self, "artifacts", _freeze(self.artifacts))
         object.__setattr__(self, "diagnostics", tuple(str(item) for item in self.diagnostics))
+        object.__setattr__(self, "failure_reports", tuple(_freeze(item) for item in self.failure_reports))
+        object.__setattr__(self, "revision_requests", tuple(_freeze(item) for item in self.revision_requests))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -346,6 +351,8 @@ class ExecutionRun:
             "latest_checkpoint_id": self.latest_checkpoint_id,
             "last_event_id": self.last_event_id,
             "diagnostics": list(self.diagnostics),
+            "failure_reports": _plain(self.failure_reports),
+            "revision_requests": _plain(self.revision_requests),
         }
 
     @classmethod
@@ -380,6 +387,8 @@ class ExecutionRun:
             latest_checkpoint_id=data.get("latest_checkpoint_id"),
             last_event_id=data.get("last_event_id"),
             diagnostics=tuple(str(item) for item in data.get("diagnostics", [])),
+            failure_reports=tuple(data.get("failure_reports", [])),
+            revision_requests=tuple(data.get("revision_requests", [])),
         )
 
 

@@ -17,7 +17,16 @@ from uuid import uuid4
 
 from .execution_bundle import ExecutionBundle
 from .execution_checkpoint import CheckpointStore, ExecutionCheckpoint, InMemoryCheckpointStore
-from .execution_events import ExecutionEventStore, InMemoryExecutionEventStore
+from .execution_events import (
+    EXECUTION_ARTIFACTS_INVALIDATED,
+    EXECUTION_BLOCKED_SUBMISSION_UNCERTAIN,
+    EXECUTION_RETRY_SCHEDULED,
+    PROVIDER_FAILURE_CLASSIFIED,
+    REVISION_APPLIED,
+    REVISION_REQUESTED,
+    ExecutionEventStore,
+    InMemoryExecutionEventStore,
+)
 from .execution_plan_validation import validate_execution_bundle
 from .execution_scheduler import DependencyResolver, RuntimeTransitionService
 from .execution_state import (
@@ -32,6 +41,7 @@ from .fake_artifact_verifier import ArtifactRecord, FakeArtifactVerifier
 from .provider_registry import ProviderRuntimeRegistry
 from .provider_capabilities import capability_snapshot_diagnostics
 from .provider_errors import ProviderErrorCategory
+from .failure_protocol import FailureAction, FailureProtocol
 from .provider_results import (
     DownloadDestination,
     ProviderCancelResult,
@@ -98,10 +108,12 @@ class ExecutionRuntime:
         artifact_root: str | Path | None = None,
         clock: Clock | None = None,
         owner_id: str = "offline-runtime",
+        failure_protocol: FailureProtocol | None = None,
     ) -> None:
         self.execution_bundle = execution_bundle
         self.clock = clock or SystemClock()
         self.owner_id = owner_id
+        self.failure_protocol = failure_protocol or FailureProtocol()
         self.provider_registry = provider_registry or ProviderRuntimeRegistry()
         self.artifact_verifier = artifact_verifier or FakeArtifactVerifier()
         self.capability_diagnostics: tuple[dict[str, str], ...] = ()
@@ -321,6 +333,8 @@ class ExecutionRuntime:
             submission_intents=intents,
             retry_records=checkpoint.retry_records,
             artifacts=artifacts,
+            failure_reports=checkpoint.failure_reports,
+            revision_requests=checkpoint.revision_requests,
             leases=leases,
             latest_checkpoint_id=checkpoint.checkpoint_id,
             last_event_id=checkpoint.last_event_id,
@@ -335,8 +349,9 @@ class ExecutionRuntime:
         self._ensure_fresh(run)
         if run.status == ExecutionRunStatus.STALE:
             raise StaleExecutionRuntimeError("stale Runtime 禁止 resume。")
-        if run.status == ExecutionRunStatus.BLOCKED and any(
-            item.state == ExecutionState.SUBMISSION_UNCERTAIN for item in run.unit_states.values()
+        if run.status == ExecutionRunStatus.BLOCKED and (
+            any(item.state == ExecutionState.SUBMISSION_UNCERTAIN for item in run.unit_states.values())
+            or bool(run.revision_requests)
         ):
             return run
         return self.recover(self.execution_bundle, execution_run_id=execution_run_id)
@@ -404,6 +419,15 @@ class ExecutionRuntime:
                 return run
             run = self.step(execution_run_id)
             if run.to_dict() == before:
+                if isinstance(self.clock, FakeClock):
+                    retry_times = [
+                        _parse_iso(state.next_retry_at)
+                        for state in run.unit_states.values()
+                        if state.next_retry_at and _parse_iso(state.next_retry_at) > self.clock.now()
+                    ]
+                    if retry_times:
+                        self.clock.sleep((min(retry_times) - self.clock.now()).total_seconds())
+                        continue
                 return run
             if isinstance(self.clock, FakeClock) and run.status not in {
                 ExecutionRunStatus.COMPLETED,
@@ -542,12 +566,39 @@ class ExecutionRuntime:
             submit_timeout = unit.timeout_policy.submit_timeout
             if submit_timeout is not None and state.started_at:
                 if (self.clock.now() - _parse_iso(state.started_at)).total_seconds() >= submit_timeout:
-                    self._timeout_unit(run, unit_id, provider, reason="submit_timeout")
+                    self._handle_error(
+                        run,
+                        unit_id,
+                        ProviderRuntimeError(
+                            "Provider submit timed out; acceptance must be reconciled manually",
+                            category=ProviderErrorCategory.SUBMIT_TIMEOUT,
+                            provider_key=assignment.provider_key,
+                            provider_code="submit_timeout",
+                            submission_may_have_been_accepted=True,
+                        ),
+                        phase="submit",
+                    )
             return
         if self._unit_timed_out(state, unit):
-            self._timeout_unit(run, unit_id, provider, reason="unit_total_timeout")
+            if state.state in {ExecutionState.DOWNLOADING, ExecutionState.VERIFYING}:
+                self._handle_error(
+                    run,
+                    unit_id,
+                    ProviderRuntimeError(
+                        "Provider download timed out",
+                        category=ProviderErrorCategory.DOWNLOAD_TIMEOUT,
+                        provider_key=assignment.provider_key,
+                        provider_code="download_timeout",
+                        retryable=True,
+                    ),
+                    phase="verify" if state.state is ExecutionState.VERIFYING else "download",
+                )
+            else:
+                self._timeout_unit(run, unit_id, provider, reason="unit_total_timeout")
             return
         if state.state in {ExecutionState.SUBMITTED, ExecutionState.QUEUED, ExecutionState.RUNNING}:
+            if state.next_retry_at and _parse_iso(state.next_retry_at) > self.clock.now():
+                return
             provider_job = run.provider_jobs.get(state.provider_job_id or "")
             if provider_job is None:
                 self._handle_error(run, unit_id, ProviderRuntimeError("ProviderJob missing after submit", category="invalid_state", code="missing_provider_job"), phase="poll")
@@ -556,7 +607,18 @@ class ExecutionRuntime:
             if poll_timeout is not None:
                 reference = provider_job.last_polled_at or state.started_at
                 if reference and (self.clock.now() - _parse_iso(reference)).total_seconds() >= poll_timeout:
-                    self._timeout_unit(run, unit_id, provider, reason="poll_timeout")
+                    self._handle_error(
+                        run,
+                        unit_id,
+                        ProviderRuntimeError(
+                            "Provider poll timed out",
+                            category=ProviderErrorCategory.POLL_TIMEOUT,
+                            provider_key=assignment.provider_key,
+                            provider_code="poll_timeout",
+                            retryable=True,
+                        ),
+                        phase="poll",
+                    )
                     return
             try:
                 result = provider.poll(provider_job, self._context(run, unit, assignment, video_job, phase="poll"))
@@ -648,6 +710,9 @@ class ExecutionRuntime:
                 run = self._load_run(run.execution_run_id)
                 self.transition_service.transition(run, unit_id, ExecutionState.DOWNLOADING, event_type="download_started", reason="provider output ready")
                 self._download_and_verify(self._load_run(run.execution_run_id), unit_id, provider, unit, assignment)
+                return
+        if state.state in {ExecutionState.DOWNLOADING, ExecutionState.VERIFYING} and state.next_retry_at:
+            if _parse_iso(state.next_retry_at) > self.clock.now():
                 return
         if state.state == ExecutionState.DOWNLOADING:
             self._download_and_verify(run, unit_id, provider, unit, assignment)
@@ -847,68 +912,150 @@ class ExecutionRuntime:
     def _handle_error(self, run: ExecutionRun, unit_id: str, exc: ProviderRuntimeError, *, phase: str) -> None:
         state = run.unit_states[unit_id]
         unit, assignment, _ = self._assignment(self._bundle_or_raise(), unit_id)
-        category = exc.category.value
-        error = RuntimeErrorRecord(
-            error_id=f"runtime-error-{uuid4().hex}",
-            category=category,
-            code=exc.code,
-            message=str(exc),
-            retryable=exc.retryable,
-            provider_key=assignment.provider_key,
-            metadata={"phase": phase, **exc.metadata},
+        current = self._load_run(run.execution_run_id)
+        report = self.failure_protocol.build_report(
+            exc,
+            execution_run_id=current.execution_run_id,
+            execution_unit_id=unit_id,
+            provider_job_id=state.provider_job_id,
+            source_movie_plan_id=current.source_movie_plan_id,
+            source_movie_plan_fingerprint=current.source_movie_plan_fingerprint,
+            source_video_job_fingerprint=state.video_job_fingerprint,
         )
-        if exc.category is ProviderErrorCategory.SUBMISSION_UNCERTAIN or exc.provider_accepted:
+        global_budget = self._bundle_or_raise().execution_plan.runtime_policy.retry_budget
+        resolution = self.failure_protocol.resolve(
+            report,
+            retry_count=state.retry_count,
+            max_attempts=unit.retry_policy.max_attempts,
+            retry_budget_remaining=(
+                global_budget is None or len(current.retry_records) < global_budget
+            ),
+            retryable_error_codes=unit.retry_policy.retryable_error_codes,
+            error_code=exc.code,
+        )
+        self.state_store.save_failure_report(current.execution_run_id, report.to_dict())
+        classified_payload = self.failure_protocol.event_payload(
+            report,
+            resolution,
+            retry_count=state.retry_count,
+        )
+        classified_payload["phase"] = phase
+        self.event_store.append(
+            current.execution_run_id,
+            PROVIDER_FAILURE_CLASSIFIED,
+            execution_unit_id=unit_id,
+            payload=classified_payload,
+        )
+        error = RuntimeErrorRecord(
+            error_id=report.failure_id,
+            category=report.category.value,
+            code=exc.code,
+            message=report.message,
+            retryable=report.retryable,
+            provider_key=assignment.provider_key,
+            metadata={"phase": phase, **dict(report.sanitized_details)},
+        )
+        if resolution.action is FailureAction.STOP_AND_WARN:
             self.transition_service.transition(
-                run,
+                current,
                 unit_id,
                 ExecutionState.SUBMISSION_UNCERTAIN,
                 event_type="provider_submit_uncertain",
-                reason="provider acceptance cannot be confirmed; manual recovery required",
-                metadata={"last_error": error.to_dict()},
+                reason=resolution.reason,
+                metadata={"last_error": error.to_dict(), "action": resolution.action.value},
             )
-            current = self._load_run(run.execution_run_id)
+            current = self._load_run(current.execution_run_id)
             intent_values = dict(current.submission_intents)
             for key, raw in intent_values.items():
                 if raw.get("execution_unit_id") == unit_id:
                     intent_values[key] = {**raw, "status": "submission_uncertain", "provider_invocation_started": True}
             self.state_store.save_run(replace(current, submission_intents=intent_values))
-            self.event_store.append(run.execution_run_id, "runtime_blocked", execution_unit_id=unit_id, payload={"reason": "SUBMISSION_UNCERTAIN", "recommended_action": "manual provider reconciliation; do not resubmit"})
-            self._release_lease(self._load_run(run.execution_run_id), unit_id)
+            # The uncertainty marker is part of the durable recovery boundary;
+            # persist it after updating the submission intent, not only in the
+            # state store.
+            self.checkpoint(current.execution_run_id)
+            self.event_store.append(
+                current.execution_run_id,
+                EXECUTION_BLOCKED_SUBMISSION_UNCERTAIN,
+                execution_unit_id=unit_id,
+                payload={
+                    **self.failure_protocol.event_payload(
+                        report,
+                        resolution,
+                        retry_count=state.retry_count,
+                    ),
+                    "recommended_action": "manual provider reconciliation; do not resubmit",
+                },
+            )
+            # Keep the legacy event for consumers that still display the old
+            # lower-case runtime vocabulary.
+            self.event_store.append(
+                current.execution_run_id,
+                "runtime_blocked",
+                execution_unit_id=unit_id,
+                payload={"reason": "SUBMISSION_UNCERTAIN", "recommended_action": "manual provider reconciliation; do not resubmit"},
+            )
+            self._release_lease(self._load_run(current.execution_run_id), unit_id)
             return
-        retryable_category = exc.category in {
-            ProviderErrorCategory.TRANSIENT_NETWORK,
-            ProviderErrorCategory.RATE_LIMITED,
-            ProviderErrorCategory.PROVIDER_UNAVAILABLE,
-            ProviderErrorCategory.SUBMIT_TIMEOUT,
-            ProviderErrorCategory.POLL_TIMEOUT,
-            ProviderErrorCategory.DOWNLOAD_TIMEOUT,
-            ProviderErrorCategory.DOWNLOAD_INTERRUPTED,
-        }
-        allowed_codes = set(unit.retry_policy.retryable_error_codes)
-        allowed = exc.retryable and retryable_category and (
-            not allowed_codes
-            or exc.code in allowed_codes
-            or category in allowed_codes
-            or category.lower() in allowed_codes
-        )
-        global_budget = getattr(self._bundle_or_raise().execution_plan.runtime_policy, "retry_budget", None)
-        budget = state.retry_count < max(0, unit.retry_policy.max_attempts - 1)
-        if global_budget is not None:
-            budget = budget and len(run.retry_records) < global_budget
-        if allowed and budget:
+        if resolution.action is FailureAction.REQUEST_REVISION:
+            revision_request = self.failure_protocol.create_revision_request(
+                report,
+                request_id=resolution.revision_request_id,
+            )
+            current = self.state_store.save_revision_request(
+                current.execution_run_id,
+                revision_request.to_dict(),
+            )
+            self.transition_service.transition(
+                current,
+                unit_id,
+                ExecutionState.BLOCKED,
+                event_type="execution_waiting_for_revision",
+                reason=resolution.reason,
+                metadata={
+                    "last_error": error.to_dict(),
+                    "action": resolution.action.value,
+                    "revision_request_id": revision_request.request_id,
+                },
+            )
+            self.event_store.append(
+                current.execution_run_id,
+                REVISION_REQUESTED,
+                execution_unit_id=unit_id,
+                payload=self.failure_protocol.event_payload(
+                    report,
+                    resolution,
+                    retry_count=state.retry_count,
+                    revision_request_id=revision_request.request_id,
+                ),
+            )
+            self._release_lease(self._load_run(current.execution_run_id), unit_id)
+            return
+        if resolution.action is FailureAction.RETRY:
             retry_count = state.retry_count + 1
-            retry_at = (self.clock.now() + timedelta(seconds=unit.retry_policy.backoff_seconds)).isoformat()
+            backoff = (
+                report.retry_after_seconds
+                if report.retry_after_seconds is not None
+                else unit.retry_policy.backoff_seconds
+            )
+            retry_at = (self.clock.now() + timedelta(seconds=backoff)).isoformat()
             record = RetryRecord(
                 retry_record_id=f"retry-{uuid4().hex}",
                 execution_unit_id=unit_id,
                 attempt=state.attempt,
-                error_category=category,
+                error_category=report.category.value,
                 retryable=True,
                 retry_at=retry_at,
-                backoff_seconds=unit.retry_policy.backoff_seconds,
-                reason=str(exc),
+                backoff_seconds=backoff,
+                reason=report.message,
             )
-            current = self._update_unit(run, unit_id, last_error=error, retry_count=retry_count, next_retry_at=retry_at)
+            current = self._update_unit(
+                current,
+                unit_id,
+                last_error=error,
+                retry_count=retry_count,
+                next_retry_at=retry_at,
+            )
             if phase == "submit":
                 intent_values = dict(current.submission_intents)
                 for key, raw in intent_values.items():
@@ -922,21 +1069,56 @@ class ExecutionRuntime:
                         }
                 current = self.state_store.save_run(replace(current, submission_intents=intent_values))
             self.state_store.save_retry_record(current.execution_run_id, record)
-            self.event_store.append(current.execution_run_id, "retry_scheduled", execution_unit_id=unit_id, payload={"category": category, "retry_at": retry_at, "phase": phase})
+            self.event_store.append(
+                current.execution_run_id,
+                EXECUTION_RETRY_SCHEDULED,
+                execution_unit_id=unit_id,
+                payload={
+                    **self.failure_protocol.event_payload(
+                        report,
+                        resolution,
+                        retry_count=retry_count,
+                    ),
+                    "retry_at": retry_at,
+                    "phase": phase,
+                },
+            )
+            self.event_store.append(
+                current.execution_run_id,
+                "retry_scheduled",
+                execution_unit_id=unit_id,
+                payload={"category": report.category.value, "retry_at": retry_at, "phase": phase},
+            )
             if phase == "submit":
-                self.transition_service.transition(self._load_run(current.execution_run_id), unit_id, ExecutionState.PREPARED, event_type="retry_scheduled", reason="retryable submit failure", metadata={"last_error": error.to_dict(), "retry_count": retry_count, "next_retry_at": retry_at})
+                self.transition_service.transition(
+                    self._load_run(current.execution_run_id),
+                    unit_id,
+                    ExecutionState.PREPARED,
+                    event_type="retry_scheduled",
+                    reason=resolution.reason,
+                    metadata={"last_error": error.to_dict(), "retry_count": retry_count, "next_retry_at": retry_at},
+                )
                 self._release_lease(self._load_run(current.execution_run_id), unit_id)
+            elif phase == "verify":
+                self.transition_service.transition(
+                    self._load_run(current.execution_run_id),
+                    unit_id,
+                    ExecutionState.DOWNLOADING,
+                    event_type="retry_scheduled",
+                    reason="retry verification through the existing Provider Job",
+                    metadata={"retry_count": retry_count, "next_retry_at": retry_at},
+                )
             return
         target = ExecutionState.FAILED
         self.transition_service.transition(
-            run,
+            current,
             unit_id,
             target,
             event_type="unit_failed",
-            reason=str(exc),
-            metadata={"last_error": error.to_dict()},
+            reason=resolution.reason,
+            metadata={"last_error": error.to_dict(), "action": resolution.action.value},
         )
-        self._release_lease(self._load_run(run.execution_run_id), unit_id)
+        self._release_lease(self._load_run(current.execution_run_id), unit_id)
 
     def _release_lease(self, run: ExecutionRun, unit_id: str) -> None:
         self.state_store.remove_lease(run.execution_run_id, unit_id)
@@ -944,6 +1126,84 @@ class ExecutionRuntime:
         if unit_id in current.unit_states:
             self._update_unit(current, unit_id, lease_id=None)
         self.event_store.append(run.execution_run_id, "lease_released", execution_unit_id=unit_id, payload={})
+
+    def apply_recompiled_bundle(
+        self,
+        execution_run_id: str,
+        revised_bundle: ExecutionBundle,
+        *,
+        revision_request_id: str,
+    ) -> ExecutionRun:
+        """Start a new run from an explicitly applied, freshly compiled bundle.
+
+        This is the runtime-side adapter boundary.  It does not call a
+        DirectorAgent, RevisionGuard, or compiler, and it never reuses the old
+        ExecutionRun.  The caller must complete the existing
+        candidate/diff/guard/apply workflow and pass its new immutable bundle.
+        """
+
+        old_run = self._load_run(execution_run_id)
+        if not str(revision_request_id).strip():
+            raise ExecutionRuntimeError("revision_request_id is required before recompilation")
+        request = next(
+            (
+                item
+                for item in old_run.revision_requests
+                if str(item.get("request_id", "")) == revision_request_id
+            ),
+            None,
+        )
+        if request is None:
+            raise ExecutionRuntimeError("revision request is not recorded on the current ExecutionRun")
+        if request.get("source_movie_plan_id") != old_run.source_movie_plan_id:
+            raise StaleExecutionRuntimeError("revision request source MoviePlan id does not match the run")
+        if request.get("source_movie_plan_fingerprint") != old_run.source_movie_plan_fingerprint:
+            raise StaleExecutionRuntimeError("revision request source MoviePlan fingerprint is stale")
+        bundle = self._bundle_or_raise(revised_bundle)
+        plan = bundle.execution_plan
+        if bundle.bundle_fingerprint == old_run.execution_bundle_fingerprint:
+            raise StaleExecutionRuntimeError("recompiled ExecutionBundle fingerprint must differ from the old run")
+        if plan.source_movie_plan_fingerprint == old_run.source_movie_plan_fingerprint:
+            raise StaleExecutionRuntimeError("recompiled bundle must reference the revised MoviePlan fingerprint")
+
+        stale_reason = "old ExecutionRun invalidated after explicit revision apply"
+        self.transition_service.mark_run_stale(old_run, stale_reason)
+        stale_run = self._load_run(execution_run_id)
+        stale_artifacts = {
+            str(artifact_id): {
+                **dict(artifact),
+                "stale": True,
+                "stale_reason": stale_reason,
+                "replaced_by_revision_request_id": revision_request_id,
+            }
+            for artifact_id, artifact in stale_run.artifacts.items()
+        }
+        self.state_store.save_run(replace(stale_run, artifacts=stale_artifacts))
+        event_payload = {
+            "actor": "RevisionApplyPort",
+            "revision_request_id": revision_request_id,
+            "execution_run_id": execution_run_id,
+            "source_movie_plan_id": old_run.source_movie_plan_id,
+            "source_movie_plan_fingerprint": old_run.source_movie_plan_fingerprint,
+            "source_video_job_fingerprint": request.get("source_video_job_fingerprint", ""),
+            "old_execution_bundle_fingerprint": old_run.execution_bundle_fingerprint,
+            "new_execution_bundle_fingerprint": bundle.bundle_fingerprint,
+        }
+        self.event_store.append(execution_run_id, REVISION_APPLIED, payload=event_payload)
+        self.event_store.append(
+            execution_run_id,
+            EXECUTION_ARTIFACTS_INVALIDATED,
+            payload={
+                **event_payload,
+                "invalidated_artifact_count": len(stale_artifacts),
+                "reason_summary": stale_reason,
+            },
+        )
+        self.execution_bundle = bundle
+        return self.create_run(bundle)
+
+    # Explicit alias for callers that name the operation after its port.
+    recompile_after_revision = apply_recompiled_bundle
 
     def cancel_unit(self, execution_run_id: str, execution_unit_id: str) -> ExecutionRun:
         run = self._load_run(execution_run_id)

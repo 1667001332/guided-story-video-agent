@@ -16,6 +16,7 @@ from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .execution_state import ExecutionRun, ProviderJob, utc_now
+from .provider_sanitization import sanitize_text
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -89,7 +90,7 @@ class RetryRecord:
             "retryable": bool(self.retryable),
             "retry_at": self.retry_at,
             "backoff_seconds": self.backoff_seconds,
-            "reason": self.reason,
+            "reason": sanitize_text(self.reason),
             "created_at": self.created_at,
         }
 
@@ -103,7 +104,7 @@ class RetryRecord:
             retryable=bool(data.get("retryable", False)),
             retry_at=data.get("retry_at"),
             backoff_seconds=float(data.get("backoff_seconds", 0.0)),
-            reason=str(data.get("reason", "")),
+            reason=sanitize_text(str(data.get("reason", ""))),
             created_at=str(data.get("created_at", utc_now())),
         )
 
@@ -151,6 +152,8 @@ class RuntimeStateStore(Protocol):
     def save_provider_job(self, run_id: str, job: ProviderJob) -> ExecutionRun: ...
     def save_submission_intent(self, run_id: str, intent: SubmissionIntent) -> ExecutionRun: ...
     def save_retry_record(self, run_id: str, record: RetryRecord) -> ExecutionRun: ...
+    def save_failure_report(self, run_id: str, report: Mapping[str, Any]) -> ExecutionRun: ...
+    def save_revision_request(self, run_id: str, request: Mapping[str, Any]) -> ExecutionRun: ...
     def save_lease(self, run_id: str, lease: ExecutionLease) -> ExecutionRun: ...
     def remove_lease(self, run_id: str, unit_id: str) -> ExecutionRun: ...
     def save_artifact(self, run_id: str, artifact: Mapping[str, Any]) -> ExecutionRun: ...
@@ -205,6 +208,22 @@ class InMemoryRuntimeStateStore:
     def save_retry_record(self, run_id: str, record: RetryRecord) -> ExecutionRun:
         run = self.load_run(run_id)
         return self._update(run_id, retry_records=(*run.retry_records, record.to_dict()))
+
+    def save_failure_report(self, run_id: str, report: Mapping[str, Any]) -> ExecutionRun:
+        run = self.load_run(run_id)
+        values = [dict(item) for item in run.failure_reports]
+        failure_id = str(report.get("failure_id", ""))
+        values = [item for item in values if str(item.get("failure_id", "")) != failure_id]
+        values.append(dict(report))
+        return self._update(run_id, failure_reports=tuple(values))
+
+    def save_revision_request(self, run_id: str, request: Mapping[str, Any]) -> ExecutionRun:
+        run = self.load_run(run_id)
+        values = [dict(item) for item in run.revision_requests]
+        request_id = str(request.get("request_id", ""))
+        values = [item for item in values if str(item.get("request_id", "")) != request_id]
+        values.append(dict(request))
+        return self._update(run_id, revision_requests=tuple(values))
 
     def save_lease(self, run_id: str, lease: ExecutionLease) -> ExecutionRun:
         run = self.load_run(run_id)
