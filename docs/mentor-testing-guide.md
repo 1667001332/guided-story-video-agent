@@ -1,12 +1,12 @@
 # 师兄 API 测试指南
 
-本指南用于 `v0.6.0` 的真实 API 验收。请使用测试者自己的 API Key，不要接收或复制项目作者的 `.env`。
+本指南用于 `v0.7.0` 的真实 API 验收。请使用测试者自己的 API Key，不要接收或复制项目作者的 `.env`。
 
 ## 1. 安装
 
 ```powershell
-git clone https://github.com/1667001332/guided-story-video-agent.git
-Set-Location guided-story-video-agent
+git clone https://github.com/1667001332/guided-story-video-agent-v2.git
+Set-Location guided-story-video-agent-v2
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[web,narration,dev]"
