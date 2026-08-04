@@ -245,7 +245,7 @@ docs/                  测试指南、研究依据和版本说明
 
 ## 版本说明
 
+- v1.2.0:移除 V2 离线执行运行时(`guided_story_agent/v2/` 及全部 v2 测试),
+  正式交付链路只保留 v1 的 VideoProvider 管线。见 [v1.2.0 发布说明](docs/releases/v1.2.0.md)
 - v1.1.0:Provider 中性视频管线(多 Provider 注册表、时长参数化、Web/CLI 切换)、
   旁白修复、JSON 修复器强化。见 [v1.1.0 发布说明](docs/releases/v1.1.0.md)
-- 仓库同时保留 V2 离线执行运行时(guided_story_agent/v2),用于离线状态机、
-  幂等与安全边界验证;真实视频生成以 v1 的 VideoProvider 链路为准
