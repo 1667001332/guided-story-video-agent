@@ -15,12 +15,18 @@ def build_video_job(
     story: StoryDraft | None = None,
     facts: StoryFacts | None = None,
     visual_style: str = "",
+    include_narration_in_prompt: bool = False,
 ) -> VideoJob:
     """Convert a script into one complete VideoJob.
 
     Scene boundaries remain semantic context in the prompt and metadata.  No
     fixed per-scene duration, shot count, or 3–15 second rule is introduced
     here; those decisions belong to the selected provider adapter.
+
+    ``include_narration_in_prompt`` is off by default: video models that read
+    the prompt aloud produce clumsy voiceovers, and narration is best served
+    by a dedicated TTS track (edge-tts) in the multi-shot render path.
+    Character dialogue stays in the prompt because the actors must speak it.
     """
 
     if not isinstance(script, StoryScript) or not script.confirmed:
@@ -52,14 +58,16 @@ def build_video_job(
             )
             lines.append(f"地点连续性：{locations}")
     if facts is not None:
+        narration_style = facts.narration_style.strip()
         for label, value in (
             ("视觉锚点", facts.visual_anchors),
             ("镜头语言", facts.camera_style),
             ("转场要求", facts.transitions),
-            ("旁白风格", facts.narration_style),
         ):
             if value.strip():
                 lines.append(f"{label}：{value.strip()}")
+        if include_narration_in_prompt and narration_style:
+            lines.append(f"旁白风格：{narration_style}")
 
     lines.append("按以下叙事顺序自然完成动作、情绪和空间连续性：")
     scene_metadata: list[dict[str, Any]] = []
@@ -70,7 +78,7 @@ def build_video_job(
         scene_line += f"人物：{'、'.join(scene.characters)}；动作：{action}"
         if scene.dialogue.strip():
             scene_line += f"；对白：{scene.dialogue.strip()}"
-        if scene.narration.strip():
+        if include_narration_in_prompt and scene.narration.strip():
             scene_line += f"；旁白：{scene.narration.strip()}"
         if scene.emotional_change.strip():
             scene_line += f"；情绪变化：{scene.emotional_change.strip()}"

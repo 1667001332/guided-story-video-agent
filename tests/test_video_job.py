@@ -85,6 +85,30 @@ def test_session_builds_direct_job_without_storyboard(output_dir):
     assert session.stage.value == "completed"
 
 
+def test_video_job_prompt_omits_narration_by_default():
+    from guided_story_agent.video_job import build_video_job
+
+    session = GuidedStorySession(CreativeBrief(target_seconds=30), RuleBasedStoryAgent())
+    session.start_ideation("一只猫在暴雨中寻找灯塔")
+    session.auto_choose()
+    session.generate_story()
+    session.confirm_story()
+    session.generate_script()
+    session.confirm_script()
+    script = session.script
+    story = session.story
+    facts = session._story_facts()
+
+    plain = build_video_job(script, story=story, facts=facts)
+    assert "旁白" not in plain.prompt
+    assert plain.narration.strip()
+
+    voiced = build_video_job(
+        script, story=story, facts=facts, include_narration_in_prompt=True
+    )
+    assert "旁白" in voiced.prompt
+
+
 def test_provider_duration_limits_are_adapter_capabilities():
     from guided_story_agent.video_provider import AgnesVideoProvider
 
