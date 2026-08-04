@@ -1134,7 +1134,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             return None
         try:
             timing_feedback = ""
-            for attempt in range(2):
+            for attempt in range(3):
                 data = self._json_completion(
                     "storyboard_director.md",
                     {
@@ -1161,7 +1161,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                         return result
                     except ValueError as exc:
                         error = exc
-                if attempt == 0:
+                if attempt < 2:
                     timing_feedback = str(error)
                     continue
                 raise error
@@ -1662,6 +1662,11 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         content = (response.choices[0].message.content or "").strip()
         if len(content) > MAX_LLM_RESPONSE_CHARS:
             raise ValueError("model JSON response is too large")
+        if not content:
+            response = self._create_completion(request)
+            content = (response.choices[0].message.content or "").strip()
+            if len(content) > MAX_LLM_RESPONSE_CHARS:
+                raise ValueError("model JSON response is too large")
         try:
             data = self._extract_json_object(content)
         except ValueError as original_error:
@@ -1715,7 +1720,10 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                         f"{payload_text[:MAX_REPAIR_INPUT_CHARS]}\n\n"
                         "模型原始回答：\n"
                         f"{content[:MAX_REPAIR_INPUT_CHARS]}\n\n"
-                        "请将模型原始回答转换为符合原任务要求的 JSON 对象。"
+                        "请将模型原始回答转换为符合原任务要求的 JSON 对象。\n"
+                        "结构要求：严格保持“原任务要求”中定义的 JSON 顶层与嵌套结构"
+                        "（键名、层级、数组/对象类型都不得改变），只修复内容，"
+                        "不要发明新的顶层字段。"
                     ),
                 },
             ],

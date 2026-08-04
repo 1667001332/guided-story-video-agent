@@ -12,4 +12,5 @@
 Timing contract: preserve semantic duration_weight and timing_reason for every scene. Do not equalize scene durations; pacing must follow the causal and emotional load.
 Filmability contract: keep every visible_action as one concise, atomic, directly visible action phase; never expand it into a paragraph or a chain of events during continuity review.
 
-只返回与 script_writer.md 完全相同的 JSON 结构。
+只返回 JSON，结构必须与 script_writer.md 的输出完全一致（顶层 script 包裹 scenes 数组，键名与层级不可改变）：
+{"script":{"title":"","scenes":[{"title":"","location":"","time_of_day":"","characters":[],"visible_action":"","dialogue":"","narration":"","props":[],"start_state":"","end_state":"","emotional_change":"","duration_weight":1.0,"timing_reason":""}]}}

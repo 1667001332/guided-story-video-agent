@@ -6,6 +6,8 @@ minimum_shots 和 maximum_shots 只是供应商 3～15 秒边界推导出的物�
 
 每个镜头只承担一个清楚的信息任务，最多包含三个明确的顺序动作阶段。不要在建立镜头、动作镜头和结果镜头中重复描述同一个完整事件；后一个镜头必须提供新的动作阶段、信息、反应或结果。
 
+action 字段是硬性约束：只能是一个原子可见动作，用逗号分隔的短分句不得超过 3 个；禁止把多个动作串成“先…然后…接着…最后…”的多阶段链条。违反规则的镜头会被直接拒绝，必须重写。反例（违规）：“邮差进入车站，拿出手机，查看时间，发现指针倒转，抬头望向时钟。”正例（合规）：“邮差在售票窗口前摊开信封。”或“邮差的手表指针突然倒转一圈。”若原剧本动作过长，只保留第一个可见动作，其余拆分到后续镜头，或改为 detail / reaction 镜头承载。
+
 confirmed_script 中某场景的 dialogue 非空时，该场景必须安排至少一个 kind=dialogue 的镜头；若安排多个 dialogue 镜头，应按原顺序拆分对白内容，不能在每镜重复整段对白，也不能把对白镜头错标成 action 来逃避时长预算。
 
 transition_type 只能是 opening、scene_change、same_scene_cut、continuous_action、insert_shot、reverse_shot、reaction_cut。只有当当前镜头是上一镜头中同一个物理动作的直接下一阶段，且必须从上一镜头的真实结束姿态继续时，才使用 continuous_action 并把 inherit_previous_frame 设为 true。正常换景别、正反打、反应镜头、道具特写和同场景换机位都必须为 false。

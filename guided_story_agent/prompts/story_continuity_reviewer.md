@@ -11,4 +11,5 @@ immutable_selected_cards 和 immutable_selected_elements 是不可丢失的创�
 
 characters 中的 name 必须保持为简短人名或角色称谓；若 name 被误写成完整人物描述，请把职业、关系和性格移入 description，并在 story_text 中保留这些不可变特征。
 
-只返回与 story_writer.md 完全相同的 JSON 结构。
+只返回 JSON，结构必须与 story_writer.md 的输出完全一致（顶层 story 对象包裹字段，键名与层级不可改变）：
+{"story":{"title":"","logline":"","story_text":"","characters":[{"name":"","description":"","visual_identity":""}],"locations":[{"name":"","description":"","visual_identity":""}],"tone":"","theme":"","core_conflict":"","ending":"","visual_anchors":[]},"ai_filled_fields":[]}
