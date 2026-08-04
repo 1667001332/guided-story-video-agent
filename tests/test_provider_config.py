@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import io
-import json
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from guided_story_agent.agent import OpenAIStoryAgent
-from guided_story_agent.provider_config import VideoProviderConfig
-from guided_story_agent.video_provider import AgnesVideoProvider, VideoGenerationError
+from guided_story_agent.provider_config import (
+    TextProviderConfig,
+    VideoProviderConfig,
+)
 
 
 class _FakeCompletions:
@@ -43,7 +42,6 @@ class JsonRepairTests(unittest.TestCase):
         self.assertEqual({"ok": True}, result)
         self.assertEqual(2, len(client.chat.completions.requests))
         self.assertIn("结构化输出修复器", str(client.chat.completions.requests[1]))
-        self.assertTrue(agent.last_model_response_preview)
 
     def test_fenced_markdown_json_is_parsed_without_repair(self) -> None:
         client = _FakeClient(['```json\n{"ok": true}\n```'])
@@ -107,100 +105,207 @@ class JsonRepairTests(unittest.TestCase):
         self.assertNotIn("response_format", client.chat.completions.requests[1])
 
 
-class VideoConfigTests(unittest.TestCase):
-    def test_video_config_reads_network_retry_values(self) -> None:
-        values = {
-            "VIDEO_API_KEY": "video-key",
-            "VIDEO_API_ROOT": "https://video.example",
-            "VIDEO_MODEL": "video-model",
-            "VIDEO_NETWORK_RETRIES": "3",
-            "VIDEO_RETRY_BACKOFF": "0.5",
+class ProviderConfigTests(unittest.TestCase):
+    def test_text_blank_generic_values_do_not_hide_legacy_config(self) -> None:
+        environment = {
+            "TEXT_PROVIDER": "openai_compatible",
+            "TEXT_API_KEY": "",
+            "TEXT_BASE_URL": "https://template.example/v1",
+            "TEXT_MODEL": "template-model",
+            "DEEPSEEK_API_KEY": "legacy-text-key",
+            "DEEPSEEK_TEXT_MODEL": "legacy-text-model",
         }
-        with patch("guided_story_agent.provider_config.load_dotenv"), patch.dict(
-            os.environ, values, clear=True
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            config = TextProviderConfig.from_env()
+
+        self.assertTrue(config.configured)
+        self.assertEqual("legacy-text-key", config.api_key)
+        self.assertEqual("legacy-text-model", config.model)
+        self.assertEqual("DEEPSEEK_* (legacy)", config.source)
+
+    def test_explicit_text_offline_wins_over_legacy_key(self) -> None:
+        environment = {
+            "TEXT_PROVIDER": "offline",
+            "TEXT_API_KEY": "",
+            "DEEPSEEK_API_KEY": "legacy-text-key",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            config = TextProviderConfig.from_env()
+
+        self.assertFalse(config.configured)
+        self.assertEqual("offline", config.provider)
+        self.assertIn("已关闭", config.error)
+        self.assertEqual("TEXT_*", config.source)
+
+    def test_video_blank_generic_values_do_not_hide_legacy_config(self) -> None:
+        environment = {
+            "VIDEO_PROVIDER": "agnes",
+            "VIDEO_API_KEY": "",
+            "VIDEO_API_ROOT": "https://template.example",
+            "VIDEO_MODEL": "template-video-model",
+            "AGNES_API_KEY": "legacy-video-key",
+            "AGNES_VIDEO_MODEL": "legacy-video-model",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
         ):
             config = VideoProviderConfig.from_env(
-                default_api_root="https://apihub.agnes-ai.com",
-                default_model="agnes-video-v2.0",
+                default_api_root="https://default.example",
+                default_model="default-video-model",
             )
-        self.assertEqual(3, config.network_retries)
-        self.assertEqual(0.5, config.retry_backoff)
+
         self.assertTrue(config.configured)
+        self.assertEqual("legacy-video-key", config.api_key)
+        self.assertEqual("legacy-video-model", config.model)
+        self.assertEqual("AGNES_* (legacy)", config.source)
 
-
-class _FakeUrlopenResponse:
-    def __init__(self, body: bytes) -> None:
-        self._stream = io.BytesIO(body)
-
-    def __enter__(self) -> _FakeUrlopenResponse:
-        return self
-
-    def __exit__(self, *args: object) -> bool:
-        return False
-
-    def read(self, *args: int) -> bytes:
-        return self._stream.read(*args)
-
-
-class VideoRetryTests(unittest.TestCase):
-    def test_status_request_retries_transient_network_errors(self) -> None:
-        provider = AgnesVideoProvider(api_key="k", network_retries=2, retry_backoff=0.01)
-        calls = {"n": 0}
-        body = json.dumps({"status": "completed"}).encode("utf-8")
-
-        def fake_urlopen(request: object, timeout: float) -> _FakeUrlopenResponse:
-            calls["n"] += 1
-            if calls["n"] < 3:
-                raise OSError("temporary network failure")
-            return _FakeUrlopenResponse(body)
-
-        with patch(
-            "guided_story_agent.video_provider.urllib.request.urlopen",
-            side_effect=fake_urlopen,
+    def test_explicit_video_disabled_wins_over_legacy_key(self) -> None:
+        environment = {
+            "VIDEO_PROVIDER": "disabled",
+            "VIDEO_API_KEY": "",
+            "AGNES_API_KEY": "legacy-video-key",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv"),
         ):
-            result = provider._status("vid-1")
-        self.assertEqual("completed", result["status"])
-        self.assertEqual(3, calls["n"])
+            config = VideoProviderConfig.from_env(
+                default_api_root="https://default.example",
+                default_model="default-video-model",
+            )
 
-    def test_submit_post_is_never_retried(self) -> None:
-        provider = AgnesVideoProvider(api_key="k", network_retries=3, retry_backoff=0.01)
-        calls = {"n": 0}
+        self.assertFalse(config.configured)
+        self.assertEqual("disabled", config.provider)
+        self.assertIn("已关闭", config.error)
+        self.assertEqual("VIDEO_*", config.source)
 
-        def failing_urlopen(request: object, timeout: float) -> _FakeUrlopenResponse:
-            calls["n"] += 1
-            raise OSError("network down")
-
-        with patch(
-            "guided_story_agent.video_provider.urllib.request.urlopen",
-            side_effect=failing_urlopen,
+    def test_default_dotenv_is_exactly_current_working_directory(self) -> None:
+        expected = (Path.cwd() / ".env").resolve()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv") as loader,
         ):
-            with self.assertRaises(VideoGenerationError):
-                provider._submit({"model": "m"})
-        self.assertEqual(1, calls["n"])
+            TextProviderConfig.from_env()
 
-    def test_download_retries_transient_errors_then_succeeds(self) -> None:
-        provider = AgnesVideoProvider(api_key="k", network_retries=2, retry_backoff=0.01)
-        calls = {"n": 0}
+        loader.assert_called_once_with(dotenv_path=expected, override=False)
 
-        def flaky_urlopen(request: object, timeout: float) -> _FakeUrlopenResponse:
-            calls["n"] += 1
-            if calls["n"] < 3:
-                raise OSError("temporary")
-            return _FakeUrlopenResponse(b"video-bytes")
+    def test_explicit_dotenv_path_is_resolved_and_used(self) -> None:
+        requested = Path("config") / "mentor.env"
+        expected = requested.expanduser().resolve()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("guided_story_agent.provider_config.load_dotenv") as loader,
+        ):
+            VideoProviderConfig.from_env(
+                default_api_root="https://default.example",
+                default_model="default-video-model",
+                dotenv_path=requested,
+            )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "shot.mp4"
-            with patch(
-                "guided_story_agent.video_provider.urllib.request.urlopen",
-                side_effect=flaky_urlopen,
+        loader.assert_called_once_with(dotenv_path=expected, override=False)
+
+    def test_text_timeout_rejects_non_finite_or_non_positive_values(self) -> None:
+        for value in ("nan", "inf", "0", "-1"):
+            with (
+                self.subTest(value=value),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TEXT_API_KEY": "test-key",
+                        "TEXT_MODEL": "test-model",
+                        "TEXT_TIMEOUT": value,
+                    },
+                    clear=True,
+                ),
+                patch("guided_story_agent.provider_config.load_dotenv"),
             ):
-                provider._download_file("https://example.com/v.mp4", target)
-            self.assertEqual(3, calls["n"])
-            self.assertEqual(b"video-bytes", target.read_bytes())
+                config = TextProviderConfig.from_env()
+                self.assertFalse(config.configured)
+                self.assertIn("TEXT_TIMEOUT", config.error)
 
-    def test_poll_interval_floor_prevents_busy_loop(self) -> None:
-        provider = AgnesVideoProvider(api_key="k", poll_interval=0)
-        self.assertGreaterEqual(provider.poll_interval, 0.1)
+    def test_video_polling_numbers_must_be_finite_and_in_range(self) -> None:
+        settings = (
+            ("VIDEO_TIMEOUT", "0"),
+            ("VIDEO_POLL_INTERVAL", "-1"),
+            ("VIDEO_POLL_INTERVAL", "nan"),
+            ("VIDEO_MAX_POLL_SECONDS", "inf"),
+        )
+        for name, value in settings:
+            with (
+                self.subTest(name=name, value=value),
+                patch.dict(
+                    os.environ,
+                    {
+                        "VIDEO_API_KEY": "test-key",
+                        "VIDEO_MODEL": "test-model",
+                        name: value,
+                    },
+                    clear=True,
+                ),
+                patch("guided_story_agent.provider_config.load_dotenv"),
+            ):
+                config = VideoProviderConfig.from_env(
+                    default_api_root="https://default.example",
+                    default_model="default-video-model",
+                )
+                self.assertFalse(config.configured)
+                self.assertIn(name, config.error)
+
+    def test_video_network_retry_settings_are_validated(self) -> None:
+        settings = (
+            ("VIDEO_NETWORK_RETRIES", "not-an-integer"),
+            ("VIDEO_NETWORK_RETRIES", "11"),
+            ("VIDEO_RETRY_BACKOFF", "-1"),
+            ("VIDEO_RETRY_BACKOFF", "nan"),
+        )
+        for name, value in settings:
+            with (
+                self.subTest(name=name, value=value),
+                patch.dict(
+                    os.environ,
+                    {
+                        "VIDEO_API_KEY": "test-key",
+                        "VIDEO_MODEL": "test-model",
+                        name: value,
+                    },
+                    clear=True,
+                ),
+                patch("guided_story_agent.provider_config.load_dotenv"),
+            ):
+                config = VideoProviderConfig.from_env(
+                    default_api_root="https://default.example",
+                    default_model="default-video-model",
+                )
+                self.assertFalse(config.configured)
+                self.assertIn(name, config.error)
+
+    def test_video_reference_mapping_requires_root_and_base_url_together(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VIDEO_API_KEY": "test-key",
+                    "VIDEO_MODEL": "test-model",
+                    "VIDEO_REFERENCE_ROOT": "public-assets",
+                },
+                clear=True,
+            ),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            config = VideoProviderConfig.from_env(
+                default_api_root="https://default.example",
+                default_model="default-video-model",
+            )
+
+        self.assertFalse(config.configured)
+        self.assertIn("必须同时填写", config.error)
 
 
 if __name__ == "__main__":

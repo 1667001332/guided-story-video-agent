@@ -18,9 +18,76 @@ from guided_story_agent import (
 )
 from guided_story_agent.cli import run_interactive
 from guided_story_agent.selfplay import run_selfplay
+from guided_story_agent.quality import review_script_against_story
 
 
 class CreativeGardenIntegrationTests(unittest.TestCase):
+    def test_formal_script_failure_is_not_silently_replaced(self) -> None:
+        class FailingCompletions:
+            def create(self, **request):
+                del request
+                raise RuntimeError("upstream returned invalid JSON")
+
+        offline = RuleBasedStoryAgent()
+        card = offline.generate_ideas("情人节杀人案", round_number=1).cards[0]
+        story = offline.generate_story("情人节杀人案", [card], {})
+        story.confirmed = True
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FailingCompletions())
+        )
+        session = GuidedStorySession(
+            CreativeBrief(target_seconds=90),
+            OpenAIStoryAgent(
+                client,
+                "deepseek-test",
+                provider_name="deepseek",
+                allow_artifact_fallback=False,
+            ),
+        )
+        session.direction = "情人节杀人案"
+        session.story = story
+        session.stage = Stage.STORY_REVIEW
+
+        with self.assertRaisesRegex(RuntimeError, "真实文本模型生成失败"):
+            session.generate_script()
+
+        self.assertIsNone(session.script)
+        self.assertEqual("failed", session.text_generation_events[-1]["status"])
+        self.assertIn(
+            "upstream returned invalid JSON",
+            session.text_generation_events[-1]["reason"],
+        )
+        self.assertEqual(
+            session.text_generation_events,
+            session.to_dict()["text_generation_events"],
+        )
+
+    def test_valentine_offline_script_is_filmable_not_numbered_template(self) -> None:
+        agent = RuleBasedStoryAgent()
+        card = agent.generate_ideas("情人节杀人案", round_number=1).cards[0]
+        story = agent.generate_story("情人节杀人案", [card], {})
+        script = agent.generate_script(story, 90)
+        combined = "\n".join(
+            " ".join(
+                (
+                    scene.title,
+                    scene.location,
+                    scene.visible_action,
+                    scene.dialogue,
+                    scene.narration,
+                )
+            )
+            for scene in script.scenes
+        )
+
+        self.assertEqual(10, len(script.scenes))
+        self.assertNotIn("故事片段", combined)
+        self.assertNotIn("故事核心场景", combined)
+        self.assertNotIn("人物必须面对这一核心冲突", combined)
+        self.assertNotIn("我已经作出了选择", combined)
+        self.assertTrue(all(scene.visible_action != scene.narration for scene in script.scenes))
+        self.assertEqual([], review_script_against_story(story, script).hard_errors)
+
     def test_from_env_prefers_generic_text_config(self) -> None:
         captured: dict[str, object] = {}
 
@@ -247,6 +314,26 @@ class CreativeGardenIntegrationTests(unittest.TestCase):
                     output_dir=temp_dir,
                     require_live_text=True,
                 )
+
+    def test_offline_selfplay_is_labeled_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_selfplay(
+                agent=RuleBasedStoryAgent(),
+                target_seconds=30,
+                output_dir=temp_dir,
+            )
+            quality = json.loads(
+                (Path(temp_dir) / "quality_report.json").read_text(encoding="utf-8")
+            )
+            human_review = json.loads(
+                (Path(temp_dir) / "human_review.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual("offline", result["bench"]["text_api_mode"])
+        self.assertEqual("RuleBasedStoryAgent", result["bench"]["text_provider"])
+        self.assertEqual([], quality["hard_errors"])
+        self.assertIn("storyboard_action_uniqueness", quality["deterministic"])
+        self.assertIn("overall_watchability", human_review["scores"])
 
     def test_unconfigured_openai_agent_falls_back_without_recursion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

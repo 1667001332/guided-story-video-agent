@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 
 from guided_story_agent import CreativeBrief, GuidedStorySession, RuleBasedStoryAgent, Stage
-from guided_story_agent.models import RenderManifest
+from guided_story_agent.models import (
+    RenderManifest,
+    StoryCharacter,
+    StoryDraft,
+    StoryScene,
+    StoryScript,
+)
 
 
 def started(seconds: int = 45) -> GuidedStorySession:
@@ -91,8 +97,79 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
         session.select_ideas(ids)
         story = session.generate_story()
         self.assertEqual(set(ids), set(story.field_sources["selected_ideas"].source_ids))
+        session.back_to_ideation()
         with self.assertRaisesRegex(ValueError, "最多"):
             session.select_ideas([card.idea_id for card in session.current_batch.cards[:4]])
+
+    def test_selected_protagonist_accepts_semantic_realization_without_exact_phrase(self) -> None:
+        session = started()
+        card = session.current_batch.cards[0]
+        session.select_ideas([card.idea_id])
+        card.protagonist = "年轻邮差（刚入职）"
+        story = StoryDraft(
+            title="测试故事",
+            logline="一名新邮差在雨夜完成关键投递。",
+            story_text=(
+                "年轻邮差刚刚入职，在暴雨里接下旧车站的最后一封信。"
+                "他沿着站台留下的线索行动，最终完成投递并承担自己的选择。"
+            ),
+            characters=[
+                StoryCharacter(
+                    name="林川",
+                    description="刚刚入职的年轻邮差，对废弃车站并不熟悉。",
+                )
+            ],
+            core_conflict=card.central_conflict,
+            ending=card.ending_direction,
+        )
+
+        session._validate_selected_constraints(story, {})
+
+    def test_script_boundary_accepts_semantic_role_without_full_card_phrase(self) -> None:
+        session = started(15)
+        card = session.current_batch.cards[0]
+        session.select_ideas([card.idea_id])
+        card.protagonist = "一个循规蹈矩的年轻邮差，深爱着生病在床的妻子。"
+        session.story = StoryDraft(
+            title="测试故事",
+            logline="年轻邮差在雨夜作出选择。",
+            story_text="年轻邮差林川为了病中的妻子，在雨夜承担了一次危险投递。",
+            characters=[
+                StoryCharacter(
+                    name="林川",
+                    description="循规蹈矩的年轻邮差，深爱病中的妻子。",
+                )
+            ],
+            core_conflict=card.central_conflict,
+            ending=card.ending_direction,
+        )
+        self.assertEqual(["林川"], session._required_story_characters())
+        visible_action = (
+            f"循规蹈矩的年轻邮差林川深爱病中的妻子，并为她完成投递；"
+            f"{card.central_conflict}；"
+            f"{card.ending_direction}"
+        )
+        script = StoryScript(
+            title="测试剧本",
+            target_seconds=15,
+            scenes=[
+                StoryScene(
+                    scene_id=1,
+                    title="最后投递",
+                    location="旧车站",
+                    time_of_day="雨夜",
+                    characters=["年轻邮差林川"],
+                    action=visible_action,
+                    narration="",
+                    visible_action=visible_action,
+                    start_state="林川带着信进入旧车站。",
+                    end_state=card.ending_direction,
+                    duration=15,
+                )
+            ],
+        )
+
+        session._validate_script_story_boundary(script)
 
     def test_more_like_and_mix_keep_sources(self) -> None:
         session = started()
@@ -169,6 +246,88 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
         self.assertGreater(len(scene_counts), 1)
         self.assertGreater(len(shot_counts), 1)
 
+    def test_storyboard_gate_uses_readable_floor_not_soft_preferred_total(self) -> None:
+        session = started(15)
+        session.auto_choose()
+        session.generate_story()
+        session.confirm_story()
+        session.generate_script()
+        session.confirm_script()
+        storyboard = session.build_storyboard()
+
+        self.assertGreater(
+            sum(shot.estimated_duration for shot in storyboard.shots),
+            storyboard.target_seconds,
+        )
+        initial_review = session.review_current_artifact("storyboard")
+        self.assertTrue(initial_review.can_confirm)
+        self.assertEqual(1.0, initial_review.scores["timing_budget_fit"])
+        self.assertLess(initial_review.scores["timing_preferred_fit"], 1.0)
+
+        underfunded = next(
+            shot
+            for shot in storyboard.shots
+            if shot.minimum_readable_duration > 3
+        )
+        replacement_duration = underfunded.minimum_readable_duration - 1
+        transferred = underfunded.duration - replacement_duration
+        donor = next(
+            shot
+            for shot in storyboard.shots
+            if shot.shot_id != underfunded.shot_id
+            and shot.duration + transferred <= 15
+        )
+        underfunded.duration = replacement_duration
+        donor.duration += transferred
+
+        blocked_review = session.review_current_artifact("storyboard")
+        self.assertFalse(blocked_review.can_confirm)
+        self.assertTrue(
+            any("低于内容可读下限" in error for error in blocked_review.hard_errors)
+        )
+        with self.assertRaisesRegex(RuntimeError, "内容可读下限"):
+            session.confirm_storyboard()
+        self.assertEqual(Stage.STORYBOARD_REVIEW, session.stage)
+        self.assertFalse(storyboard.confirmed)
+
+    def test_render_gate_rechecks_current_content_budget_before_provider_call(self) -> None:
+        session = started(15)
+        session.auto_choose()
+        session.generate_story()
+        session.confirm_story()
+        session.generate_script()
+        session.confirm_script()
+        storyboard = session.build_storyboard()
+        session.confirm_storyboard()
+
+        underfunded = next(
+            shot
+            for shot in storyboard.shots
+            if shot.minimum_readable_duration > 3
+        )
+        replacement_duration = underfunded.minimum_readable_duration - 1
+        transferred = underfunded.duration - replacement_duration
+        donor = next(
+            shot
+            for shot in storyboard.shots
+            if shot.shot_id != underfunded.shot_id
+            and shot.duration + transferred <= 15
+        )
+        underfunded.duration = replacement_duration
+        donor.duration += transferred
+
+        class Renderer:
+            called = False
+
+            def render(self, plan, output_dir):
+                self.called = True
+                raise AssertionError("时长门失败后不应调用视频 Provider")
+
+        renderer = Renderer()
+        with self.assertRaisesRegex(RuntimeError, "内容可读下限"):
+            session.render_confirmed_plan(renderer, ".")
+        self.assertFalse(renderer.called)
+
     def test_long_custom_duration_is_not_capped_at_twelve_shots(self) -> None:
         session = started(300)
         session.generate_story()
@@ -206,7 +365,7 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
         session.render_confirmed_plan(Renderer(), "outputs")
         self.assertEqual(Stage.COMPLETED, session.stage)
 
-    def test_schema_v4_roundtrip_and_v2_read_only_migration(self) -> None:
+    def test_current_schema_roundtrip_and_legacy_read_only_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session = started()
             session.auto_choose()
@@ -215,9 +374,12 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
             session.generate_script()
             session.confirm_script()
             storyboard = session.build_storyboard()
-            path = session.save(Path(temp_dir) / "v4.json")
+            path = session.save(Path(temp_dir) / "v5.json")
             loaded = GuidedStorySession.load(path, agent=RuleBasedStoryAgent())
-            self.assertEqual(4, json.loads(path.read_text(encoding="utf-8"))["schema_version"])
+            self.assertEqual(
+                GuidedStorySession.schema_version,
+                json.loads(path.read_text(encoding="utf-8"))["schema_version"],
+            )
             self.assertEqual(session.direction, loaded.direction)
             self.assertEqual(session.selected_idea_ids, loaded.selected_idea_ids)
             self.assertEqual(session.story.story_text, loaded.story.story_text)
@@ -230,6 +392,32 @@ class GuidedStorySessionV4Tests(unittest.TestCase):
                 storyboard.shots[0].first_frame_prompt,
                 loaded.storyboard.shots[0].first_frame_prompt,
             )
+
+            v4_path = Path(temp_dir) / "v4.json"
+            v4_data = json.loads(path.read_text(encoding="utf-8"))
+            v4_data["schema_version"] = 4
+            for shot in v4_data["storyboard"]["shots"]:
+                shot.pop("dialogue", None)
+                shot.pop("minimum_readable_duration", None)
+                shot.pop("source_action", None)
+                shot.pop("retake_instruction", None)
+                shot.pop("time_of_day", None)
+                shot.pop("visual_style", None)
+                shot.pop("color_palette", None)
+            v4_path.write_text(
+                json.dumps(v4_data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            migrated_v4 = GuidedStorySession.load(
+                v4_path,
+                agent=RuleBasedStoryAgent(),
+            )
+            self.assertEqual("", migrated_v4.storyboard.shots[0].dialogue)
+            self.assertEqual(
+                0,
+                migrated_v4.storyboard.shots[0].minimum_readable_duration,
+            )
+            self.assertEqual(v4_data, json.loads(v4_path.read_text(encoding="utf-8")))
 
             old_path = Path(temp_dir) / "v2.json"
             old_data = {

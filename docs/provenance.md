@@ -2,7 +2,7 @@
 
 ## v0.4 故事优先重构
 
-完整故事、结构化人物地点资料、故事确认门禁、自适应场景剧本以及 schema v4 均在本仓库重新实现。Dramatron 只提供“故事要素先于逐场剧本”的公开架构启发；本项目没有复制其 Notebook 代码、提示词样例或文本标记解析。
+完整故事、结构化人物地点资料、故事确认门禁、自适应场景剧本以及当前 schema v5 均在本仓库重新实现。schema v4 仍作为历史格式只读兼容；Dramatron 只提供“故事要素先于逐场剧本”的公开架构启发；本项目没有复制其 Notebook 代码、提示词样例或文本标记解析。
 
 ## v0.3 创意花园重构
 
@@ -34,3 +34,8 @@
 - ShortGPT：旁白、字幕和视频编辑流水线。
 
 本仓库不直接打包或复制上述第三方仓库的源文件。
+
+## 当前主流程的边界
+
+当前主流程采用 `StoryScript → VideoJob → VideoProvider.generate_video → VideoArtifact`。
+`StoryboardPlan` 与逐镜头 `StoryRenderer` 只作为旧会话和旧测试的兼容层，不再是新视频任务的必要中间层。Provider 的时长上限、是否需要内部切片以及具体 API 字段均属于 Provider 适配器能力；核心不会把 Agnes 的 3–15 秒限制传播到剧本或会话模型。

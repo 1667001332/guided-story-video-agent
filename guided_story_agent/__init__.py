@@ -3,6 +3,7 @@
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent
 from .models import (
     CreativeBrief,
+    ContinuityState,
     DraftBundle,
     ElementOption,
     ElementPalette,
@@ -11,6 +12,8 @@ from .models import (
     IdeaCard,
     IdeationTurnResult,
     RenderManifest,
+    ProviderCapabilities,
+    VideoJob,
     Stage,
     StoryCharacter,
     StoryDraft,
@@ -22,20 +25,27 @@ from .models import (
     SelectionState,
     VisualAsset,
     VisualBible,
+    VisualReference,
 )
 from .session import GuidedStorySession
+from .rendering import VideoJobRenderer
+from .video_job import build_video_job
 
 __all__ = [
     "CreativeBrief",
+    "ContinuityState",
     "DraftBundle",
     "ElementOption",
     "ElementPalette",
     "GuideTurnResult",
     "GuidedStorySession",
+    "VideoJobRenderer",
     "IdeaBatch",
     "IdeaCard",
     "IdeationTurnResult",
     "OpenAIStoryAgent",
+    "ProviderCapabilities",
+    "VideoJob",
     "RenderManifest",
     "RuleBasedStoryAgent",
     "SelectionState",
@@ -49,4 +59,6 @@ __all__ = [
     "StoryboardShot",
     "VisualAsset",
     "VisualBible",
+    "VisualReference",
+    "build_video_job",
 ]
