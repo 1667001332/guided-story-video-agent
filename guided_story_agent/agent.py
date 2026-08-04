@@ -584,6 +584,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         self.last_used_fallback = False
         self.fallback_count = 0
         self.last_fallback_reason = ""
+        self.last_model_response_preview = ""
 
     @classmethod
     def from_env(cls) -> OpenAIStoryAgent:
@@ -1100,8 +1101,50 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         }
         if self.json_mode != "disabled":
             request["response_format"] = {"type": "json_object"}
+        response = self._create_completion(request)
+        content = self._response_content(response)
         try:
-            response = self.client.chat.completions.create(**request)
+            return self._parse_json_object(content)
+        except ValueError as original_error:
+            repair_request = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是结构化输出修复器。只返回一个合法的 JSON 对象，"
+                            "不要 Markdown、不要解释、不要额外文字。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "原任务要求：\n"
+                            f"{self._load_prompt(prompt_name)}\n\n"
+                            "原始输入：\n"
+                            f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+                            "模型原始回答：\n"
+                            f"{content[:12000]}\n\n"
+                            "请将模型原始回答转换为符合原任务要求的 JSON 对象。"
+                        ),
+                    },
+                ],
+                "temperature": 0,
+                "max_tokens": 4000,
+            }
+            if self.json_mode != "disabled":
+                repair_request["response_format"] = {"type": "json_object"}
+            try:
+                repaired = self._create_completion(repair_request)
+                return self._parse_json_object(self._response_content(repaired))
+            except Exception as repair_error:
+                raise ValueError(
+                    f"{original_error}; JSON repair failed: {repair_error}"
+                ) from original_error
+
+    def _create_completion(self, request: dict[str, Any]) -> Any:
+        try:
+            return self.client.chat.completions.create(**request)
         except Exception as exc:
             message = str(exc).lower()
             can_retry_without_json_mode = self.json_mode == "auto" and (
@@ -1109,19 +1152,33 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             )
             if not can_retry_without_json_mode:
                 raise
-            request.pop("response_format")
-            response = self.client.chat.completions.create(**request)
+            fallback_request = dict(request)
+            fallback_request.pop("response_format", None)
+            return self.client.chat.completions.create(**fallback_request)
+
+    def _response_content(self, response: Any) -> str:
         content = (response.choices[0].message.content or "").strip()
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as exc:
-            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-            if not match:
-                raise ValueError("model did not return a JSON object") from exc
-            data = json.loads(match.group(0))
-        if not isinstance(data, dict):
-            raise ValueError("model JSON must be an object")
-        return data
+        self.last_model_response_preview = content[:500]
+        return content
+
+    @staticmethod
+    def _parse_json_object(content: str) -> dict[str, Any]:
+        candidates = [content]
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
+        if fenced:
+            candidates.insert(0, fenced.group(1))
+        embedded = re.search(r"\{.*\}", content, flags=re.DOTALL)
+        if embedded:
+            candidates.append(embedded.group(0))
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                raise ValueError("model JSON must be an object")
+            return data
+        raise ValueError("model did not return a JSON object")
 
     def _load_prompt(self, name: str) -> str:
         return (self.prompt_dir / name).read_text(encoding="utf-8")

@@ -160,6 +160,8 @@ class VideoProviderConfig:
     timeout: float
     poll_interval: float
     max_poll_seconds: float
+    network_retries: int
+    retry_backoff: float
     source: str
     error: str = ""
 
@@ -183,6 +185,8 @@ class VideoProviderConfig:
             "VIDEO_TIMEOUT",
             "VIDEO_POLL_INTERVAL",
             "VIDEO_MAX_POLL_SECONDS",
+            "VIDEO_NETWORK_RETRIES",
+            "VIDEO_RETRY_BACKOFF",
         )
         if _has_any(generic_names):
             provider_raw = _value("VIDEO_PROVIDER", "agnes").lower()
@@ -196,6 +200,12 @@ class VideoProviderConfig:
                 poll_interval=_number(_value("VIDEO_POLL_INTERVAL", "5"), 5),
                 max_poll_seconds=_number(
                     _value("VIDEO_MAX_POLL_SECONDS", "900"), 900
+                ),
+                network_retries=int(
+                    _number(_value("VIDEO_NETWORK_RETRIES", "2"), 2)
+                ),
+                retry_backoff=_number(
+                    _value("VIDEO_RETRY_BACKOFF", "1"), 1
                 ),
                 source="VIDEO_*",
             )
@@ -211,6 +221,10 @@ class VideoProviderConfig:
             max_poll_seconds=_number(
                 _value("AGNES_MAX_POLL_SECONDS", "900"), 900
             ),
+            network_retries=int(
+                _number(_value("VIDEO_NETWORK_RETRIES", "2"), 2)
+            ),
+            retry_backoff=_number(_value("VIDEO_RETRY_BACKOFF", "1"), 1),
             source="AGNES_* (legacy)" if _value("AGNES_API_KEY") else "none",
         )
         return config._validated("agnes")
@@ -241,6 +255,8 @@ class VideoProviderConfig:
             timeout=self.timeout,
             poll_interval=self.poll_interval,
             max_poll_seconds=self.max_poll_seconds,
+            network_retries=self.network_retries,
+            retry_backoff=self.retry_backoff,
             source=self.source,
             error=error,
         )
