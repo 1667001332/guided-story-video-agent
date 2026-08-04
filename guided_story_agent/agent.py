@@ -28,6 +28,7 @@ from .models import (
 from .provider_config import TextProviderConfig
 from .storyboard import assess_director_plan_timing
 from .timing import (
+    ShotTimingProfile,
     count_sequential_action_phases,
     plan_scene_durations,
 )
@@ -91,16 +92,29 @@ class StoryAgent(Protocol):
 
     def revise_story(self, story: StoryDraft, feedback: str) -> StoryDraft: ...
 
-    def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript: ...
+    def generate_script(
+        self,
+        story: StoryDraft,
+        target_seconds: int,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> StoryScript: ...
 
     def revise_script(
-        self, story: StoryDraft, script: StoryScript, feedback: str
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        feedback: str,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> StoryScript: ...
 
     def plan_storyboard(
         self,
         script: StoryScript,
         facts: StoryFacts,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> list[dict[str, Any]] | None: ...
 
     def evaluate_artifacts(
@@ -510,7 +524,14 @@ class RuleBasedStoryAgent:
         revised.confirmed = False
         return revised
 
-    def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
+    def generate_script(
+        self,
+        story: StoryDraft,
+        target_seconds: int,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> StoryScript:
+        profile = timing_profile or ShotTimingProfile()
         # Keep very short offline scripts from degenerating into three equal
         # buckets; the scene count is a pacing choice, not a fixed template.
         scene_count = max(2, round(int(target_seconds) / 9))
@@ -558,7 +579,7 @@ class RuleBasedStoryAgent:
         durations, weights, reasons = plan_scene_durations(
             scenes,
             target_seconds,
-            minimum=3,
+            minimum=profile.min_duration_seconds,
             maximum=target_seconds,
         )
         for scene, duration, weight, reason in zip(scenes, durations, weights, reasons):
@@ -720,7 +741,15 @@ class RuleBasedStoryAgent:
         ]
         return locations, props, beats
 
-    def revise_script(self, story: StoryDraft, script: StoryScript, feedback: str) -> StoryScript:
+    def revise_script(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        feedback: str,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> StoryScript:
+        del timing_profile
         if not feedback.strip():
             raise ValueError("请用一句话说明想怎样修改剧本。")
         revised = deepcopy(script)
@@ -737,8 +766,10 @@ class RuleBasedStoryAgent:
         self,
         script: StoryScript,
         facts: StoryFacts,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> list[dict[str, Any]] | None:
-        del script, facts
+        del script, facts, timing_profile
         return None
 
     def evaluate_artifacts(
@@ -1071,9 +1102,16 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         reviewed.version = story.version + 1
         return reviewed
 
-    def generate_script(self, story: StoryDraft, target_seconds: int) -> StoryScript:
+    def generate_script(
+        self,
+        story: StoryDraft,
+        target_seconds: int,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> StoryScript:
+        profile = timing_profile or ShotTimingProfile()
         self._reset_fallback_status()
-        fallback = super().generate_script(story, target_seconds)
+        fallback = super().generate_script(story, target_seconds, timing_profile=profile)
         if self.client is None:
             self._mark_fallback("generate_script", self._unavailable_reason)
             return fallback
@@ -1084,10 +1122,12 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "confirmed_story": to_plain_data(story),
                     "required_constraints": self._script_constraints(story),
                     "target_seconds": target_seconds,
-                    "maximum_scenes": max(1, target_seconds // 3),
+                    "maximum_scenes": profile.maximum_shot_count(target_seconds),
                 },
             )
-            script = self._script_from_model(data, fallback, target_seconds)
+            script = self._script_from_model(
+                data, fallback, target_seconds, timing_profile=profile
+            )
         except Exception as exc:
             self._handle_artifact_failure("generate_script", exc)
             return fallback
@@ -1095,11 +1135,22 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             story,
             script,
             operation="generate_script_review",
+            timing_profile=profile,
         )
 
-    def revise_script(self, story: StoryDraft, script: StoryScript, feedback: str) -> StoryScript:
+    def revise_script(
+        self,
+        story: StoryDraft,
+        script: StoryScript,
+        feedback: str,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> StoryScript:
+        profile = timing_profile or ShotTimingProfile()
         self._reset_fallback_status()
-        fallback = super().revise_script(story, script, feedback)
+        fallback = super().revise_script(
+            story, script, feedback, timing_profile=profile
+        )
         if self.client is None:
             self._mark_fallback("revise_script", self._unavailable_reason)
             return fallback
@@ -1113,7 +1164,9 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "feedback": feedback,
                 },
             )
-            revised = self._script_from_model(data, fallback, script.target_seconds)
+            revised = self._script_from_model(
+                data, fallback, script.target_seconds, timing_profile=profile
+            )
         except Exception as exc:
             self._handle_artifact_failure("revise_script", exc)
             return fallback
@@ -1121,13 +1174,17 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             story,
             revised,
             operation="revise_script_review",
+            timing_profile=profile,
         )
 
     def plan_storyboard(
         self,
         script: StoryScript,
         facts: StoryFacts,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> list[dict[str, Any]] | None:
+        profile = timing_profile or ShotTimingProfile()
         self._reset_fallback_status()
         if self.client is None:
             self._mark_fallback("plan_storyboard", self._unavailable_reason)
@@ -1141,8 +1198,12 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                         "confirmed_script": to_plain_data(script),
                         "story_facts": to_plain_data(facts),
                         "target_seconds": script.target_seconds,
-                        "minimum_shots": max(1, (script.target_seconds + 14) // 15),
-                        "maximum_shots": max(1, script.target_seconds // 3),
+                        "minimum_shots": profile.minimum_shot_count(
+                            script.target_seconds
+                        ),
+                        "maximum_shots": profile.maximum_shot_count(
+                            script.target_seconds
+                        ),
                         "timing_feedback": timing_feedback,
                     },
                 )
@@ -1154,8 +1215,12 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 else:
                     result = [dict(item) for item in shots]
                     try:
-                        self._validate_director_plan(script, result)
-                        assessment = assess_director_plan_timing(script, result)
+                        self._validate_director_plan(
+                            script, result, timing_profile=profile
+                        )
+                        assessment = assess_director_plan_timing(
+                            script, result, timing_profile=profile
+                        )
                         if not assessment.feasible:
                             raise ValueError(assessment.feedback())
                         return result
@@ -1211,9 +1276,12 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
     def _validate_director_plan(
         script: StoryScript,
         shots: list[dict[str, Any]],
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> None:
-        minimum = max(1, (script.target_seconds + 14) // 15)
-        maximum = max(1, script.target_seconds // 3)
+        profile = timing_profile or ShotTimingProfile()
+        minimum = profile.minimum_shot_count(script.target_seconds)
+        maximum = profile.maximum_shot_count(script.target_seconds)
         if not minimum <= len(shots) <= maximum:
             raise ValueError(f"director shot count must be between {minimum} and {maximum}")
         scene_ids = [scene.scene_id for scene in script.scenes]
@@ -1431,7 +1499,11 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
 
     @staticmethod
     def _script_from_model(
-        data: dict[str, Any], fallback: StoryScript, target_seconds: int
+        data: dict[str, Any],
+        fallback: StoryScript,
+        target_seconds: int,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> StoryScript:
         raw = data.get("script", data)
         raw_scenes = raw.get("scenes", [])
@@ -1487,8 +1559,11 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     duration=1,
                 )
             )
-        if len(scenes) <= max(1, target_seconds // 3):
-            OpenAIStoryAgent._normalize_script_durations(scenes, target_seconds)
+        profile = timing_profile or ShotTimingProfile()
+        if len(scenes) <= profile.maximum_shot_count(target_seconds):
+            OpenAIStoryAgent._normalize_script_durations(
+                scenes, target_seconds, timing_profile=profile
+            )
         return StoryScript(
             title=str(raw.get("title", fallback.title)).strip() or fallback.title,
             target_seconds=target_seconds,
@@ -1526,7 +1601,9 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         script: StoryScript,
         *,
         operation: str,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> StoryScript:
+        profile = timing_profile or ShotTimingProfile()
         reviewed = script
         try:
             data = self._json_completion(
@@ -1536,13 +1613,19 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "required_constraints": self._script_constraints(story),
                     "script": to_plain_data(script),
                     "target_seconds": script.target_seconds,
-                    "maximum_scenes": max(1, script.target_seconds // 3),
+                    "maximum_scenes": profile.maximum_shot_count(
+                        script.target_seconds
+                    ),
                 },
             )
-            reviewed = self._script_from_model(data, script, script.target_seconds)
+            reviewed = self._script_from_model(
+                data, script, script.target_seconds, timing_profile=profile
+            )
         except Exception as exc:
             self._handle_artifact_failure(operation, exc, fallback_kind="partial")
-        return self._repair_script_budget(story, reviewed, operation=operation)
+        return self._repair_script_budget(
+            story, reviewed, operation=operation, timing_profile=profile
+        )
 
     def _repair_script_budget(
         self,
@@ -1550,10 +1633,16 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         script: StoryScript,
         *,
         operation: str,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> StoryScript:
-        maximum = max(1, script.target_seconds // 3)
+        profile = timing_profile or ShotTimingProfile()
+        maximum = profile.maximum_shot_count(script.target_seconds)
         if len(script.scenes) <= maximum:
-            self._normalize_script_durations(script.scenes, script.target_seconds)
+            self._normalize_script_durations(
+                script.scenes,
+                script.target_seconds,
+                timing_profile=profile,
+            )
             return script
         try:
             data = self._json_completion(
@@ -1570,12 +1659,14 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 data,
                 script,
                 script.target_seconds,
+                timing_profile=profile,
             )
             if len(compressed.scenes) > maximum:
                 raise ValueError("compressed script still exceeds maximum_scenes")
             self._normalize_script_durations(
                 compressed.scenes,
                 compressed.target_seconds,
+                timing_profile=profile,
             )
             return compressed
         except Exception as exc:
@@ -1584,7 +1675,9 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                 exc,
                 fallback_kind="whole",
             )
-            return RuleBasedStoryAgent().generate_script(story, script.target_seconds)
+            return RuleBasedStoryAgent().generate_script(
+                story, script.target_seconds, timing_profile=profile
+            )
 
     @staticmethod
     def _script_constraints(story: StoryDraft) -> dict[str, Any]:
@@ -1607,11 +1700,14 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
     def _normalize_script_durations(
         scenes: list[StoryScene],
         target_seconds: int,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> None:
+        profile = timing_profile or ShotTimingProfile()
         durations, weights, reasons = plan_scene_durations(
             scenes,
             target_seconds,
-            minimum=3,
+            minimum=profile.min_duration_seconds,
             maximum=target_seconds,
         )
         for scene, duration, weight, reason in zip(scenes, durations, weights, reasons):

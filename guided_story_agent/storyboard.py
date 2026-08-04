@@ -22,6 +22,7 @@ from .models import (
 from .timing import (
     ReadableShotMinimum,
     ShotTimingDemand,
+    ShotTimingProfile,
     allocate_weighted_durations,
     assess_shot_readable_minimum,
     estimate_shot_duration,
@@ -37,6 +38,7 @@ class StoryboardTimingAssessment:
     minimum_durations: tuple[int, ...]
     preferred_durations: tuple[float, ...]
     minimum_reasons: tuple[str, ...]
+    max_duration_seconds: int = 15
 
     @property
     def minimum_total(self) -> int:
@@ -51,7 +53,7 @@ class StoryboardTimingAssessment:
         return tuple(
             index
             for index, duration in enumerate(self.minimum_durations, start=1)
-            if duration > 15
+            if duration > self.max_duration_seconds
         )
 
     @property
@@ -59,7 +61,9 @@ class StoryboardTimingAssessment:
         return (
             bool(self.minimum_durations)
             and not self.over_capacity_shots
-            and self.minimum_total <= self.target_seconds <= 15 * len(self.minimum_durations)
+            and self.minimum_total
+            <= self.target_seconds
+            <= self.max_duration_seconds * len(self.minimum_durations)
         )
 
     def feedback(self) -> str:
@@ -70,7 +74,8 @@ class StoryboardTimingAssessment:
         if self.over_capacity_shots:
             shots = "、".join(str(index) for index in self.over_capacity_shots)
             return (
-                f"上次分镜中镜头 {shots} 的单镜内容超过15秒容量；{details}。"
+                f"上次分镜中镜头 {shots} 的单镜内容超过"
+                f"{self.max_duration_seconds}秒容量；{details}。"
                 "请拆分过载动作，但同时删去低信息增量镜头，重新使总预算成立。"
             )
         return (
@@ -183,29 +188,35 @@ def build_storyboard(
     facts: StoryFacts,
     visual_bible: VisualBible | None = None,
     director_plan: list[dict[str, object]] | None = None,
+    *,
+    timing_profile: ShotTimingProfile | None = None,
 ) -> StoryboardPlan:
     if not script.confirmed:
         raise RuntimeError("请先确认剧本，再生成分镜。")
     if not script.scenes:
         raise ValueError("剧本没有可转换的场景。")
-    normalized = _normalized_storyboard_script(script)
+    profile = timing_profile or ShotTimingProfile()
+    normalized = _normalized_storyboard_script(script, timing_profile=profile)
     bible = visual_bible or build_visual_bible(normalized, facts)
     units = (
-        _units_from_director_plan(normalized, director_plan)
+        _units_from_director_plan(
+            normalized, director_plan, timing_profile=profile
+        )
         if director_plan
-        else _plan_shot_units(normalized)
+        else _plan_shot_units(normalized, timing_profile=profile)
     )
     assessment, timing, readable, dialogues, narrations = _assess_units_timing(
         normalized,
         units,
+        timing_profile=profile,
     )
     if not assessment.feasible:
         raise StoryboardTimingBudgetError(assessment)
     durations = allocate_weighted_durations(
         normalized.target_seconds,
         [item[1] for item in timing],
-        minimum=3,
-        maximum=15,
+        minimum=profile.min_duration_seconds,
+        maximum=profile.max_duration_seconds,
         minimums=list(assessment.minimum_durations),
         keys=[
             f"{unit.scene.scene_id}:{unit.kind}:{unit.purpose}:{index}"
@@ -259,31 +270,41 @@ def assess_director_plan_timing(
     *,
     dialogue_overrides: list[str] | None = None,
     narration_overrides: list[str] | None = None,
+    timing_profile: ShotTimingProfile | None = None,
 ) -> StoryboardTimingAssessment:
     """Assess a model director plan before accepting or retrying it."""
 
-    normalized = _normalized_storyboard_script(script)
-    units = _units_from_director_plan(normalized, director_plan)
+    profile = timing_profile or ShotTimingProfile()
+    normalized = _normalized_storyboard_script(script, timing_profile=profile)
+    units = _units_from_director_plan(
+        normalized, director_plan, timing_profile=profile
+    )
     assessment, _, _, _, _ = _assess_units_timing(
         normalized,
         units,
         dialogue_overrides=dialogue_overrides,
         narration_overrides=narration_overrides,
+        timing_profile=profile,
     )
     return assessment
 
 
-def _normalized_storyboard_script(script: StoryScript) -> StoryScript:
+def _normalized_storyboard_script(
+    script: StoryScript,
+    *,
+    timing_profile: ShotTimingProfile | None = None,
+) -> StoryScript:
+    profile = timing_profile or ShotTimingProfile()
     normalized = deepcopy(script)
     normalized.scenes = fit_scenes_to_duration(
         normalized.scenes,
         normalized.target_seconds,
-        minimum=3,
+        minimum=profile.min_duration_seconds,
     )
     normalized_durations = allocate_weighted_durations(
         normalized.target_seconds,
         [_scene_duration_weight(scene) for scene in normalized.scenes],
-        minimum=3,
+        minimum=profile.min_duration_seconds,
         maximum=normalized.target_seconds,
         keys=[f"scene-{scene.scene_id}-{scene.title}" for scene in normalized.scenes],
     )
@@ -298,6 +319,7 @@ def _assess_units_timing(
     *,
     dialogue_overrides: list[str] | None = None,
     narration_overrides: list[str] | None = None,
+    timing_profile: ShotTimingProfile | None = None,
 ) -> tuple[
     StoryboardTimingAssessment,
     list[tuple[float, float, str]],
@@ -305,6 +327,7 @@ def _assess_units_timing(
     list[str],
     list[str],
 ]:
+    profile = timing_profile or ShotTimingProfile()
     if not units:
         raise ValueError("分镜至少需要一个镜头单元。")
     scene_shot_counts = {
@@ -348,13 +371,23 @@ def _assess_units_timing(
         )
         for index, unit in enumerate(units)
     ]
-    timing = [estimate_shot_duration(demand) for demand in demands]
-    readable = [assess_shot_readable_minimum(demand) for demand in demands]
+    timing = [
+        estimate_shot_duration(demand, timing_profile=profile) for demand in demands
+    ]
+    readable = [
+        assess_shot_readable_minimum(
+            demand,
+            provider_minimum=profile.min_duration_seconds,
+            provider_maximum=profile.max_duration_seconds,
+        )
+        for demand in demands
+    ]
     assessment = StoryboardTimingAssessment(
         target_seconds=script.target_seconds,
         minimum_durations=tuple(item.minimum_seconds for item in readable),
         preferred_durations=tuple(item[0] for item in timing),
         minimum_reasons=tuple(item.reason for item in readable),
+        max_duration_seconds=profile.max_duration_seconds,
     )
     return assessment, timing, readable, dialogues, narrations
 
@@ -446,7 +479,10 @@ def _scenes_share_physical_context(left: StoryScene, right: StoryScene) -> bool:
 def _units_from_director_plan(
     script: StoryScript,
     director_plan: list[dict[str, object]],
+    *,
+    timing_profile: ShotTimingProfile | None = None,
 ) -> list[_ShotUnit]:
+    profile = timing_profile or ShotTimingProfile()
     scenes = {scene.scene_id: scene for scene in script.scenes}
     units: list[_ShotUnit] = []
     for index, item in enumerate(director_plan):
@@ -487,8 +523,8 @@ def _units_from_director_plan(
                 composition=str(item.get("composition", "")).strip(),
             )
         )
-    minimum = max(1, math.ceil(script.target_seconds / 15))
-    maximum = max(1, script.target_seconds // 3)
+    minimum = profile.minimum_shot_count(script.target_seconds)
+    maximum = profile.maximum_shot_count(script.target_seconds)
     if not minimum <= len(units) <= maximum:
         raise ValueError(f"导演分镜数量必须在 {minimum} 到 {maximum} 之间。")
     if {unit.scene.scene_id for unit in units} != set(scenes):
@@ -496,7 +532,10 @@ def _units_from_director_plan(
     return units
 
 
-def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
+def _plan_shot_units(
+    script: StoryScript,
+    timing_profile: ShotTimingProfile | None = None,
+) -> list[_ShotUnit]:
     """Derive non-repeating, atomic fallback shots when no model director is available."""
     units: list[_ShotUnit] = []
     previous_context: tuple[str, str] | None = None
@@ -591,9 +630,10 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
             )
         previous_context = context
 
-    maximum = max(1, script.target_seconds // 3)
+    profile = timing_profile or ShotTimingProfile()
+    maximum = profile.maximum_shot_count(script.target_seconds)
     minimum = max(
-        math.ceil(script.target_seconds / 15),
+        profile.minimum_shot_count(script.target_seconds),
         min(len(script.scenes), maximum),
     )
     required_indexes = [index for index, unit in enumerate(units) if unit.required]
@@ -611,7 +651,9 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
 
     def candidate_fits(indexes: set[int]) -> bool:
         candidate = [unit for index, unit in enumerate(units) if index in indexes]
-        assessment, _, _, _, _ = _assess_units_timing(script, candidate)
+        assessment, _, _, _, _ = _assess_units_timing(
+            script, candidate, timing_profile=profile
+        )
         return (
             not assessment.over_capacity_shots
             and assessment.minimum_total <= script.target_seconds
@@ -636,7 +678,9 @@ def _plan_shot_units(script: StoryScript) -> list[_ShotUnit]:
         if candidate_fits(candidate):
             selected = candidate
     result = [unit for index, unit in enumerate(units) if index in selected]
-    assessment, _, _, _, _ = _assess_units_timing(script, result)
+    assessment, _, _, _, _ = _assess_units_timing(
+        script, result, timing_profile=profile
+    )
     if not assessment.feasible:
         raise StoryboardTimingBudgetError(assessment)
     return result

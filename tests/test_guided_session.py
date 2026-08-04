@@ -22,8 +22,10 @@ def started(seconds: int = 45) -> GuidedStorySession:
 
 
 class RepairableScriptAgent(RuleBasedStoryAgent):
-    def generate_script(self, story, target_seconds):
-        script = super().generate_script(story, target_seconds)
+    def generate_script(self, story, target_seconds, *, timing_profile=None):
+        script = super().generate_script(
+            story, target_seconds, timing_profile=timing_profile
+        )
         for scene in script.scenes:
             scene.duration = 3
         script.scenes[0].action = ""

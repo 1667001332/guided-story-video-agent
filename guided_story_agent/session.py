@@ -71,6 +71,7 @@ from .storyboard import (
 from .video_job import build_video_job
 from .timing import (
     ShotTimingDemand,
+    ShotTimingProfile,
     assess_shot_readable_minimum,
     estimate_story_duration,
     plan_scene_durations,
@@ -201,6 +202,7 @@ class GuidedStorySession:
         *,
         director_agent: V2DirectorAgent | None = None,
         v2_enabled: bool = False,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> None:
         self._state_lock = RLock()
         self._render_in_progress = False
@@ -209,6 +211,7 @@ class GuidedStorySession:
         self.agent = agent or RuleBasedStoryAgent()
         self.director_agent = director_agent
         self.v2_enabled = bool(v2_enabled)
+        self.timing_profile = timing_profile or ShotTimingProfile()
         self.stage = Stage.IDEATING
         self.direction = ""
         self.idea_batches: list[IdeaBatch] = []
@@ -1945,7 +1948,11 @@ class GuidedStorySession:
             self._run_text_operation(
                 "generate_script",
                 "script",
-                lambda: self.agent.generate_script(deepcopy(self.story), target_seconds),
+                lambda: self.agent.generate_script(
+                    deepcopy(self.story),
+                    target_seconds,
+                    timing_profile=self.timing_profile,
+                ),
             )
         )
         self._validate_or_repair_script(script, target_seconds=target_seconds)
@@ -1984,6 +1991,7 @@ class GuidedStorySession:
                     deepcopy(self.story),
                     deepcopy(self.script),
                     cleaned_feedback,
+                    timing_profile=self.timing_profile,
                 ),
             )
         )
@@ -2051,7 +2059,11 @@ class GuidedStorySession:
             "plan_storyboard",
             "storyboard",
             lambda: (
-                planner(deepcopy(self.script), deepcopy(facts))
+                planner(
+                    deepcopy(self.script),
+                    deepcopy(facts),
+                    timing_profile=self.timing_profile,
+                )
                 if callable(planner)
                 else None
             ),
@@ -2060,6 +2072,7 @@ class GuidedStorySession:
             self.script,
             facts,
             director_plan=director_plan,
+            timing_profile=self.timing_profile,
         )
         self._validate_storyboard_plan(storyboard)
         self.storyboard = storyboard
@@ -2680,9 +2693,14 @@ class GuidedStorySession:
                 review.hard_errors.append("剧本总时长不符合目标")
             if not self.script.scenes:
                 review.hard_errors.append("剧本没有可转换的场景")
-            if any(scene.duration < 3 for scene in self.script.scenes):
-                review.hard_errors.append("存在不足3秒、无法稳定转换为镜头的场景")
-            if len(self.script.scenes) > max(1, target_seconds // 3):
+            if any(
+                scene.duration < self.timing_profile.min_duration_seconds
+                for scene in self.script.scenes
+            ):
+                review.hard_errors.append("存在不足最短时长、无法稳定转换为镜头的场景")
+            if len(self.script.scenes) > self.timing_profile.maximum_shot_count(
+                target_seconds
+            ):
                 review.hard_errors.append("场景数量超过当前时长可容纳的分镜数量")
             if any(
                 not (scene.visible_action or scene.action).strip() for scene in self.script.scenes
@@ -2715,12 +2733,17 @@ class GuidedStorySession:
                 return review
             if abs(self.storyboard.total_duration - target_seconds) > 1:
                 review.hard_errors.append("分镜总时长不符合目标")
-            minimum = max(1, (target_seconds + 14) // 15)
-            maximum = max(1, target_seconds // 3)
+            minimum = self.timing_profile.minimum_shot_count(target_seconds)
+            maximum = self.timing_profile.maximum_shot_count(target_seconds)
             if not minimum <= len(self.storyboard.shots) <= maximum:
                 review.hard_errors.append(f"当前时长下分镜数量必须在{minimum}到{maximum}之间")
-            if any(not 3 <= shot.duration <= 15 for shot in self.storyboard.shots):
-                review.hard_errors.append("存在超出3到15秒限制的镜头")
+            if any(
+                not self.timing_profile.min_duration_seconds
+                <= shot.duration
+                <= self.timing_profile.max_duration_seconds
+                for shot in self.storyboard.shots
+            ):
+                review.hard_errors.append("存在超出时长限制的镜头")
             try:
                 if self.script is None:
                     raise ValueError("缺少已确认剧本")
@@ -2751,6 +2774,7 @@ class GuidedStorySession:
                     narration_overrides=[
                         shot.narration for shot in self.storyboard.shots
                     ],
+                    timing_profile=self.timing_profile,
                 )
             except (TypeError, ValueError) as exc:
                 review.hard_errors.append(
@@ -2766,11 +2790,11 @@ class GuidedStorySession:
                         self.storyboard.shots,
                         readable_minimums,
                     )
-                    if minimum_duration > 15
+                    if minimum_duration > self.timing_profile.max_duration_seconds
                 ]
                 if over_capacity:
                     review.hard_errors.append(
-                        "存在单镜内容可读下限超过15秒、必须拆分的镜头："
+                        "存在单镜内容可读下限超过时长上限、必须拆分的镜头："
                         + "、".join(str(shot_id) for shot_id in over_capacity)
                     )
                 underfunded = [
@@ -3834,16 +3858,18 @@ class GuidedStorySession:
             raise ValueError("保存的剧本目标时长无效。")
         if not script.scenes:
             raise ValueError("保存的剧本没有场景。")
-        if len(script.scenes) > script.target_seconds // 3:
-            raise ValueError("保存的剧本场景过密，无法转换为三秒以上镜头。")
+        if len(script.scenes) > self.timing_profile.maximum_shot_count(
+            script.target_seconds
+        ):
+            raise ValueError("保存的剧本场景过密，无法转换为最短时长以上的镜头。")
         seen_ids: set[int] = set()
         for scene in script.scenes:
             self._validate_scene_fields(scene)
             if scene.scene_id in seen_ids:
                 raise ValueError("保存的剧本场景 ID 不能重复。")
             seen_ids.add(scene.scene_id)
-            if scene.duration < 3:
-                raise ValueError("保存的剧本包含不足三秒的场景。")
+            if scene.duration < self.timing_profile.min_duration_seconds:
+                raise ValueError("保存的剧本包含不足最短时长的场景。")
             if not (scene.visible_action or scene.action).strip():
                 raise ValueError("保存的剧本包含空动作场景。")
         if abs(script.total_duration - script.target_seconds) > 1:
@@ -4184,8 +4210,7 @@ class GuidedStorySession:
         ]
         return list(dict.fromkeys(selected))
 
-    @staticmethod
-    def _validate_storyboard_plan(plan: StoryboardPlan) -> None:
+    def _validate_storyboard_plan(self, plan: StoryboardPlan) -> None:
         if not isinstance(plan.title, str) or not isinstance(plan.narration_text, str):
             raise ValueError("分镜标题和旁白必须是字符串。")
         if not isinstance(plan.audio_path, str) or not isinstance(plan.subtitle_path, str):
@@ -4287,8 +4312,16 @@ class GuidedStorySession:
                 raise ValueError("镜头对应的场景 ID 必须是正整数。")
             if isinstance(shot.duration, bool) or not isinstance(shot.duration, int):
                 raise ValueError("镜头时长必须是整数。")
-            if not 3 <= shot.duration <= 15:
-                raise ValueError("镜头时长必须在 3 到 15 秒之间。")
+            if not (
+                self.timing_profile.min_duration_seconds
+                <= shot.duration
+                <= self.timing_profile.max_duration_seconds
+            ):
+                raise ValueError(
+                    "镜头时长必须在 "
+                    f"{self.timing_profile.min_duration_seconds} 到 "
+                    f"{self.timing_profile.max_duration_seconds} 秒之间。"
+                )
             if (
                 isinstance(shot.minimum_readable_duration, bool)
                 or not isinstance(shot.minimum_readable_duration, int)

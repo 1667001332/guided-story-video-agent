@@ -339,7 +339,8 @@ class CoreGenerationRegressionTests(unittest.TestCase):
         self,
     ) -> None:
         class DenseScriptAgent(RuleBasedStoryAgent):
-            def generate_script(self, story, target_seconds):
+            def generate_script(self, story, target_seconds, *, timing_profile=None):
+                del timing_profile
                 protagonist = story.characters[0].name
                 return StoryScript(
                     title=story.title,

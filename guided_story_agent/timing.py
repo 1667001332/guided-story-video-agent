@@ -32,10 +32,32 @@ class ReadableShotMinimum:
     speech_seconds: int
     minimum_seconds: int
     reason: str
+    max_duration_seconds: int = 15
 
     @property
     def requires_split(self) -> bool:
-        return self.minimum_seconds > 15
+        return self.minimum_seconds > self.max_duration_seconds
+
+
+@dataclass(frozen=True, slots=True)
+class ShotTimingProfile:
+    """Planning-time per-shot duration bounds.
+
+    Defaults preserve the original Agnes adapter bounds (3–15 seconds per
+    generation).  A provider with different bounds injects its own profile at
+    storyboard planning time, so the pipeline never hardcodes 3/15 again.
+    """
+
+    min_duration_seconds: int = 3
+    max_duration_seconds: int = 15
+
+    def minimum_shot_count(self, target_seconds: int) -> int:
+        """Fewest shots that can physically carry ``target_seconds``."""
+        return max(1, math.ceil(target_seconds / self.max_duration_seconds))
+
+    def maximum_shot_count(self, target_seconds: int) -> int:
+        """Most shots that fit into ``target_seconds`` at the minimum duration."""
+        return max(1, target_seconds // self.min_duration_seconds)
 
 
 _BASE_SECONDS = {
@@ -72,8 +94,13 @@ _CONCURRENT_PREFIXES = (
 )
 
 
-def estimate_shot_duration(demand: ShotTimingDemand) -> tuple[float, float, str]:
+def estimate_shot_duration(
+    demand: ShotTimingDemand,
+    *,
+    timing_profile: ShotTimingProfile | None = None,
+) -> tuple[float, float, str]:
     """Estimate content need without turning shot kinds into fixed durations."""
+    profile = timing_profile or ShotTimingProfile()
     kind = demand.shot_kind if demand.shot_kind in _BASE_SECONDS else "action"
     base = _BASE_SECONDS[kind]
     action_steps = _count_action_steps(demand.action)
@@ -139,7 +166,10 @@ def estimate_shot_duration(demand: ShotTimingDemand) -> tuple[float, float, str]
         + role_increment
     )
     estimated = 0.8 * content_estimate + 0.2 * scene_share
-    estimated = min(15.0, max(3.0, estimated))
+    estimated = min(
+        float(profile.max_duration_seconds),
+        max(float(profile.min_duration_seconds), estimated),
+    )
     priority_multiplier = 1.0 + max(0, demand.priority - 3) * 0.06
     weight = max(0.1, (estimated - 2.0) * priority_multiplier)
 
@@ -255,6 +285,7 @@ def assess_shot_readable_minimum(
     demand: ShotTimingDemand,
     *,
     provider_minimum: int = 3,
+    provider_maximum: int = 15,
 ) -> ReadableShotMinimum:
     """Calculate a content-specific floor without treating the preferred estimate as a gate.
 
@@ -305,6 +336,7 @@ def assess_shot_readable_minimum(
         speech_seconds=speech_seconds,
         minimum_seconds=minimum_seconds,
         reason="；".join(reasons),
+        max_duration_seconds=provider_maximum,
     )
 
 

@@ -19,6 +19,7 @@ from guided_story_agent.storyboard import (
 )
 from guided_story_agent.timing import (
     ShotTimingDemand,
+    ShotTimingProfile,
     allocate_durations,
     allocate_weighted_durations,
     assess_shot_readable_minimum,
@@ -1090,6 +1091,76 @@ class TimingTests(unittest.TestCase):
                 for asset_id in shot.reference_asset_ids
             )
         )
+
+
+class ShotTimingProfileTests(unittest.TestCase):
+    def test_profile_shot_count_math(self) -> None:
+        default = ShotTimingProfile()
+        self.assertEqual(4, default.minimum_shot_count(60))
+        self.assertEqual(20, default.maximum_shot_count(60))
+
+        wide = ShotTimingProfile(min_duration_seconds=5, max_duration_seconds=30)
+        self.assertEqual(2, wide.minimum_shot_count(60))
+        self.assertEqual(12, wide.maximum_shot_count(60))
+
+        self.assertEqual(1, default.minimum_shot_count(3))
+        self.assertEqual(1, default.maximum_shot_count(3))
+
+    def test_custom_profile_drives_storyboard_budget(self) -> None:
+        script = StoryScript(
+            "长镜头测试",
+            60,
+            [
+                StoryScene(
+                    1,
+                    "等待",
+                    "空站台",
+                    "清晨",
+                    ["旅人"],
+                    "旅人安静等待列车",
+                    "",
+                    60,
+                )
+            ],
+            confirmed=True,
+        )
+        narrow = build_storyboard(
+            script,
+            StoryFacts(),
+            timing_profile=ShotTimingProfile(
+                min_duration_seconds=5, max_duration_seconds=30
+            ),
+        )
+        self.assertTrue(
+            all(5 <= shot.duration <= 30 for shot in narrow.shots)
+        )
+        self.assertGreaterEqual(
+            len(narrow.shots),
+            ShotTimingProfile(min_duration_seconds=5, max_duration_seconds=30).minimum_shot_count(60),
+        )
+        self.assertLessEqual(
+            len(narrow.shots),
+            ShotTimingProfile(min_duration_seconds=5, max_duration_seconds=30).maximum_shot_count(60),
+        )
+
+    def test_session_accepts_custom_timing_profile(self) -> None:
+        from guided_story_agent.models import CreativeBrief
+        from guided_story_agent.session import GuidedStorySession
+
+        profile = ShotTimingProfile(min_duration_seconds=5, max_duration_seconds=30)
+        session = GuidedStorySession(
+            CreativeBrief(target_seconds=60),
+            RuleBasedStoryAgent(),
+            timing_profile=profile,
+        )
+        session.start_ideation("一只猫在暴雨中寻找灯塔")
+        session.auto_choose()
+        session.generate_story()
+        session.confirm_story()
+        session.generate_script()
+        session.confirm_script()
+        plan = session.build_storyboard()
+        self.assertTrue(all(5 <= shot.duration <= 30 for shot in plan.shots))
 
 
 if __name__ == "__main__":
