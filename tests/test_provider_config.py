@@ -394,6 +394,20 @@ class VideoProviderRegistryTests(unittest.TestCase):
             provider = video_provider_from_env()
         self.assertEqual("fake-dispatch", provider.provider_name)
 
+    def test_agnes_dimensions_follow_declared_aspect_ratios(self) -> None:
+        from guided_story_agent.video_provider import AgnesVideoProvider
+
+        provider = AgnesVideoProvider(api_key="test")
+        self.assertEqual(
+            ("16:9", "9:16", "1:1"),
+            provider.capabilities.supported_aspect_ratios,
+        )
+        self.assertEqual((1152, 648), provider.dimensions("16:9"))
+        self.assertEqual((648, 1152), provider.dimensions("9:16"))
+        self.assertEqual((768, 768), provider.dimensions("1:1"))
+        with self.assertRaises(ValueError):
+            provider.dimensions("4:3")
+
 
 if __name__ == "__main__":
     unittest.main()

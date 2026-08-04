@@ -394,6 +394,7 @@ class ProviderCapabilities:
     max_duration_seconds: int | None = None
     supports_long_video: bool = True
     supports_multi_scene_prompt: bool = True
+    supported_aspect_ratios: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

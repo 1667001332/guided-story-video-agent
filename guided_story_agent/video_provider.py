@@ -61,6 +61,8 @@ class VideoProvider(Protocol):
         resume_request_id: str | None = None,
     ) -> VideoArtifact: ...
 
+    def dimensions(self, ratio: str) -> tuple[int, int]: ...
+
 
 def video_provider_from_env() -> VideoProvider:
     """Build the configured video adapter via the provider registry.
@@ -351,7 +353,23 @@ class AgnesVideoProvider:
             max_duration_seconds=15,
             supports_long_video=False,
             supports_multi_scene_prompt=True,
+            supported_aspect_ratios=("16:9", "9:16", "1:1"),
         )
+
+    def dimensions(self, ratio: str) -> tuple[int, int]:
+        """Resolve a storyboard aspect ratio into this provider's pixel size."""
+        dimensions = {
+            "16:9": (1152, 648),
+            "9:16": (648, 1152),
+            "1:1": (768, 768),
+        }
+        try:
+            return dimensions[ratio]
+        except KeyError as exc:
+            supported = "、".join(self.capabilities.supported_aspect_ratios)
+            raise ValueError(
+                f"画幅比例只支持 {supported}。"
+            ) from exc
 
     @classmethod
     def from_env(cls) -> AgnesVideoProvider:
@@ -425,8 +443,22 @@ class AgnesVideoProvider:
             raise VideoProviderNotConfigured(
                 "未配置 VIDEO_API_KEY（旧版可使用 AGNES_API_KEY），尚未发起视频任务。"
             )
-        if shot.duration not in range(3, 16):
-            raise ValueError("单镜头时长必须是 3 到 15 秒之间的整数。")
+        capabilities = self.capabilities
+        if shot.reference_image_paths and not capabilities.supports_reference_images:
+            raise VideoProviderNotConfigured(
+                "当前 Provider 不支持通用身份参考图；"
+                "请先由渲染器选择一张首帧，或改用声明支持 reference images 的 Provider。"
+            )
+        if not (
+            capabilities.min_duration_seconds
+            <= shot.duration
+            <= capabilities.max_duration_seconds
+        ):
+            raise ValueError(
+                "单镜头时长必须是 "
+                f"{capabilities.min_duration_seconds} 到 "
+                f"{capabilities.max_duration_seconds} 秒之间的整数。"
+            )
         payload = self._build_payload(shot)
         video_id = (resume_request_id or "").strip()
         if video_id:
@@ -570,7 +602,7 @@ class AgnesVideoProvider:
         )
 
     def _build_payload(self, shot: StoryboardShot) -> dict[str, Any]:
-        width, height = self._dimensions(shot.aspect_ratio)
+        width, height = self.dimensions(shot.aspect_ratio)
         payload: dict[str, Any] = {
             "model": self.model,
             "prompt": shot.video_prompt,
@@ -748,20 +780,6 @@ class AgnesVideoProvider:
     def _extract_url(cls, data: Any) -> str | None:
         value = cls._extract_text(data, ("video_url", "download_url", "output_url", "url"))
         return value if value and value.startswith(("https://", "http://")) else None
-
-    @staticmethod
-    def _dimensions(ratio: str) -> tuple[int, int]:
-        dimensions = {
-            "16:9": (1152, 648),
-            "9:16": (648, 1152),
-            "1:1": (768, 768),
-        }
-        try:
-            return dimensions[ratio]
-        except KeyError as exc:
-            raise ValueError(
-                "Agnes 画幅比例只支持 16:9、9:16 或 1:1。"
-            ) from exc
 
     def _download_file(self, url: str, target: Path) -> None:
         temporary = target.with_suffix(".mp4.part")
