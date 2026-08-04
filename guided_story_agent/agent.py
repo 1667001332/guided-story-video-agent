@@ -8,19 +8,15 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import (
-    CreatorContribution,
-    DraftBundle,
     ElementOption,
     ElementPalette,
     IdeaBatch,
     IdeaCard,
     SourceAttribution,
-    StoryBeat,
     StoryCharacter,
     StoryDraft,
     StoryFacts,
     StoryLocation,
-    StoryOutline,
     StoryScene,
     StoryScript,
     to_plain_data,
@@ -123,16 +119,6 @@ class StoryAgent(Protocol):
         script: StoryScript,
         storyboard: dict[str, Any],
     ) -> dict[str, Any]: ...
-
-    def generate_draft(
-        self,
-        direction: str,
-        selected_cards: list[IdeaCard],
-        selected_elements: dict[str, ElementOption],
-        target_seconds: int,
-    ) -> DraftBundle: ...
-
-    def revise_draft(self, draft: DraftBundle, feedback: str) -> DraftBundle: ...
 
     def simulate_creator_direction(self) -> str: ...
 
@@ -781,83 +767,8 @@ class RuleBasedStoryAgent:
         del story, script, storyboard
         return {}
 
-    def generate_draft(
-        self,
-        direction: str,
-        selected_cards: list[IdeaCard],
-        selected_elements: dict[str, ElementOption],
-        target_seconds: int,
-    ) -> DraftBundle:
-        story = self.generate_story(direction, selected_cards, selected_elements)
-        script = self.generate_script(story, target_seconds)
-        beats = [
-            StoryBeat(
-                beat_id=scene.scene_id,
-                purpose=scene.title,
-                event=scene.visible_action or scene.action,
-                causal_link=scene.start_state,
-                emotional_change=scene.emotional_change,
-                duration=scene.duration,
-            )
-            for scene in script.scenes
-        ]
-        opening = script.scenes[0].visible_action or script.scenes[0].action
-        development = "；".join(
-            scene.visible_action or scene.action for scene in script.scenes[1:-1]
-        )
-        outline = StoryOutline(
-            title=story.title,
-            logline=story.logline,
-            opening=opening,
-            protagonist_goal=story.characters[0].description if story.characters else story.logline,
-            conflict=story.core_conflict,
-            development=development,
-            turning_point=script.scenes[-2].visible_action
-            if len(script.scenes) > 1
-            else development,
-            ending=story.ending,
-            source_turn_ids=[],
-            beats=beats,
-        )
-        return DraftBundle(
-            outline=outline,
-            script=script,
-            field_sources=deepcopy(story.field_sources),
-            ai_filled_fields=list(story.ai_filled_fields),
-        )
-
-    def revise_draft(self, draft: DraftBundle, feedback: str) -> DraftBundle:
-        if not feedback.strip():
-            raise ValueError("请用一句话说明想怎样修改。")
-        story = StoryDraft(
-            title=draft.outline.title,
-            logline=draft.outline.logline,
-            story_text="；".join(
-                scene.visible_action or scene.action for scene in draft.script.scenes
-            ),
-            core_conflict=draft.outline.conflict,
-            ending=draft.outline.ending,
-        )
-        revised = deepcopy(draft)
-        revised.script = self.revise_script(story, draft.script, feedback)
-        revised.version += 1
-        revised.outline.confirmed = False
-        return revised
-
-    def build_outline(self, facts: StoryFacts, history: list[CreatorContribution]) -> StoryOutline:
-        direction = facts.premise or facts.opening or "一个尚未命名的故事"
-        return self.generate_draft(direction, [], {}, 45).outline
-
-    def build_script(
-        self, outline: StoryOutline, facts: StoryFacts, target_seconds: int
-    ) -> StoryScript:
-        return self.generate_draft(outline.logline or outline.title, [], {}, target_seconds).script
-
     def simulate_creator_direction(self) -> str:
         return "暴雨夜，一名邮差在废弃车站收到一封写给明天的信。"
-
-    def simulate_creator(self, question: str, history: list[CreatorContribution]) -> str:
-        return self.simulate_creator_direction()
 
     @staticmethod
     def _short_seed(direction: str) -> str:
@@ -1333,30 +1244,6 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             raise ValueError("director plan changes script scene order")
         if set(scene_ids) - set(planned_ids):
             raise ValueError("director plan omits a script scene")
-
-    def generate_draft(
-        self,
-        direction: str,
-        selected_cards: list[IdeaCard],
-        selected_elements: dict[str, ElementOption],
-        target_seconds: int,
-    ) -> DraftBundle:
-        story = self.generate_story(direction, selected_cards, selected_elements)
-        script = self.generate_script(story, target_seconds)
-        fallback = RuleBasedStoryAgent().generate_draft(
-            direction, selected_cards, selected_elements, target_seconds
-        )
-        fallback.script = script
-        fallback.outline.title = story.title
-        fallback.outline.logline = story.logline
-        fallback.outline.conflict = story.core_conflict
-        fallback.outline.ending = story.ending
-        fallback.field_sources = deepcopy(story.field_sources)
-        fallback.ai_filled_fields = list(story.ai_filled_fields)
-        return fallback
-
-    def revise_draft(self, draft: DraftBundle, feedback: str) -> DraftBundle:
-        return super().revise_draft(draft, feedback)
 
     def simulate_creator_direction(self) -> str:
         self._reset_fallback_status()

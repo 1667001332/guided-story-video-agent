@@ -25,7 +25,6 @@ from .models import (
     ContinuityState,
     CreativeBrief,
     CreativeSuggestion,
-    DraftBundle,
     ElementOption,
     ElementPalette,
     GuideTurnResult,
@@ -36,12 +35,10 @@ from .models import (
     SelectionState,
     SourceAttribution,
     Stage,
-    StoryBeat,
     StoryCharacter,
     StoryDraft,
     StoryFacts,
     StoryLocation,
-    StoryOutline,
     StoryScene,
     StoryScript,
     StoryboardPlan,
@@ -170,9 +167,6 @@ class GuidedStorySession:
         self.chat_history: list[dict[str, str]] = []
         self.story: StoryDraft | None = None
         self.story_history: list[StoryDraft] = []
-        self.draft: DraftBundle | None = None
-        self.draft_history: list[DraftBundle] = []
-        self.outline: StoryOutline | None = None
         self.script: StoryScript | None = None
         self.storyboard: StoryboardPlan | None = None
         self.video_job: VideoJob | None = None
@@ -266,7 +260,6 @@ class GuidedStorySession:
             selected_idea_ids=list(self.selected_idea_ids),
             selected_elements=dict(self.selected_elements),
             can_generate_story=bool(self.direction),
-            can_generate_draft=bool(self.direction),
         )
 
     @property
@@ -280,14 +273,6 @@ class GuidedStorySession:
     @property
     def valid_turns(self) -> int:
         return self.free_text_count
-
-    @property
-    def can_build_outline(self) -> bool:
-        return bool(self.direction)
-
-    @property
-    def can_build_script(self) -> bool:
-        return bool(self.story and self.story.confirmed)
 
     @property
     def effective_target_seconds(self) -> int:
@@ -323,8 +308,6 @@ class GuidedStorySession:
         self.rejected_idea_ids = []
         self.element_palette = None
         self.selected_elements = {}
-        self.draft = None
-        self.outline = None
         self.script = None
         self.storyboard = None
         self.video_job = None
@@ -333,7 +316,6 @@ class GuidedStorySession:
         self.chat_history = [{"role": "user", "content": cleaned}]
         self.story = None
         self.story_history = []
-        self.draft_history = []
         self.revisions = {}
         self.revision_cursor = {}
         self.user_action_count = 0
@@ -541,8 +523,6 @@ class GuidedStorySession:
         if self.brief.duration_mode == "auto":
             self.brief.resolved_target_seconds = None
         self.script = None
-        self.draft = None
-        self.outline = None
         self.storyboard = None
         self.video_job = None
         self.render_manifest = None
@@ -580,8 +560,6 @@ class GuidedStorySession:
         if self.brief.duration_mode == "auto":
             self.brief.resolved_target_seconds = None
         self.script = None
-        self.draft = None
-        self.outline = None
         self.storyboard = None
         self.video_job = None
         self.render_manifest = None
@@ -634,8 +612,6 @@ class GuidedStorySession:
         self.brief.resolved_target_seconds = target_seconds
         self.brief.validate()
         self.script = script
-        self.draft = None
-        self.outline = None
         self.storyboard = None
         self.video_job = None
         self.render_manifest = None
@@ -675,8 +651,6 @@ class GuidedStorySession:
         )
         script.confirmed = False
         self.script = script
-        self.draft = None
-        self.outline = None
         self.storyboard = None
         self.video_job = None
         self.render_manifest = None
@@ -901,68 +875,6 @@ class GuidedStorySession:
             user_feedback="confirm visual inputs",
         )
         return diagnostics
-
-    # v0.3 compatibility wrappers -------------------------------------------------
-    @_state_mutation
-    def generate_draft(self) -> DraftBundle:
-        warnings.warn(
-            "generate_draft 已被 generate_story/confirm_story/generate_script 取代",
-            DeprecationWarning,
-        )
-        story = self.generate_story()
-        self.confirm_story()
-        script = self.generate_script()
-        beats = [
-            StoryBeat(
-                scene.scene_id,
-                scene.title,
-                scene.visible_action or scene.action,
-                scene.start_state,
-                scene.emotional_change,
-                scene.duration,
-            )
-            for scene in script.scenes
-        ]
-        outline = StoryOutline(
-            title=story.title,
-            logline=story.logline,
-            opening=script.scenes[0].visible_action or script.scenes[0].action,
-            protagonist_goal=story.characters[0].description if story.characters else story.logline,
-            conflict=story.core_conflict,
-            development=story.story_text,
-            turning_point="",
-            ending=story.ending,
-            source_turn_ids=[],
-            beats=beats,
-        )
-        self.draft = DraftBundle(
-            outline=outline,
-            script=script,
-            field_sources=deepcopy(story.field_sources),
-            ai_filled_fields=list(story.ai_filled_fields),
-            version=len(self.draft_history) + 1,
-        )
-        self.draft_history.append(deepcopy(self.draft))
-        self.outline = outline
-        return self.draft
-
-    @_state_mutation
-    def revise_draft(self, feedback: str) -> DraftBundle:
-        warnings.warn("revise_draft 已被 revise_story/revise_script 取代", DeprecationWarning)
-        if self.draft is None:
-            raise RuntimeError("请先生成剧本。")
-        candidate = deepcopy(self.draft)
-        candidate.script = self.revise_script(feedback)
-        candidate.version += 1
-        self.draft = candidate
-        self.outline = candidate.outline
-        self.draft_history.append(deepcopy(candidate))
-        return self.draft
-
-    @_state_mutation
-    def confirm_draft(self) -> None:
-        warnings.warn("confirm_draft 已被 confirm_script 取代", DeprecationWarning)
-        self.confirm_script()
 
     @_state_mutation
     def update_storyboard_shot(self, shot_id: int, patch: dict[str, Any]) -> StoryboardPlan:
@@ -1355,7 +1267,7 @@ class GuidedStorySession:
                 review.hard_errors.append("故事缺少核心冲突或结局")
             review.scores["story_completeness"] = 1.0 if not review.hard_errors else 0.5
             review.scores["ai_fill_disclosure"] = 1.0
-        elif kind in ("draft", "script") and self.script:
+        elif kind == "script" and self.script:
             target_seconds = self.effective_target_seconds
             if abs(self.script.total_duration - target_seconds) > 1:
                 review.hard_errors.append("剧本总时长不符合目标")
@@ -1600,26 +1512,6 @@ class GuidedStorySession:
         )
 
     @_state_mutation
-    def build_outline(self) -> StoryOutline:
-        warnings.warn("build_outline 已被 generate_draft 取代", DeprecationWarning)
-        return self.generate_draft().outline
-
-    @_state_mutation
-    def confirm_outline(self) -> None:
-        if self.story is None:
-            raise RuntimeError("尚未生成故事。")
-        self.confirm_story()
-
-    @_state_mutation
-    def build_script(self) -> StoryScript:
-        warnings.warn("build_script 已被 generate_script 取代", DeprecationWarning)
-        if self.story is None:
-            self.generate_story()
-        if not self.story.confirmed:
-            self.confirm_story()
-        return self.generate_script()
-
-    @_state_mutation
     def update_script_scene(self, scene_id: int, patch: dict[str, Any]) -> StoryScript:
         if self.script is None:
             raise RuntimeError("尚未生成剧本。")
@@ -1651,8 +1543,6 @@ class GuidedStorySession:
         candidate_script.confirmed = False
 
         self.script = candidate_script
-        self.draft = None
-        self.outline = None
         self.storyboard = None
         self.video_job = None
         self.render_manifest = None
@@ -1695,8 +1585,6 @@ class GuidedStorySession:
                 "story": to_plain_data(self.story) if self.story else None,
                 "story_history": to_plain_data(self.story_history),
                 "script": to_plain_data(self.script) if self.script else None,
-                "draft": to_plain_data(self.draft) if self.draft else None,
-                "draft_history": to_plain_data(self.draft_history),
                 "storyboard": to_plain_data(self.storyboard) if self.storyboard else None,
                 "video_job": to_plain_data(self.video_job) if self.video_job else None,
                 "render_manifest": to_plain_data(self.render_manifest)
@@ -1770,17 +1658,6 @@ class GuidedStorySession:
         ]
         if data.get("script"):
             session.script = session._script_from(data["script"])
-        if data.get("draft"):
-            session.draft = session._draft_from(data["draft"])
-            session.outline = session.draft.outline
-            if session.script is None:
-                session.script = session.draft.script
-            if session.story is None:
-                session.story = session._story_from_legacy_draft(session.draft)
-                session.story_history = [deepcopy(session.story)]
-        session.draft_history = [
-            session._draft_from(item) for item in data.get("draft_history", [])
-        ]
         if data.get("storyboard"):
             session.storyboard = session._storyboard_from(
                 data["storyboard"],
@@ -1813,31 +1690,28 @@ class GuidedStorySession:
 
     def _load_v2(self, data: dict[str, Any]) -> GuidedStorySession:
         self.legacy_facts = self._facts_from(data.get("facts", {}))
-        outline = self._outline_from(data["outline"]) if data.get("outline") else None
+        raw_outline = data.get("outline")
+        outline = dict(raw_outline) if isinstance(raw_outline, dict) else {}
         script = self._script_from(data["script"]) if data.get("script") else None
         self.direction = (
             self.legacy_facts.premise
             or self.legacy_facts.opening
-            or (outline.logline if outline else "")
+            or str(outline.get("logline", ""))
             or "从v0.2迁移的故事"
         )
         if outline and script:
-            self.draft = DraftBundle(
-                outline=outline,
-                script=script,
-                ai_filled_fields=[],
-                field_sources={
-                    "legacy": SourceAttribution(
-                        field="legacy",
-                        source_type="v0.2_migration",
-                        value=self.direction,
-                    )
-                },
+            story = StoryDraft(
+                title=str(outline.get("title", script.title)) or script.title,
+                logline=str(outline.get("logline", "")),
+                story_text="；".join(
+                    scene.visible_action or scene.action for scene in script.scenes
+                ),
+                core_conflict=str(outline.get("conflict", "")),
+                ending=str(outline.get("ending", "")),
             )
-            self.draft_history = [deepcopy(self.draft)]
-            self.outline, self.script = outline, script
-            self.story = self._story_from_legacy_draft(self.draft)
-            self.story_history = [deepcopy(self.story)]
+            self.story = story
+            self.story_history = [deepcopy(story)]
+            self.script = script
             self.stage = Stage.SCRIPT_REVIEW
         else:
             self.stage = Stage.IDEATING
@@ -2203,8 +2077,6 @@ class GuidedStorySession:
 
     def _invalidate_after_upstream_change(self, *, clear_palette: bool = True) -> None:
         self.story = None
-        self.draft = None
-        self.outline = None
         self.script = None
         self.storyboard = None
         self.video_job = None
@@ -2214,7 +2086,7 @@ class GuidedStorySession:
             self.selected_elements = {}
         if self.brief.duration_mode == "auto":
             self.brief.resolved_target_seconds = None
-        for kind in ("story", "draft", "script", "storyboard"):
+        for kind in ("story", "script", "storyboard"):
             self.revisions.pop(kind, None)
             self.revision_cursor.pop(kind, None)
 
@@ -2842,12 +2714,6 @@ class GuidedStorySession:
             candidate = self._script_from(deepcopy(revision.payload))
             self._validate_loaded_script(candidate)
             return candidate
-        if revision.artifact_type == "draft":
-            if self.story is None or not self.story.confirmed:
-                raise ValueError("恢复旧版草稿前必须存在已确认故事。")
-            candidate = self._draft_from(deepcopy(revision.payload))
-            self._validate_loaded_script(candidate.script)
-            return candidate
         if revision.artifact_type == "storyboard":
             if (
                 self.story is None
@@ -2872,8 +2738,6 @@ class GuidedStorySession:
         if artifact_type == "story":
             self.story = candidate
             self.stage = Stage.STORY_REVIEW
-            self.draft = None
-            self.outline = None
             self.script = None
             self.storyboard = None
             self.video_job = None
@@ -2882,20 +2746,10 @@ class GuidedStorySession:
         if artifact_type == "script":
             self.script = candidate
             self.stage = Stage.SCRIPT_REVIEW
-            self.draft = None
-            self.outline = None
             self.storyboard = None
             self.video_job = None
             self.render_manifest = None
             return self.script
-        if artifact_type == "draft":
-            self.draft = candidate
-            self.outline, self.script = self.draft.outline, self.draft.script
-            self.stage = Stage.SCRIPT_REVIEW
-            self.storyboard = None
-            self.video_job = None
-            self.render_manifest = None
-            return self.draft
         if artifact_type == "storyboard":
             self.storyboard = candidate
             self.stage = Stage.STORYBOARD_REVIEW
@@ -2916,7 +2770,6 @@ class GuidedStorySession:
         allowed_kinds = {
             "story",
             "script",
-            "draft",
             "storyboard",
             "video_job",
         }
@@ -3032,80 +2885,9 @@ class GuidedStorySession:
         )
 
     @staticmethod
-    def _story_from_legacy_draft(draft: DraftBundle) -> StoryDraft:
-        story_text = draft.outline.development.strip() or "\n\n".join(
-            beat.event for beat in draft.outline.beats if beat.event.strip()
-        )
-        if len(story_text) < 120:
-            story_text = "\n\n".join(
-                [
-                    draft.outline.opening,
-                    draft.outline.protagonist_goal,
-                    draft.outline.conflict,
-                    draft.outline.development,
-                    draft.outline.turning_point,
-                    draft.outline.ending,
-                ]
-            )
-        names = []
-        for scene in draft.script.scenes:
-            for name in scene.characters:
-                if name not in names:
-                    names.append(name)
-        locations = []
-        for scene in draft.script.scenes:
-            if scene.location not in locations:
-                locations.append(scene.location)
-        return StoryDraft(
-            title=draft.outline.title,
-            logline=draft.outline.logline,
-            story_text=story_text,
-            characters=[
-                StoryCharacter(name, draft.outline.protagonist_goal, "保持旧版人物外观一致")
-                for name in (names or ["主角"])
-            ],
-            locations=[
-                StoryLocation(name, "从旧版剧本迁移的地点", "保持旧版空间与光线一致")
-                for name in (locations or ["故事核心场景"])
-            ],
-            core_conflict=draft.outline.conflict,
-            ending=draft.outline.ending,
-            visual_anchors=["旧版人物外观", "旧版关键道具", "旧版场景主色"],
-            field_sources=deepcopy(draft.field_sources),
-            ai_filled_fields=list(draft.ai_filled_fields),
-            version=draft.version,
-            confirmed=True,
-        )
-
-    @classmethod
-    def _draft_from(cls, data: dict[str, Any]) -> DraftBundle:
-        return DraftBundle(
-            outline=cls._outline_from(data["outline"]),
-            script=cls._script_from(data["script"]),
-            field_sources={
-                str(kind): SourceAttribution(**item)
-                for kind, item in data.get("field_sources", {}).items()
-            },
-            ai_filled_fields=[str(item) for item in data.get("ai_filled_fields", [])],
-            version=int(data.get("version", 1)),
-        )
-
-    @staticmethod
     def _facts_from(data: dict[str, Any]) -> StoryFacts:
         allowed = StoryFacts.__dataclass_fields__
         return StoryFacts(**{key: str(value) for key, value in data.items() if key in allowed})
-
-    @staticmethod
-    def _outline_from(data: dict[str, Any]) -> StoryOutline:
-        beats = [StoryBeat(**item) for item in data.get("beats", [])]
-        fields = StoryOutline.__dataclass_fields__
-        kwargs = {key: value for key, value in data.items() if key in fields and key != "beats"}
-        kwargs.setdefault("source_turn_ids", [])
-        kwargs["confirmed"] = GuidedStorySession._strict_bool(
-            kwargs.get("confirmed", False),
-            "outline.confirmed",
-        )
-        return StoryOutline(**kwargs, beats=beats)
 
     @staticmethod
     def _script_from(data: dict[str, Any]) -> StoryScript:

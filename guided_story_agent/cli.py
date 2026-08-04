@@ -114,7 +114,7 @@ def run_interactive(
             elif raw == "/auto":
                 session.auto_choose()
                 output_fn(_selection_text(session))
-            elif raw in ("/story", "/draft", "/outline"):
+            elif raw == "/story":
                 story = session.generate_story()
                 _print_story(story, output_fn)
             elif raw in ("/revise-story", "/revise"):

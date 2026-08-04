@@ -108,15 +108,6 @@ class StoryFacts:
 
 
 @dataclass(slots=True)
-class CreatorContribution:
-    turn_id: int
-    text: str
-    source: str = "human"
-    extracted_facts: dict[str, str] = field(default_factory=dict)
-    fact_evidence: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass(slots=True)
 class FactEvidence:
     field: str
     value: str
@@ -230,15 +221,6 @@ class StoryDraft:
 
 
 @dataclass(slots=True)
-class DraftBundle:
-    outline: StoryOutline
-    script: StoryScript
-    field_sources: dict[str, SourceAttribution] = field(default_factory=dict)
-    ai_filled_fields: list[str] = field(default_factory=list)
-    version: int = 1
-
-
-@dataclass(slots=True)
 class IdeationTurnResult:
     message: str
     batch: IdeaBatch | None
@@ -262,32 +244,6 @@ class GuideTurnResult:
     missing_critical_fields: list[str] = field(default_factory=list)
     recommended_action: str = "continue"
     used_fallback: bool = False
-
-
-@dataclass(slots=True)
-class StoryBeat:
-    beat_id: int
-    purpose: str
-    event: str
-    causal_link: str
-    emotional_change: str
-    duration: int
-    source_turn_ids: list[int] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class StoryOutline:
-    title: str
-    logline: str
-    opening: str
-    protagonist_goal: str
-    conflict: str
-    development: str
-    turning_point: str
-    ending: str
-    source_turn_ids: list[int]
-    confirmed: bool = False
-    beats: list[StoryBeat] = field(default_factory=list)
 
 
 @dataclass(slots=True)

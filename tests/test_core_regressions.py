@@ -308,7 +308,6 @@ class CoreStateRegressionTests(unittest.TestCase):
         agent.fail = False
         session.start_ideation("真正的新项目")
         self.assertEqual({}, session.revisions)
-        self.assertEqual([], session.draft_history)
 
     def test_loaded_state_rejects_future_schema_string_bool_and_broken_chain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
