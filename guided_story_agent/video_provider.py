@@ -13,16 +13,71 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from .models import ProviderCapabilities, StoryboardShot, VideoArtifact, VideoJob
-from .provider_config import VideoProviderConfig
+from .provider_config import (
+    VideoProviderConfig,
+    create_video_provider,
+    register_builtin_video_providers,
+)
 
 
 ProgressCallback = Callable[[str, float, str], None]
 DEFAULT_API_ROOT = "https://apihub.agnes-ai.com"
 DEFAULT_MODEL = "agnes-video-v2.0"
+
+
+class VideoProvider(Protocol):
+    """Contract every v1 video adapter must satisfy.
+
+    The storyboard and whole-video render paths depend only on this surface,
+    so a new provider can be added by implementing it and registering a
+    factory under its ``VIDEO_PROVIDER`` key.
+    """
+
+    provider_name: str
+
+    def capabilities(self) -> ProviderCapabilities: ...
+
+    def generate_shot(
+        self,
+        shot: StoryboardShot,
+        output_dir: str | Path,
+        *,
+        attempt: int = 1,
+        progress_callback: ProgressCallback | None = None,
+        resume_request_id: str | None = None,
+    ) -> VideoArtifact: ...
+
+    def generate_video(
+        self,
+        job: VideoJob,
+        output_dir: str | Path,
+        *,
+        attempt: int = 1,
+        progress_callback: ProgressCallback | None = None,
+        resume_request_id: str | None = None,
+    ) -> VideoArtifact: ...
+
+
+def video_provider_from_env() -> VideoProvider:
+    """Build the configured video adapter via the provider registry.
+
+    The default remains Agnes, but any registered provider key can be
+    selected with ``VIDEO_PROVIDER`` without touching this call site.
+    """
+    register_builtin_video_providers()
+    config = VideoProviderConfig.from_env(
+        default_api_root=DEFAULT_API_ROOT,
+        default_model=DEFAULT_MODEL,
+    )
+    if config.configured:
+        return create_video_provider(config.provider)
+    # Unconfigured or explicitly disabled: fall back to the built-in adapter,
+    # which will surface the configuration error when a generation is attempted.
+    return AgnesVideoProvider.from_env()
 
 
 class VideoGenerationError(RuntimeError):

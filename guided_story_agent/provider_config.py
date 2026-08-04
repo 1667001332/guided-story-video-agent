@@ -5,6 +5,7 @@ import os
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from dotenv import load_dotenv
 
@@ -54,6 +55,39 @@ def _integer(value: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return -1
+
+
+_VIDEO_PROVIDER_FACTORIES: dict[str, Callable[[], object]] = {}
+
+
+def register_video_provider(name: str, factory: Callable[[], object]) -> None:
+    """Register a concrete video adapter so VIDEO_PROVIDER can select it."""
+    _VIDEO_PROVIDER_FACTORIES[str(name).strip().lower()] = factory
+
+
+def available_video_providers() -> tuple[str, ...]:
+    """Sorted provider keys that can currently be constructed."""
+    register_builtin_video_providers()
+    return tuple(sorted(_VIDEO_PROVIDER_FACTORIES))
+
+
+def create_video_provider(name: str) -> object:
+    """Construct the adapter registered under ``name``."""
+    register_builtin_video_providers()
+    factory = _VIDEO_PROVIDER_FACTORIES.get(str(name).strip().lower())
+    if factory is None:
+        raise ValueError(
+            f"未知的视频 Provider：{name}；可用：{'、'.join(available_video_providers())}"
+        )
+    return factory()
+
+
+def register_builtin_video_providers() -> None:
+    """Lazily attach built-in adapters; safe to call more than once."""
+    if "agnes" not in _VIDEO_PROVIDER_FACTORIES:
+        from .video_provider import AgnesVideoProvider
+
+        _VIDEO_PROVIDER_FACTORIES["agnes"] = AgnesVideoProvider.from_env
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,9 +304,11 @@ class VideoProviderConfig:
         return config._validated("agnes")
 
     def _validated(self, provider_raw: str) -> VideoProviderConfig:
-        if self.provider not in {"agnes", "disabled"}:
+        register_builtin_video_providers()
+        if self.provider != "disabled" and self.provider not in available_video_providers():
             return self._with_error(
-                f"VIDEO_PROVIDER={provider_raw} 暂未实现；当前支持 agnes 或 disabled。"
+                f"VIDEO_PROVIDER={provider_raw} 暂未实现；"
+                f"当前支持 {'、'.join(available_video_providers())} 或 disabled。"
             )
         if self.provider == "disabled":
             return self._with_error("VIDEO_PROVIDER 已设为 disabled，付费视频 API 已关闭。")

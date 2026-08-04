@@ -14,7 +14,7 @@ from .quality import (
 )
 from .rendering import VideoJobRenderer
 from .session import GuidedStorySession
-from .video_provider import AgnesVideoProvider
+from .video_provider import video_provider_from_env
 
 
 def _idea_metrics(session: GuidedStorySession) -> tuple[float, float]:
@@ -214,7 +214,7 @@ def run_selfplay(
             else:
                 session.build_video_job()
                 manifest = session.render_confirmed_video(
-                    VideoJobRenderer(AgnesVideoProvider.from_env()),
+                    VideoJobRenderer(video_provider_from_env()),
                     target / "video",
                 )
             bench["render_status"] = manifest.status

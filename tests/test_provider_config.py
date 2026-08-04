@@ -318,5 +318,82 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertIn("必须同时填写", config.error)
 
 
+class VideoProviderRegistryTests(unittest.TestCase):
+    def test_registry_dispatches_and_rejects_unknown_keys(self) -> None:
+        from guided_story_agent.provider_config import (
+            available_video_providers,
+            create_video_provider,
+            register_video_provider,
+        )
+
+        marker: list[str] = []
+
+        class _FakeProvider:
+            provider_name = "fake-test"
+
+            @classmethod
+            def from_env(cls) -> _FakeProvider:
+                marker.append("built")
+                return cls()
+
+        register_video_provider("fake-test", _FakeProvider.from_env)
+        self.assertIn("fake-test", available_video_providers())
+        provider = create_video_provider("fake-test")
+        self.assertEqual("fake-test", provider.provider_name)
+        self.assertEqual(["built"], marker)
+        with self.assertRaises(ValueError):
+            create_video_provider("no-such-provider")
+
+    def test_video_config_accepts_registered_provider_key(self) -> None:
+        from guided_story_agent.provider_config import register_video_provider
+
+        class _FakeProvider:
+            provider_name = "second-provider"
+
+        register_video_provider("second-provider", _FakeProvider)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VIDEO_PROVIDER": "second-provider",
+                    "VIDEO_API_KEY": "key",
+                    "VIDEO_MODEL": "model",
+                },
+                clear=True,
+            ),
+            patch("guided_story_agent.provider_config.load_dotenv"),
+        ):
+            config = VideoProviderConfig.from_env(
+                default_api_root="https://default.example",
+                default_model="default-video-model",
+            )
+        self.assertTrue(config.configured)
+        self.assertEqual("second-provider", config.provider)
+
+    def test_video_provider_from_env_dispatches_via_registry(self) -> None:
+        from guided_story_agent.provider_config import register_video_provider
+        from guided_story_agent.video_provider import video_provider_from_env
+
+        class _FakeProvider:
+            provider_name = "fake-dispatch"
+
+            @classmethod
+            def from_env(cls) -> _FakeProvider:
+                return cls()
+
+        register_video_provider("fake-dispatch", _FakeProvider.from_env)
+        with patch.dict(
+            os.environ,
+            {
+                "VIDEO_PROVIDER": "fake-dispatch",
+                "VIDEO_API_KEY": "key",
+                "VIDEO_MODEL": "model",
+            },
+            clear=True,
+        ):
+            provider = video_provider_from_env()
+        self.assertEqual("fake-dispatch", provider.provider_name)
+
+
 if __name__ == "__main__":
     unittest.main()
