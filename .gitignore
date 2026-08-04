@@ -11,3 +11,9 @@ build/
 !.env.example
 .vscode/
 outputs/
+.offline-runtime-artifacts/
+.codex-runtime-temp/
+.codex-test-tmp/
+.codex_full_test_temp/
+.pytest_tmp/
+.test-temp-review/
