@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,6 +30,7 @@ from guided_story_agent.rendering import (
 )
 from guided_story_agent.video_provider import (
     AgnesVideoProvider,
+    VideoGenerationError,
     VideoProviderNotConfigured,
     sanitize_remote_url,
     validate_mp4_file,
@@ -599,6 +602,64 @@ class NarrationRenderingTests(unittest.TestCase):
                     {"prompt": "test"},
                 )
         self.assertEqual(1, opener.call_count)
+
+    def test_download_does_not_retry_deterministic_http_errors(self) -> None:
+        sleeps: list[float] = []
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            network_retries=2,
+            retry_backoff=0.25,
+            sleep_fn=sleeps.append,
+        )
+        http_error = urllib.error.HTTPError(
+            "https://video.example/v.mp4", 404, "Not Found", {}, None
+        )
+        with patch(
+            "guided_story_agent.video_provider.urllib.request.urlopen",
+            side_effect=http_error,
+        ) as opener:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(VideoGenerationError, "MP4 下载失败"):
+                    provider._download_file(
+                        "https://video.example/v.mp4", Path(tmp) / "shot.mp4"
+                    )
+        self.assertEqual(1, opener.call_count)
+        self.assertEqual([], sleeps)
+
+    def test_download_retries_transient_http_errors_then_succeeds(self) -> None:
+        class Response:
+            def __init__(self, body: bytes) -> None:
+                self._stream = io.BytesIO(body)
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+            def read(self, *args: int) -> bytes:
+                return self._stream.read(*args)
+
+        sleeps: list[float] = []
+        provider = AgnesVideoProvider(
+            api_key="test-key",
+            network_retries=2,
+            retry_backoff=0.25,
+            sleep_fn=sleeps.append,
+        )
+        transient = urllib.error.HTTPError(
+            "https://video.example/v.mp4", 503, "Service Unavailable", {}, None
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "shot.mp4"
+            with patch(
+                "guided_story_agent.video_provider.urllib.request.urlopen",
+                side_effect=[transient, transient, Response(b"video-bytes")],
+            ) as opener:
+                provider._download_file("https://video.example/v.mp4", target)
+            self.assertEqual(3, opener.call_count)
+            self.assertEqual([0.25, 0.5], sleeps)
+            self.assertEqual(b"video-bytes", target.read_bytes())
 
     def test_submission_intent_survives_process_style_interruption(self) -> None:
         calls = 0

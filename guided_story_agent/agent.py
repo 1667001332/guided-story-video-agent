@@ -38,6 +38,7 @@ ELEMENT_KINDS = ("character", "conflict", "turning_point", "ending")
 MAX_PREVIOUS_CARDS = 64
 MAX_LLM_PAYLOAD_CHARS = 250_000
 MAX_LLM_RESPONSE_CHARS = 1_000_000
+MAX_REPAIR_INPUT_CHARS = 30_000
 
 
 def _natural_join(values: list[str], separator: str) -> str:
@@ -1665,7 +1666,9 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             data = self._extract_json_object(content)
         except ValueError as original_error:
             try:
-                data = self._repair_json_object(prompt_name, payload_text, content)
+                data = self._repair_json_object(
+                    prompt_name, payload_text, content, max_tokens
+                )
             except Exception as repair_error:
                 raise ValueError(
                     f"{original_error}; JSON repair failed: {repair_error}"
@@ -1691,7 +1694,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             return self.client.chat.completions.create(**fallback_request)
 
     def _repair_json_object(
-        self, prompt_name: str, payload_text: str, content: str
+        self, prompt_name: str, payload_text: str, content: str, max_tokens: int
     ) -> dict[str, Any]:
         repair_request = {
             "model": self.model,
@@ -1709,15 +1712,15 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                         "原任务要求：\n"
                         f"{self._load_prompt(prompt_name)}\n\n"
                         "原始输入：\n"
-                        f"{payload_text}\n\n"
+                        f"{payload_text[:MAX_REPAIR_INPUT_CHARS]}\n\n"
                         "模型原始回答：\n"
-                        f"{content[:MAX_LLM_RESPONSE_CHARS]}\n\n"
+                        f"{content[:MAX_REPAIR_INPUT_CHARS]}\n\n"
                         "请将模型原始回答转换为符合原任务要求的 JSON 对象。"
                     ),
                 },
             ],
             "temperature": 0,
-            "max_tokens": 4000,
+            "max_tokens": max_tokens,
         }
         if self.json_mode != "disabled":
             repair_request["response_format"] = {"type": "json_object"}

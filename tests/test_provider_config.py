@@ -43,6 +43,16 @@ class JsonRepairTests(unittest.TestCase):
         self.assertEqual(2, len(client.chat.completions.requests))
         self.assertIn("结构化输出修复器", str(client.chat.completions.requests[1]))
 
+    def test_repair_truncates_large_inputs_and_follows_main_max_tokens(self) -> None:
+        big_content = "噪音" * 20_000 + "不是 JSON"
+        client = _FakeClient([big_content, '{"ok": true}'])
+        agent = OpenAIStoryAgent(client, "test-model")
+        agent._json_completion("story_writer.md", {"direction": "测试"})
+        repair_request = client.chat.completions.requests[1]
+        user_message = str(repair_request["messages"][1]["content"])
+        self.assertLess(len(user_message), 35_000)
+        self.assertEqual(8000, repair_request["max_tokens"])
+
     def test_fenced_markdown_json_is_parsed_without_repair(self) -> None:
         client = _FakeClient(['```json\n{"ok": true}\n```'])
         agent = OpenAIStoryAgent(client, "test-model")

@@ -721,7 +721,16 @@ class AgnesVideoProvider:
                         shutil.copyfileobj(response, handle)
                 temporary.replace(target)
                 return
-            except Exception as exc:
+            except urllib.error.HTTPError as exc:
+                temporary.unlink(missing_ok=True)
+                retryable = exc.code in {408, 425, 429, 500, 502, 503, 504}
+                if retryable and attempt + 1 < attempts:
+                    self._retry_wait(attempt)
+                    continue
+                raise VideoGenerationError(
+                    f"MP4 下载失败：HTTP {exc.code}: {exc.reason}"
+                ) from exc
+            except (OSError, TimeoutError) as exc:
                 temporary.unlink(missing_ok=True)
                 if attempt + 1 < attempts:
                     self._retry_wait(attempt)
