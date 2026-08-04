@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .models import CreativeBrief, Stage
 from .rendering import StoryRenderer, VideoJobRenderer
 from .session import GuidedStorySession
-from .video_provider import AgnesVideoProvider
+from .video_provider import video_provider_from_env
 from .v2.director import DirectorAgent as V2DirectorAgent
 from .v2.execution import CompilationOptions, ProviderCapabilities as V2ProviderCapabilities
 from .v2.revision_apply import ApplyRevisionCommand, RollbackRevisionCommand
@@ -230,7 +231,7 @@ def run_interactive(
                 renderer = (
                     renderer_factory()
                     if renderer_factory
-                    else StoryRenderer(AgnesVideoProvider.from_env())
+                    else StoryRenderer(video_provider_from_env())
                 )
                 if session.video_job is not None:
                     direct_renderer = (
@@ -1153,8 +1154,15 @@ def main() -> None:
     )
     text_mode.add_argument("--require-live-text", action="store_true")
     parser.add_argument("--render", action="store_true", help="允许二次确认后的付费视频生成")
+    parser.add_argument(
+        "--video-provider",
+        default="",
+        help="覆盖 VIDEO_PROVIDER（例如 agnes）；省略时读取 .env 配置",
+    )
     parser.add_argument("--v2", action="store_true", help="启用 DirectorAgent → MoviePlan V2 主链")
     args = parser.parse_args()
+    if args.video_provider:
+        os.environ["VIDEO_PROVIDER"] = args.video_provider
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or f"outputs/manual_cli/{stamp}"
     try:

@@ -1206,6 +1206,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                         ),
                         "timing_feedback": timing_feedback,
                     },
+                    timing_profile=profile,
                 )
                 shots = data.get("shots")
                 if not isinstance(shots, list) or not all(
@@ -1723,7 +1724,14 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
     def _unavailable_reason(self) -> str:
         return self.configuration_error or "文本 API 未配置。"
 
-    def _json_completion(self, prompt_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _json_completion(
+        self,
+        prompt_name: str,
+        payload: dict[str, Any],
+        *,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> dict[str, Any]:
+        profile = timing_profile or ShotTimingProfile()
         if prompt_name.startswith("story_") or prompt_name.startswith("storyboard_"):
             max_tokens = 8000
         elif prompt_name.startswith("script_"):
@@ -1738,7 +1746,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         request = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self._load_prompt(prompt_name)},
+                {"role": "system", "content": self._render_prompt(prompt_name, profile)},
                 {"role": "user", "content": payload_text},
             ],
             "temperature": (
@@ -1768,7 +1776,11 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
         except ValueError as original_error:
             try:
                 data = self._repair_json_object(
-                    prompt_name, payload_text, content, max_tokens
+                    prompt_name,
+                    payload_text,
+                    content,
+                    max_tokens,
+                    timing_profile=profile,
                 )
             except Exception as repair_error:
                 raise ValueError(
@@ -1795,8 +1807,15 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
             return self.client.chat.completions.create(**fallback_request)
 
     def _repair_json_object(
-        self, prompt_name: str, payload_text: str, content: str, max_tokens: int
+        self,
+        prompt_name: str,
+        payload_text: str,
+        content: str,
+        max_tokens: int,
+        *,
+        timing_profile: ShotTimingProfile | None = None,
     ) -> dict[str, Any]:
+        profile = timing_profile or ShotTimingProfile()
         repair_request = {
             "model": self.model,
             "messages": [
@@ -1811,7 +1830,7 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
                     "role": "user",
                     "content": (
                         "原任务要求：\n"
-                        f"{self._load_prompt(prompt_name)}\n\n"
+                        f"{self._render_prompt(prompt_name, profile)}\n\n"
                         "原始输入：\n"
                         f"{payload_text[:MAX_REPAIR_INPUT_CHARS]}\n\n"
                         "模型原始回答：\n"
@@ -1854,6 +1873,19 @@ class OpenAIStoryAgent(RuleBasedStoryAgent):
 
     def _load_prompt(self, name: str) -> str:
         return (self.prompt_dir / name).read_text(encoding="utf-8")
+
+    def _render_prompt(
+        self,
+        name: str,
+        timing_profile: ShotTimingProfile | None = None,
+    ) -> str:
+        """Load a prompt and substitute provider-bound duration tokens."""
+        profile = timing_profile or ShotTimingProfile()
+        return (
+            self._load_prompt(name)
+            .replace("{MIN_DURATION_SECONDS}", str(profile.min_duration_seconds))
+            .replace("{MAX_DURATION_SECONDS}", str(profile.max_duration_seconds))
+        )
 
     def _reset_fallback_status(self) -> None:
         self.last_used_fallback = False

@@ -327,7 +327,9 @@ class CreativeGardenWebTests(unittest.TestCase):
             self.assertIn("首帧", planned["data"][1])
             self.assertIn("引用资产", planned["data"][1])
             await app.process_api(indexes["confirm_storyboard"], [None], state=state)
-            blocked = await app.process_api(indexes["render_video"], [None, False], state=state)
+            blocked = await app.process_api(
+                indexes["render_video"], [None, False, "auto"], state=state
+            )
             self.assertIn("费用确认", blocked["data"][2])
 
         asyncio.run(process())

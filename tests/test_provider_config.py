@@ -408,6 +408,59 @@ class VideoProviderRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provider.dimensions("4:3")
 
+    def test_session_auto_derives_profile_from_provider_capabilities(self) -> None:
+        from guided_story_agent.models import ProviderCapabilities
+        from guided_story_agent.provider_config import register_video_provider
+        from guided_story_agent.session import GuidedStorySession
+
+        class _WideProvider:
+            provider_name = "wide-video"
+            capabilities = ProviderCapabilities(
+                min_duration_seconds=5,
+                max_duration_seconds=120,
+            )
+
+        register_video_provider("wide-video", lambda: _WideProvider())
+        with patch.dict(
+            os.environ,
+            {
+                "VIDEO_PROVIDER": "wide-video",
+                "VIDEO_API_KEY": "key",
+                "VIDEO_MODEL": "model",
+            },
+            clear=True,
+        ):
+            session = GuidedStorySession()
+        self.assertEqual(5, session.timing_profile.min_duration_seconds)
+        self.assertEqual(120, session.timing_profile.max_duration_seconds)
+
+    def test_resolve_video_provider_and_prompt_tokens(self) -> None:
+        from guided_story_agent.agent import OpenAIStoryAgent
+        from guided_story_agent.provider_config import register_video_provider
+        from guided_story_agent.timing import ShotTimingProfile
+        from guided_story_agent.web_app import resolve_video_provider
+
+        class _Pickable:
+            provider_name = "pickable"
+
+        register_video_provider("pickable", lambda: _Pickable())
+        with patch.dict(
+            os.environ,
+            {
+                "VIDEO_PROVIDER": "pickable",
+                "VIDEO_API_KEY": "key",
+                "VIDEO_MODEL": "model",
+            },
+            clear=True,
+        ):
+            self.assertEqual("pickable", resolve_video_provider("pickable").provider_name)
+
+        agent = OpenAIStoryAgent(None, "test-model")
+        wide = ShotTimingProfile(min_duration_seconds=5, max_duration_seconds=120)
+        rendered = agent._render_prompt("storyboard_director.md", wide)
+        self.assertIn("5～120 秒", rendered)
+        self.assertNotIn("{MIN_DURATION_SECONDS}", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

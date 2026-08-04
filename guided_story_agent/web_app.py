@@ -14,9 +14,10 @@ from uuid import uuid4
 
 from .agent import OpenAIStoryAgent, RuleBasedStoryAgent, StoryAgent
 from .models import CreativeBrief, ElementPalette, Stage
+from .provider_config import available_video_providers
 from .rendering import StoryRenderer, VideoJobRenderer  # noqa: F401 - legacy patch/API compatibility
 from .session import GuidedStorySession
-from .video_provider import AgnesVideoProvider
+from .video_provider import video_provider_from_env
 
 
 VISUAL_USAGE_CHOICES = [
@@ -119,6 +120,7 @@ def restore_saved_session_view(
         final_video,
         f"已从 {source} 恢复到“{_stage_tab(session.stage)}”阶段。",
         _gr_update(value=False),
+        _gr_update(value="auto"),
         _gr_update(selected=_stage_tab(session.stage)),
         _uncertain_shot_choices_update(plan),
         "",
@@ -786,6 +788,7 @@ def resolve_submission_uncertainty_view(
 def render_video_with_progress(
     session: GuidedStorySession | None,
     cost_confirmed: bool = False,
+    provider_name: str = "auto",
     *,
     provider=None,
     output_dir: str | Path | None = None,
@@ -844,7 +847,7 @@ def render_video_with_progress(
                     renderer = StoryRenderer(provider, progress_callback=progress)
                     result["manifest"] = session.render_confirmed_plan(renderer, target)
                 else:
-                    active_provider = provider or AgnesVideoProvider.from_env()
+                    active_provider = provider or resolve_video_provider(provider_name)
                     renderer = VideoJobRenderer(active_provider, progress_callback=progress)
                     result["manifest"] = session.render_confirmed_video(renderer, target)
             finally:
@@ -907,6 +910,20 @@ def render_video_with_progress(
         _progress_text(1.0, message),
         reset_confirmation,
     )
+
+
+def resolve_video_provider(provider_name: str = "auto") -> Any:
+    """Resolve the provider dropdown value into a concrete adapter."""
+    from .provider_config import create_video_provider
+
+    name = (provider_name or "auto").strip().lower()
+    if name in {"", "auto"}:
+        return video_provider_from_env()
+    if name not in available_video_providers():
+        raise ValueError(
+            f"未知的视频 Provider：{name}；可用：{'、'.join(available_video_providers())}"
+        )
+    return create_video_provider(name)
 
 
 def _idea_card_grid_class(gr):
@@ -1554,6 +1571,11 @@ footer{display:none!important}
                                 """
                             )
                             cost_confirmed = gr.Checkbox(label="我确认下一步会调用付费视频 API")
+                            provider_choice = gr.Dropdown(
+                                label="视频 Provider",
+                                choices=["auto", *available_video_providers()],
+                                value="auto",
+                            )
                             render = gr.Button(
                                 "生成真实视频",
                                 variant="primary",
@@ -1610,6 +1632,7 @@ footer{display:none!important}
             video,
             status,
             cost_confirmed,
+            provider_choice,
             workflow,
             uncertain_shot,
             provider_request_id,
@@ -1815,7 +1838,7 @@ footer{display:none!important}
         )
         render_event = render.click(
             render_saved,
-            [session_state, cost_confirmed],
+            [session_state, cost_confirmed, provider_choice],
             [session_state, video, status, cost_confirmed],
             show_progress="hidden",
             api_name="render_video",

@@ -141,6 +141,33 @@ from .v2.validation import (
 )
 
 
+def _auto_timing_profile() -> ShotTimingProfile | None:
+    """Derive the planning profile from the configured video provider.
+
+    Reads the adapter selected by ``VIDEO_PROVIDER`` (default Agnes) and maps
+    its capability bounds onto ``ShotTimingProfile``.  Falls back to ``None``
+    so callers keep the default 3–15s bounds when nothing is configured.
+    """
+    try:
+        from .video_provider import video_provider_from_env
+
+        capabilities = video_provider_from_env().capabilities
+    except Exception:
+        return None
+    minimum = capabilities.min_duration_seconds
+    maximum = capabilities.max_duration_seconds
+    if (
+        isinstance(minimum, int)
+        and isinstance(maximum, int)
+        and 0 < minimum <= maximum
+    ):
+        return ShotTimingProfile(
+            min_duration_seconds=minimum,
+            max_duration_seconds=maximum,
+        )
+    return None
+
+
 MAX_USER_INPUT_CHARS = 4_000
 CURRENT_STAGES = {
     Stage.IDEATING,
@@ -211,7 +238,9 @@ class GuidedStorySession:
         self.agent = agent or RuleBasedStoryAgent()
         self.director_agent = director_agent
         self.v2_enabled = bool(v2_enabled)
-        self.timing_profile = timing_profile or ShotTimingProfile()
+        self.timing_profile = (
+            timing_profile or _auto_timing_profile() or ShotTimingProfile()
+        )
         self.stage = Stage.IDEATING
         self.direction = ""
         self.idea_batches: list[IdeaBatch] = []
